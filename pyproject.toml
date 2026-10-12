@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttorch"
+version = "0.1.0.dev0"
+description = "TTorch Bridge：面向异构设备的训练执行收束层（Part 1：功能接入层）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+# 刻意不声明 torch 依赖：目标环境的 torch 由厂商栈提供（KL3 的
+# torch_xmlir 经 .pth 劫持 import torch），声明 torch 会让 pip 试图
+# 重装/升级并破坏厂商栈。运行期缺 torch 直接 ImportError 更诚实。
+dependencies = []
+
+[project.optional-dependencies]
+# 跑 smoke/recipe 才需要；Bridge 本体不依赖
+recipes = ["transformers>=4.40"]
+
+# 注意：.pth 的安装位置由 setup.py 动态计算（见该文件注释），
+# 不在此处声明 data-files——写死路径会绑定 Python 小版本号。
+
+[tool.setuptools.packages.find]
+include = ["ttorch*"]
+exclude = ["tt-bridge-demo*", "tt-schedule-demo*", "docs*"]

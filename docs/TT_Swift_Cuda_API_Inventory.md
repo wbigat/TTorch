@@ -148,6 +148,12 @@ P0 接口族在 mock demo 验证后，移植真实 torch 时又暴露出四个 m
 | G11 | **能力类绑定的"说谎"半径**：cpu-dev 上把 `torch.cuda.is_available` 绑成 True，AdamW 的 graph capture 健康检查经 `torch.accelerator` 走到 dummy cuda 直接炸 | mock 没有"torch 内部也消费这些符号"的维度 | 平台 overlay 最小实例：torch.cuda 为非功能桩的栈剔除能力类绑定，框架语义由 `platform_mgr.capability()` 直接供给；masquerade 栈无此问题（shim 真实可工作） |
 | G12 | 门面签名必须是 torch 真实签名超集（`synchronize(device)` 等可选 device 参） | mock 调用点全部无参 | 契约/门面/adapter 全链路 `device=None` |
 | G13 | `get_rng_state(None)` 在 torch 2.9 会炸（内部直接 `device.index`）——None=当前设备必须**省略实参**，不能位置透传 None | KL3 真机 conformance 首跑 Traceback 实锤（2026-10-12） | adapter 内 `fn() if device is None else fn(device)` |
+| G14 | **绑定的爆炸半径不止于框架调用点**：被绑符号所在模块的**原实现内部**也引用同模块符号。`torch.cuda.current_stream` 的全局名空间就是被改过的 `torch.cuda.__dict__`，其内部 `Stream(stream_id=..., device_index=..., device_type=...)` 落到门面 → `TypeError: Stream.__new__() got an unexpected keyword argument 'stream_id'`；放行 TTStream 则更隐蔽（`'TTStream' object has no attribute 'record_event'`） | mock vendor_cuda 的函数内部不互相构造对象；G12 只覆盖了"框架调用点的签名"，没覆盖"原实现内部的构造签名" | **G12 原则推广到构造型符号**：门面签名是厂商真实构造签名的超集，按**调用者**分流——无参=框架语义返回 TTStream，带厂商构造 kwargs=原实现内部，经新增契约 `PlatformAdapter.stream_wrap()` 回落原生对象。admission 新增 `vendor_internal_construction` 守门 |
+
+**G14 的一般化结论**：凡 remap 的符号是**类/构造器**（Stream、Event、Graph…），
+都要检查"该模块的原实现内部是否用它构造对象"。这类调用的身份判据是**调用者**
+（带厂商私有构造参数的只可能是厂商栈自己），不是参数形态；放行原则是原样回落，
+不拿门面冒充厂商内部数据结构。
 
 ### 真实环境校准结果（2026-10-12 KL3 机器实测）
 
@@ -178,6 +184,94 @@ python real_sft_smoke.py --platform cpu     # 无卡机器 dev 验证
 3. `TorchCudaPlatform.sdk_range=("11.0","13.5")` 对定制栈可能需放宽
    （KL3 报 `torch=2.9.0+cu129`，当前取值范围内）；
 4. bf16 vs fp32 的 rel_err 参考值（CPU 实测 7.2e-3，仅打印不卡阈值）。
+
+## 5. 真实模型穿透：Qwen3.5-0.8B 脱离 xswift 跑通（2026-10-12，real_qwen_smoke.py）
+
+开发方针是**穿透优先、不铺面**：完备性现阶段放低，未纳入 policy 的 API
+直接报未实现（default-deny/exception），先把一条端到端链路打穿。
+
+第一个穿透点：**不经 ms-swift / megatron / mcore_bridge，纯 transformers +
+TT Bridge 跑通真实 Qwen3.5-0.8B 的 fwd/bwd/optimizer step。**
+
+| 事实 | 证据 |
+|---|---|
+| xswift_ext/xmegatron_ext 由环境变量控制，无需删包改 `.pth` | `XSWIFT_PLUGIN_ENABLE=0` 即不激活（`auto_init._is_enabled()` 默认 "0"）；实测 `xswift_ext.entry`/`swift`/`megatron`/`mcore_bridge` 全部 `参与=False` |
+| 厂商基座必须保留，且与 TT 共存无冲突 | `torch_xmlir` 经 `torch_xmlir.pth` 的 `hook_torch()` 加载，`参与=True`；XCCL/SYMBOL_REWRITE 照常 |
+| transformers 5.12.1 **内置**支持 `qwen3_5`，无 remote code | 模型目录无 `.py`；`AutoConfig` 直出 `model_type=qwen3_5` |
+| Bridge 绑定被真实框架消费 | `torch.cuda.{synchronize,current_stream,mem_get_info,get_rng_state}` 全部指向 `tt_bridge.platform_mgr.*` |
+| 功能穿透成立 | 单 batch 过拟合 `loss 15.6669 -> 0.0002`（20 步）；admission 14/14 PASS |
+
+**本轮确立的真实接入形态（自造替身察觉不到的）**：
+
+1. **import 时序是硬约束**（§1.2）：`transformers` 必须在 `cuda_compat.activate()`
+   **之后**才 import，否则框架 from-import 持有绑定前的陈旧引用。落地形态是
+   把 `from transformers import AutoModelForCausalLM` 放进函数体而非模块顶部。
+2. **扫尾白名单 = 真实框架包**：`sweep_packages=["transformers", "fla"]`
+   （对照 mock demo 的 `None` 全量扫尾、`real_sft_smoke` 的 `framework_real`）。
+3. **混合架构已跑通**：Qwen3.5 的 `linear_attention`（fla/GatedDeltaNet 系）+
+   `full_attention` 交替层，24 层 0.752B。fla 在该栈回落 CPU（厂商 `xpu_fla`
+   patch 的 triton noop 所致，仅 warning），**功能可达成立**——性能是 Provider
+   面的独立课题，不阻塞功能穿透。
+4. `attn_implementation="eager"` 固定：`flash`/`sdpa` 后端在厂商栈的可用性属
+   Provider 性能面，不进功能穿透的范围。
+
+## 6. 第二个穿透点：`bash run.sh` 经 TT 跑通 swift-megatron（2026-10-12）
+
+目标达成：**原训练脚本一行不改**（仅 env.sh 把两个开关改成可覆盖的默认值），
+加三个环境变量即由 TT 顶替 xswift_ext/xmegatron_ext 跑完整 SFT。
+
+```bash
+TT_PLUGIN_ENABLE=1 XSWIFT_PLUGIN_ENABLE=0 XME_PLUGIN_ENABLE=0 bash run.sh
+```
+
+| 项 | TT 模式 | 对照（原 xswift） |
+|---|---|---|
+| 退出码 | **0** | 0 |
+| 完成 step | **43/43** | 43/43 |
+| checkpoint | 已保存 | 已保存 |
+| 插件 | XSwift/XME Plugin Init **0 处** | 均 Init |
+
+**loss 偏差性质判别**（按 crosshw-numeric-divergence-triage 的口径）：
+43 步 Δ 的正号 24 / 负号 19、均值 +2.4e-05、平均 |Δ| 3.7e-04（相对量级 2e-04）
+——**零均值、符号近似对半**，是规约顺序噪声而非系统性 bias，符合"两套不同
+patch 实现同一语义"的预期。
+
+### 本轮暴露并修复的缺口
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| **G15** | `TypeError: expected a torch.ByteTensor, but got bytes`，死在 `initialize_megatron -> set_random_seed` | **RNG state 契约定错**：我们定为"不透明可序列化对象（bytes）"，但 megatron 的 RNG tracker 把 `torch.cuda.get_rng_state()` 的返回值**原样回喂 torch 原生 `Generator.set_state()`**（`tensor_parallel/random.py:289` 取、`:164` 喂），中途不经我们的 `set_rng_state`——状态对象会**流出 TT 边界** | 契约改为 **torch 原生 ByteTensor**（兼容读旧 bytes）。一般化结论见下 |
+
+**G15 的一般化结论**：**门面的返回值类型必须与被替换符号一致**。这是
+G12「签名必须是真实签名超集」在**返回值**上的对应面——G12 管入参（谁来调），
+G15 管出参（结果流向谁）。判别方法：问"这个返回值会不会被框架交给
+TT 管不到的代码消费？"会，就不能用自定义表示。RNG state、Stream、Event、
+Generator 都属此类；纯数值（`memory_allocated` 的 int、`mem_get_info` 的
+tuple）不属此类，可以自由换算口径。
+
+### 本轮验证的非缺口（避免误判）
+
+- **`SEQ_LEN=2048` 下 `get_rope_index` 崩**（`expanded size (2048) must match
+  existing size (802)`）：对照实验证明**原 xswift 配置同样崩在同一行**，
+  是脚本参数与样本长度不匹配，与 TT 无关。默认 `SEQ_LEN=20480` 下两边都正常。
+  —— 教训：接框架后的每个报错都要先做开关对照，再归因。
+
+### 仍未覆盖（按方针不铺开）
+
+- 多卡 / 分布式（环境不支持）；
+- `default_deny=True` 尚未开启：当前 14 符号够跑通本链路，但"未盘点即报错"
+  的白名单姿态还没立起来，缺口靠探针实测而非机制拦截；
+- 实测仍被调用但未纳入 policy 的符号：`is_initialized`（torch `_lazy_init`）、
+  `is_current_stream_capturing`（AdamW graph capture 健康检查）。
+
+### 下一个穿透点候选（仍是一次只打一个）
+
+| 候选 | 价值 | 代价 |
+|---|---|---|
+| 真实数据 + tokenizer（替合成 ids） | 补齐 SFT 数据面的 CUDA 痕迹（packing 的 `is_initialized` 等） | 低 |
+| checkpoint save/resume（真实权重） | §1.4 "最容易后期暴露"的一环，RNG 契约已就位 | 中 |
+| 单机 2 卡 DP（c10d + XCCL） | B 类 env 切面（`BKCL_*`），分布式是 swift 主链路前提 | 中高 |
+| 接回 ms-swift（关 xswift_ext，用 TT 顶替） | 直面 §1 的 20 符号 6 语义族全集 | 高 |
 
 ### 遗留（不阻塞单卡 SFT smoke，按优先级）
 

@@ -99,7 +99,8 @@
 
 ### P2 —— 记录为已知边界，暂不实现
 
-8. **懒加载 vs code-first 的张力**：FlagOS register 只存字符串路径（不在该平台就绝不 import 其库）；我们 code-first 真实对象引用 import 期即解析（拼写即炸），代价是全部 vendor 实现 eager import。折中候选：provider impl 支持惰性工厂（`impl_factory: Callable[[], Callable]`），门禁期才解析。待讨论。
+8. **懒加载 vs code-first 的张力**：FlagOS register 只存字符串路径（不在该平台就绝不 import 其库）；我们 code-first 真实对象引用 import 期即解析（拼写即炸），代价是全部 vendor 实现 eager import。折中候选：provider impl 支持惰性工厂（`impl_factory: Callable[[], Callable]`），门禁期才解析。
+   **platform 侧已落地（2026-10-12，`platform_specs.py`）**：按"管理面 eager / 适配面 lazy"切开——detect 与身份元数据保持真实引用（code-first 优势不丢），只有实现本体降级为 `impl="module:Class"` 字符串，`_activate()` 才 import。实测佐证了 FlagOS 这条设计的必要性：本机 `import torch_xmlir` 即触发 SYMBOL_REWRITE 与 libbkcl 加载，eager import 全部 vendor adapter 在异构机群上不可接受。另有一条 FlagOS 未记录的收益：PrivateUse1 的 `torch.xpu` 是厂商包运行时注册的属性，类属性 import 期求值必拿 None，惰性是正确性要求而不只是性能优化。**provider 侧仍待办**（见 §4 行动顺序）。
 9. **异构混训（hetero）与"进程级单 platform"假设冲突**。FlagOS hetero 支持同进程多芯片类型（flagcx）；我们 auto_activate 多命中 fail fast。文档明记：若未来做异构混训，该假设要打破。
 10. **契约探测技巧**（inspect 调用方源码判断契约形态，dcp.py 实例）——用于一个 patch 兼容多个上游版本。技巧保留，遇具体案例再用。
 11. **RNG conformance 测试**未实现（定稿已列）；wrap_model 类"不报错只出 NaN"的补丁证明 behavior 类必须配 conformance 背书。

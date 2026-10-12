@@ -9,7 +9,7 @@
 不再有字符串 id 注册表——引用即对象，写错名字 import 期就炸。
 每个测试返回 (ok, detail)。
 """
-from tt_bridge import platform_mgr
+from ttorch.bridge import platform_mgr
 
 
 def set_device_equivalence(ctx):
@@ -64,6 +64,26 @@ def stream_binding(ctx):
           and vc.stream is platform_mgr.stream
           and vc.current_stream is platform_mgr.current_stream)
     return ok, f"Stream/stream/current_stream 绑到门面 -> {ok}"
+
+
+def vendor_internal_construction(ctx):
+    """G14：绑定的爆炸半径——被绑符号所在模块的**原实现内部**也会引用
+    同模块符号，必须仍拿到厂商原生对象。
+
+    `torch.cuda.current_stream` 的全局名空间就是被我们改过的
+    `torch.cuda.__dict__`，其内部 `Stream(stream_id=...)` 会落到门面；
+    门面若不分流，返回的 TTStream 会被当作原生 stream 继续流进厂商栈
+    （实测表现：`'TTStream' object has no attribute 'record_event'`）。
+
+    判据：经门面取当前流，其 .sid 必须是厂商原生类型而非 TTStream。
+    """
+    from ttorch.bridge.platform_adapter import TTStream
+    if not platform_mgr.capability("stream_api"):
+        return True, "平台声明 stream_api=False，无 stream 对象族"
+    sid = platform_mgr.current_stream().sid
+    ok = not isinstance(sid, TTStream)
+    return ok, (f"原实现内部构造回落厂商原生对象 -> {type(sid).__name__}"
+                f"（非 TTStream={ok}）")
 
 
 def make_cap_binding_test(attr, key):

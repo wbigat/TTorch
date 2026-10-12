@@ -9,8 +9,8 @@ CPU(dev) 上。唯一的可移植性约定：设备构造走 bridge 的 device_s
 import torch
 from torch import nn
 
-from tt_bridge import platform_mgr
-from tt_bridge.platform_adapter import TTPlatformError
+from ttorch.bridge import platform_mgr
+from ttorch.bridge.platform_adapter import TTPlatformError
 
 VOCAB, DIM, HEADS, LAYERS, SEQ, BATCH = 512, 256, 4, 2, 64, 8
 

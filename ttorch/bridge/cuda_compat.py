@@ -16,8 +16,8 @@ YAML 降级为生成物（registry.export_yaml 快照，供评审 diff 与 prove
 import importlib
 import sys
 
-from tt_bridge import platform_mgr
-from tt_bridge.registry import Decision, Entry
+from ttorch.bridge import platform_mgr
+from ttorch.bridge.registry import Decision, Entry
 
 
 class TTCompatError(RuntimeError):

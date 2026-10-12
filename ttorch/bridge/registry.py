@@ -102,13 +102,21 @@ def entries() -> Tuple[Entry, ...]:
     return tuple(REGISTRY)
 
 
-def export_yaml(path):
-    """导出快照：评审 diff / provenance 用。生成物，永不手改。"""
+def export_yaml(path, bind_module=None):
+    """导出快照：评审 diff / provenance 用。生成物，永不手改。
+
+    bind_module：只导出绑定到该模块的条目。REGISTRY 是**进程级全局**，
+    一个进程里可能同时注册了多套 policy（mock 的 vendor_cuda 与真实的
+    torch.cuda）——不过滤会把不相关的条目写进快照，导致"CI diff 必须
+    一致"的约定失效（实测：demo 导出的快照混进了 14 条 torch.cuda 条目）。
+    None 表示导出全部（单一 policy 的场景）。
+    """
     import yaml
     rows = [dict(symbol=e.dotted, category=e.category.value, decision=e.decision.value,
                  target=e.target, intent=e.intent,
                  test=e.test.__name__ if e.test else None)
-            for e in REGISTRY]
+            for e in REGISTRY
+            if bind_module is None or (e.bind_module or e.symbol.__module__) == bind_module]
     with open(path, "w") as f:
         yaml.safe_dump({"version": 1, "symbols": rows}, f,
                        allow_unicode=True, sort_keys=False)

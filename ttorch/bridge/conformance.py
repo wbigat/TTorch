@@ -131,9 +131,41 @@ def graph_capture_roundtrip(adapter):
     """graph_capture=True 的背书：硬件确实能捕获执行。"""
     if not adapter.capabilities().get("graph_capture"):
         return Result("graph_capture_roundtrip", True, "declared False，无需背书")
-    r = adapter.hw.capture(lambda: "ok")
-    return Result("graph_capture_roundtrip", r == "ok",
-                  f"{adapter.name}: capture 执行 -> {r}")
+    hw = _hw_hooks(adapter)
+    if hw is not None:
+        r = hw.capture(lambda: "ok")
+        return Result("graph_capture_roundtrip", r == "ok",
+                      f"{adapter.name}: capture 执行 -> {r}")
+    # 真实栈：declared 档"承诺 True 必须有背书"不允许放过，用 torch 原生
+    # graph 实测捕获+重放（判据=replay 真的执行了被捕获的 op，而非 capture
+    # 期顺带执行）。async_comm 可留待 provider 门禁实测，graph_capture 无此兜底。
+    import torch
+    mod = getattr(adapter, "mod", None)
+    if mod is None or not hasattr(mod, "CUDAGraph"):
+        return Result("graph_capture_roundtrip", False,
+                      f"{adapter.name}: 声明 graph_capture=True 但 {mod} 无 CUDAGraph")
+    try:
+        x = torch.ones(8, device=_dev(adapter))
+        main = adapter.stream_current()      # 捕获前的 warmup 必须在 side stream 上
+        side = adapter.stream_create()
+        adapter.stream_wait(side, main)
+        adapter.stream_set(side)
+        x.mul_(1)
+        adapter.stream_set(main)
+        adapter.stream_wait(main, side)
+        g = mod.CUDAGraph()
+        with mod.graph(g):
+            x.mul_(2)
+        before = x.clone()
+        g.replay()
+        adapter.synchronize()
+        ok = bool((x == before * 2).all())
+        detail = f"{adapter.name}: capture+replay 生效={ok}（replay 前 {before[0]} -> 后 {x[0]}）"
+    except Exception as e:
+        ok = False
+        detail = (f"{adapter.name}: 声明 graph_capture=True 但实测捕获失败 "
+                  f"{type(e).__name__}: {e}")
+    return Result("graph_capture_roundtrip", ok, detail)
 
 
 def async_comm_smoke(adapter):
@@ -156,10 +188,14 @@ def async_comm_smoke(adapter):
 def rng_state_roundtrip(adapter):
     """RNG 契约：get->set->get 回环一致；非法值必须抛统一错误（checkpoint
     resume 正确性；xmegatron 的 XPU RNG 对齐补丁证明此路径必踩）。"""
-    from tt_bridge.platform_adapter import TTPlatformError
+    from ttorch.bridge.platform_adapter import TTPlatformError
     s = adapter.get_rng_state()
     adapter.set_rng_state(s)
-    ok = adapter.get_rng_state() == s
+    back = adapter.get_rng_state()
+    # state 是 torch 原生对象（ByteTensor）时 `==` 返回逐元素 tensor，
+    # 直接用作 bool 会抛 "Boolean value of Tensor is ambiguous"——
+    # 契约只要求"回环相等"，比较方式随对象类型走
+    ok = bool((back == s).all()) if hasattr(back, "all") else back == s
     try:
         adapter.set_rng_state(12345)  # 非法类型
         rejected = False

@@ -153,7 +153,9 @@ except platform_mgr.TTPlatformError as e:
 
 print("\n== 8. 导出 YAML 快照（生成物，CI diff 评审用，永不手改）==")
 snap = os.path.join(os.path.dirname(__file__), "policy_snapshot.yaml")
-registry.export_yaml(snap)
+# 限定 mock policy：REGISTRY 是进程级全局，真实 torch.cuda 的条目
+# （bindings_torch）若被 import 过也在其中，不过滤会污染本快照
+registry.export_yaml(snap, bind_module="vendor_cuda")
 with open(snap) as f:
     print("\n".join("  " + line for line in f.read().splitlines()[:8]))
 print(f"  ...（完整快照见 {os.path.basename(snap)}，提交时 diff 必须一致）")

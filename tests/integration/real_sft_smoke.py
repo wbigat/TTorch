@@ -23,10 +23,7 @@ import sys
 import torch
 
 import framework_real
-from tt_bridge import bindings_torch, cuda_compat, platform_mgr
-from tt_bridge.adapters_real import (TorchCpuPlatform, TorchCudaPlatform,
-                                     TorchXpuMasqueradePlatform,
-                                     TorchXpuNativePlatform)
+from ttorch.bridge import bindings_torch, cuda_compat, platform_mgr, platform_specs
 
 
 def rel_err(a, b):
@@ -40,9 +37,10 @@ def main():
     ap.add_argument("--steps", type=int, default=50)
     args = ap.parse_args()
 
-    for cls in (TorchCudaPlatform, TorchXpuMasqueradePlatform,
-                TorchXpuNativePlatform, TorchCpuPlatform):
-        platform_mgr.register(cls)
+    # 注册只登记轻量 spec：四个平台的实现本体此刻都未被 import，
+    # 激活哪个才 import 哪个（见 platform_specs.py 模块注释）
+    for spec in platform_specs.REAL_PLATFORMS:
+        platform_mgr.register(spec)
 
     print(f"[env] torch={torch.__version__}")
     if args.platform == "auto":

@@ -247,7 +247,20 @@ Platform 声明支持的契约版本；契约变更需全平台回归。
 
 ### 4.1a 激活方式：自动检测 + 证据打印 + override 逃生通道（2026-10-10 三次定稿）
 
-Platform Manager 管理**所有 platform 类型的逻辑注册**（register 只登记元数据，不初始化），启动期**自动分析当前环境**决定激活哪一个：
+> **管理面/适配面分文件 + 实现惰性导入（2026-10-12 落地，`platform_specs.py`）**：
+> register 登记的是轻量 `PlatformSpec`（身份元数据 + `detect` + 实现模块路径 `impl`），
+> 实现本体由 `_activate()` 在平台确定后才 import。两条硬理由：
+> ① **厂商包 import 有副作用**——KL3 的 `torch_xmlir` 一经 import 即执行
+> SYMBOL_REWRITE（torch/deepspeed/transformers）并加载 libbkcl/XCCL，在非该硬件的
+> 机器上轻则污染进程重则 ImportError；② **PrivateUse1 栈的设备模块是运行时注册的**
+> （`_register_device_module`），`mod = getattr(torch, "xpu", None)` 作为类属性在
+> import 期求值必然拿到 None，故 adapter 改持 `mod_path` 字符串、激活期解析。
+> 由此 `platform_specs.py` 有一条硬约束：**detect 只许 `find_spec`（查找不导入）/
+> torch 自带 API / 设备节点探测，禁止 import 任何厂商包**——这正是"detect 只看不
+> 初始化"在代码组织上的落地。detect 保持真实函数引用（code-first 不丢），只有实现
+> 本体降级为字符串路径。
+
+Platform Manager 管理**所有 platform 类型的逻辑注册**（register 只登记元数据，不初始化、不导入实现），启动期**自动分析当前环境**决定激活哪一个：
 
 - 每个 adapter 实现 `detect()` 存在性探测（查驱动/SO/设备节点，**只看不初始化**），返回 `(present, evidence)`；
 - `auto_activate()` 对全部候选逐一探测并**逐条打印证据**，恰好一个命中 → 激活；零命中 → fail fast 并列出探测报告；**多命中 → fail fast 拒绝猜测**（进程级单 platform 假设被破坏，必须人工介入）；

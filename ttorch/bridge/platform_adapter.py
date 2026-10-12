@@ -105,10 +105,18 @@ class PlatformAdapter:
         raise NotImplementedError
 
     def set_rng_state(self, state, device=None):
-        """恢复 RNG 状态（checkpoint resume）。state 契约：不透明可序列化
-        对象（mock=str，真实 adapter=torch ByteTensor 序列化的 bytes），
-        唯一要求是 get/set 回环相等；非法值必须抛
-        TTPlatformError(category="invalid_rng_state")。"""
+        """恢复 RNG 状态（checkpoint resume）。
+
+        state 契约 = **该平台 torch 栈的原生 RNG state 对象**（真实 adapter
+        是 torch ByteTensor；mock adapter 用 str 自洽即可）。要求有二：
+        get/set 回环相等；非法值抛 TTPlatformError("invalid_rng_state")。
+
+        为什么不是"不透明可序列化对象"（G15 修正）：该对象会**流出 TT
+        边界**——megatron 的 RNG tracker 把 get_rng_state() 的结果直接
+        回喂 torch 原生 `Generator.set_state()`，不经我们的 set_rng_state。
+        门面的返回值类型必须与被替换符号一致，否则框架拿到的是我们的
+        自定义表示，在 TT 管不到的地方炸。
+        """
         raise NotImplementedError
 
     # --- stream 原语（swift megatron 路径 ddp fencing 必触发） ---
@@ -127,6 +135,27 @@ class PlatformAdapter:
     def stream_wait(self, waiter, waitee):
         """跨流依赖：waiter 等 waitee 完成。"""
         raise NotImplementedError
+
+    def stream_wrap(self, **kwargs):
+        """按厂商原生构造参数造一个**原生** stream 对象（不是 TTStream）。
+
+        存在理由（G14，G12"门面签名是 torch 真实签名超集"的推广）：
+        remap 的爆炸半径不止于框架调用点——被绑定符号所在模块的**原实现
+        内部**也会引用同模块的其他符号。`torch.cuda.current_stream` 的
+        全局命名空间就是 `torch.cuda.__dict__`，绑定 `torch.cuda.Stream`
+        后，它内部 `Stream(stream_id=..., device_index=..., device_type=...)`
+        拿到的是我们的门面。
+
+        所以构造型符号的门面必须覆盖两种调用者：
+        - 框架调用（无参）-> 门面语义，返回 TTStream 句柄；
+        - 原实现内部调用（带厂商构造 kwargs）-> 本方法，返回原生对象。
+
+        判据是"调用者是谁"，不是"参数长什么样"：带厂商私有构造参数的
+        只可能是厂商栈自己，此时必须原样放行，否则等于拿门面去冒充厂商
+        内部数据结构。
+        """
+        raise TTPlatformError(
+            "unsupported", f"{self.name}: 不支持按厂商构造参数包装 stream {sorted(kwargs)}")
 
     def stream_key(self, sid):
         """stream 身份的稳定可比较 key（conformance 判等用）。
@@ -153,5 +182,6 @@ class PlatformAdapter:
         raise NotImplementedError
 
     def get_rng_state(self, device=None):
-        """读 RNG 状态（checkpoint save）。契约：不透明可序列化对象。"""
+        """读 RNG 状态（checkpoint save）。契约见 set_rng_state：平台 torch
+        栈的原生 state 对象，会被框架直接回喂 torch 原生 API。"""
         raise NotImplementedError

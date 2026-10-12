@@ -11,7 +11,7 @@ platform_adapter.py（契约）与 adapters.py（各实现）。
 """
 from contextlib import contextmanager
 
-from tt_bridge.platform_adapter import TTPlatformError, TTStream  # noqa: F401  # 再导出
+from ttorch.bridge.platform_adapter import TTPlatformError, TTStream  # noqa: F401  # 再导出
 
 
 # ------------------------------------------------------------------
@@ -44,9 +44,20 @@ _active = None
 _caps_cache = None  # probe 期填充一次的静态事实缓存
 
 
-def register(adapter_cls):
-    """逻辑注册 platform 类型：只登记元数据，不初始化。"""
-    _REGISTRY[adapter_cls.name] = adapter_cls
+def register(entry):
+    """逻辑注册 platform 类型：只登记元数据，不初始化、不导入实现。
+
+    entry 两种形态，统一按属性访问（name/vendor_name/device_name/
+    detect/auto_detect/masquerades_as 两者同名同义）：
+
+    - **PlatformSpec**（platform_specs.py，真实平台走这条）：带 `impl` 字段，
+      实现本体在 _activate() 才 import——厂商包的 import 副作用与
+      PrivateUse1 运行时注册问题由此规避，见该文件模块注释；
+    - **已 import 的 adapter 类**（mock / 测试夹具）：无厂商依赖，直接登记。
+
+    `impl` 字段的有无即"是否惰性"的判据。
+    """
+    _REGISTRY[entry.name] = entry
 
 
 def _ver_tuple(s):
@@ -82,13 +93,38 @@ def _validate_caps(caps):
     return out
 
 
+def _load(entry):
+    """解析出 adapter 实例——**惰性导入的唯一落点**。
+
+    带 impl 的 spec 形态在此才 import 实现模块：进程里只会激活一个
+    platform，其余候选的厂商实现永远不被导入。身份以 spec 为唯一真相，
+    注入实例（与 identity 档"adapter 不许自报"一致）。
+    """
+    impl = getattr(entry, "impl", None)
+    if impl is None:
+        return entry()  # 已 import 的 adapter 类（mock/测试夹具）
+    mod_path, _, cls_name = impl.partition(":")
+    print(f"[platform_mgr] lazy-import {entry.name}: {impl}")
+    import importlib
+    try:
+        module = importlib.import_module(mod_path)
+        adapter_cls = getattr(module, cls_name)
+    except (ImportError, AttributeError) as e:
+        raise TTPlatformError(
+            "platform", f"{entry.name}: 实现 '{impl}' 导入失败: {e}") from e
+    inst = adapter_cls()
+    for k in ("name", "vendor_name", "device_name"):
+        setattr(inst, k, getattr(entry, k))
+    return inst
+
+
 def _activate(name, how):
-    """激活流水线：实例化 → 版本协商 → init → caps schema 校验 →
-    conformance 门禁。任一不过则拒绝激活，不切换 _active。"""
+    """激活流水线：惰性导入实现 → 实例化 → 版本协商 → init → caps schema
+    校验 → conformance 门禁。任一不过则拒绝激活，不切换 _active。"""
     global _active, _caps_cache
     if name not in _REGISTRY:
         raise KeyError(f"platform '{name}' 未注册，可选: {sorted(_REGISTRY)}")
-    candidate = _REGISTRY[name]()
+    candidate = _load(_REGISTRY[name])
 
     lo, hi = _ver_tuple(candidate.sdk_range[0]), _ver_tuple(candidate.sdk_range[1])
     sdk = _ver_tuple(candidate.sdk_version())
@@ -110,7 +146,7 @@ def _activate(name, how):
             "mandatory_capability",
             f"{name} 训练强制能力不满足: {lacking}（声明 False 即淘汰，不靠测试偶遇）")
 
-    from tt_bridge import conformance  # 延迟 import 避免环
+    from ttorch.bridge import conformance  # 延迟 import 避免环
     results = conformance.run(candidate)
     failed = [r for r in results if not r.ok]
     for r in results:
@@ -143,10 +179,10 @@ def auto_activate():
     torch.cuda.is_available() 报 True，没有这层会把冒充者当真 NVIDIA。
     """
     hits = {}  # name -> evidence
-    for name, cls in _REGISTRY.items():
-        if not getattr(cls, "auto_detect", True):
+    for name, entry in _REGISTRY.items():
+        if not getattr(entry, "auto_detect", True):
             continue
-        ok, evidence = cls.detect()
+        ok, evidence = entry.detect()  # spec 的函数字段与类的 classmethod 调用形态一致
         print(f"[platform_mgr] detect {name}: {'present' if ok else 'absent'} ({evidence})")
         if ok:
             hits[name] = evidence
@@ -281,7 +317,7 @@ def mem_get_info(device=None):
 
 
 def get_rng_state(device=None):
-    """checkpoint save 的 RNG 状态读取（不透明可序列化对象契约）。"""
+    """checkpoint save 的 RNG 状态读取（torch 原生 ByteTensor 契约，见 G15）。"""
     _require_cap("rng_state", "get_rng_state")
     return active().get_rng_state(device)
 
@@ -300,10 +336,19 @@ def set_rng_state(state, device=None):
 # --- stream 对象族（swift megatron 路径 ddp fencing 必触发） ---
 
 class Stream:
-    """门面 Stream：框架 new 出来的是 TTStream 句柄（对象形态与 CUDA 一致）。"""
+    """门面 Stream：框架 new 出来的是 TTStream 句柄（对象形态与 CUDA 一致）。
 
-    def __new__(cls):
+    签名是厂商真实签名的超集（G12 原则，构造型符号的形态）：绑定
+    `torch.cuda.Stream` 后，厂商栈**原实现内部**的构造调用也会落到这里
+    （`current_stream` 内部的 `Stream(stream_id=...)`，因为它的全局名空间
+    就是被我们改过的 `torch.cuda.__dict__`）。两类调用者必须分流，见
+    PlatformAdapter.stream_wrap 的说明。
+    """
+
+    def __new__(cls, **kwargs):
         _require_cap("stream_api", "Stream")
+        if kwargs:  # 厂商栈内部构造：原样放行，不拿门面冒充其内部数据结构
+            return active().stream_wrap(**kwargs)
         return TTStream(active(), active().stream_create())
 
 
@@ -312,12 +357,17 @@ def current_stream():
     return TTStream(active(), active().stream_current())
 
 
+def _sid_of(s):
+    """取 stream id：框架传 TTStream 句柄，厂商栈内部可能直接传原生对象。"""
+    return s.sid if isinstance(s, TTStream) else s
+
+
 @contextmanager
 def stream(s):
     """stream 上下文管理器：进入切当前流，退出恢复原流。"""
     a = active()
     prev = a.stream_current()
-    a.stream_set(s.sid)
+    a.stream_set(_sid_of(s))
     try:
         yield s
     finally:

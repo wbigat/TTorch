@@ -14,9 +14,9 @@
 """
 import torch.cuda
 
-from tt_bridge import admission, platform_mgr
-from tt_bridge import registry as _registry
-from tt_bridge.registry import Category, Decision, Entry, binding_register
+from ttorch.bridge import admission, platform_mgr
+from ttorch.bridge import registry as _registry
+from ttorch.bridge.registry import Category, Decision, Entry, binding_register
 
 B, S, C = Category.BEHAVIOR, Category.STATE_QUERY, Category.CAPABILITY
 R = Decision.REMAP
@@ -42,8 +42,10 @@ binding_register(Entry(symbol=torch.cuda.synchronize, category=B, decision=R,
                intent="device-wide 等待；torch 原生语义与契约一致", bind_module=M))
 
 binding_register(Entry(symbol=torch.cuda.Stream, category=B, decision=R,
-               impl=platform_mgr.Stream, test=admission.stream_binding,
-               intent="stream 对象族；ddp fencing 必触发", bind_module=M))
+               impl=platform_mgr.Stream, test=admission.vendor_internal_construction,
+               intent="stream 对象族；ddp fencing 必触发。门面签名是厂商构造签名的"
+                      "超集（G14）：原实现内部的 Stream(stream_id=...) 必须回落原生对象",
+               bind_module=M))
 binding_register(Entry(symbol=torch.cuda.current_stream, category=S, decision=R,
                impl=platform_mgr.current_stream, test=admission.stream_binding,
                intent="当前 stream 句柄（动态只读）", bind_module=M))
@@ -53,7 +55,7 @@ binding_register(Entry(symbol=torch.cuda.stream, category=B, decision=R,
 
 binding_register(Entry(symbol=torch.cuda.set_rng_state, category=B, decision=R,
                impl=platform_mgr.set_rng_state, test=admission.rng_binding,
-               intent="checkpoint resume 恢复 RNG；bytes 契约", bind_module=M))
+               intent="checkpoint resume 恢复 RNG；torch 原生 ByteTensor 契约", bind_module=M))
 binding_register(Entry(symbol=torch.cuda.empty_cache, category=B, decision=R,
                impl=platform_mgr.empty_cache, test=admission.empty_cache_binding,
                intent="allocator 提示；尽力语义", bind_module=M))
@@ -73,7 +75,7 @@ binding_register(Entry(symbol=torch.cuda.mem_get_info, category=S, decision=R,
                intent="(free, total) 字节元组", bind_module=M))
 binding_register(Entry(symbol=torch.cuda.get_rng_state, category=S, decision=R,
                impl=platform_mgr.get_rng_state, test=admission.rng_binding,
-               intent="checkpoint save 读 RNG（bytes 契约）", bind_module=M))
+               intent="checkpoint save 读 RNG（torch 原生 ByteTensor；会被 megatron 回喂 Generator.set_state）", bind_module=M))
 
 # --- 能力 ---
 
