@@ -147,6 +147,20 @@ P0 接口族在 mock demo 验证后，移植真实 torch 时又暴露出四个 m
 | G10 | **adapter 直调 `mod.X` 会无限递归**：绑定后 `torch.cuda.synchronize` 已是门面，adapter 再调就是 门面→adapter→门面 | mock adapter 用独立 hw 对象，不经过被 patch 模块 | 真实 adapter 全部经 `_orig(name)` 走 `_origin_` 留痕（绑定机制顺带产物成为官方逃生通道） |
 | G11 | **能力类绑定的"说谎"半径**：cpu-dev 上把 `torch.cuda.is_available` 绑成 True，AdamW 的 graph capture 健康检查经 `torch.accelerator` 走到 dummy cuda 直接炸 | mock 没有"torch 内部也消费这些符号"的维度 | 平台 overlay 最小实例：torch.cuda 为非功能桩的栈剔除能力类绑定，框架语义由 `platform_mgr.capability()` 直接供给；masquerade 栈无此问题（shim 真实可工作） |
 | G12 | 门面签名必须是 torch 真实签名超集（`synchronize(device)` 等可选 device 参） | mock 调用点全部无参 | 契约/门面/adapter 全链路 `device=None` |
+| G13 | `get_rng_state(None)` 在 torch 2.9 会炸（内部直接 `device.index`）——None=当前设备必须**省略实参**，不能位置透传 None | KL3 真机 conformance 首跑 Traceback 实锤（2026-10-12） | adapter 内 `fn() if device is None else fn(device)` |
+
+### 真实环境校准结果（2026-10-12 KL3 机器实测）
+
+1. **masquerade 探测通道已闭环**：真实卡名是通用的 `"gpu"`，`_XPU_MARKERS`
+   卡名标记法不可靠；改用**厂商包存在性**作为 native 探测通道
+   （`_XPU_NATIVE_PACKAGES=("torch_xmlir",)`——该栈预装 torch_xmlir 并由此
+   加载 libbkcl/XCCL）。同时 `TorchCudaPlatform.detect` 增加防御：厂商包在场时
+   cuda claim 直接不成立（masquerade 防护双保险，不再只依赖降级机制）。
+2. **附带观察**：KL3 栈自带 SYMBOL_REWRITE（torch/deepspeed/transformers）与
+   xpu_fla triton patch——厂商栈有自己的 monkey-patch 层，TT cuda-compat 是
+   叠加其上的第二层，绑定顺序须保证厂商栈先就位（import torch 时它已生效）。
+3. mock 双 demo 在该环境完整跑通（含全部 conformance/admission/red 用例），
+   证明 Bridge/Provider 机制与真实厂商栈共存无冲突。
 
 ### 真实 XPU 环境执行清单（real_sft_smoke.py）
 
@@ -158,11 +172,11 @@ python real_sft_smoke.py --platform cpu     # 无卡机器 dev 验证
 ```
 
 待真实环境校准（本地 CPU 路径已验证之外）：
-1. masquerade 卡名标记 `_XPU_MARKERS=("xpu","kl3")` 是否命中真实卡名
-   ——看 detect 行打印的卡名，不中就补标记；
+1. ~~masquerade 卡名标记命中~~ **已闭环**（见上节：改用 torch_xmlir 厂商包探测）；
 2. native xpu 栈 `mem_get_info/get_rng_state` 是否存在——不存在会自动
    声明 capability=False 并降级，看 conformance 的 skipped 行；
-3. `TorchCudaPlatform.sdk_range=("11.0","13.5")` 对定制栈可能需放宽；
+3. `TorchCudaPlatform.sdk_range=("11.0","13.5")` 对定制栈可能需放宽
+   （KL3 报 `torch=2.9.0+cu129`，当前取值范围内）；
 4. bf16 vs fp32 的 rel_err 参考值（CPU 实测 7.2e-3，仅打印不卡阈值）。
 
 ### 遗留（不阻塞单卡 SFT smoke，按优先级）

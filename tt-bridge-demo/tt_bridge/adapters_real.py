@@ -20,6 +20,8 @@
 - masquerade 栈的 sdk_version 来源（torch.version.cuda 在定制栈上的取值）；
 - torch.xpu 原生栈的 mem_get_info/get_rng_state 是否存在（缺失会自动降级）。
 """
+import importlib.util
+
 import torch
 
 from tt_bridge.platform_adapter import PlatformAdapter, TTPlatformError
@@ -27,6 +29,12 @@ from tt_bridge.platform_adapter import PlatformAdapter, TTPlatformError
 # masquerade 探测标记：torch.cuda.get_device_name() 含这些子串时，
 # 说明 torch.cuda 背后不是 NVIDIA（待真实环境校准的卡名清单）
 _XPU_MARKERS = ("xpu", "kl3")
+
+# KL3 厂商栈的 native 探测通道：torch_xmlir 包存在性。
+# 真实环境校准结论（2026-10-12，KL3 机器实测）：卡名是通用的 "gpu"，
+# _XPU_MARKERS 不命中；但该环境 torch_xmlir 随栈预装（libbkcl/XCCL 由其
+# 加载），包存在性是厂商私有通道，不会被 NVIDIA 栈误命中。
+_XPU_NATIVE_PACKAGES = ("torch_xmlir",)
 
 
 def _cuda_device_name():
@@ -127,7 +135,11 @@ class _TorchAccelBase(PlatformAdapter):
     # --- RNG（bytes 契约）---
     def get_rng_state(self, device=None):
         try:
-            return _rng_to_bytes(self._orig("get_rng_state")(device))
+            # torch>=2.x 的 get_rng_state(device) 不接受 None（内部 device.index），
+            # None=当前设备必须省略实参，不能位置透传
+            fn = self._orig("get_rng_state")
+            state = fn() if device is None else fn(device)
+            return _rng_to_bytes(state)
         except Exception as e:
             raise TTPlatformError("rng_state", str(e)) from e
 
@@ -175,6 +187,9 @@ class TorchCudaPlatform(_TorchAccelBase):
     def detect(cls):
         if not torch.cuda.is_available():
             return False, "torch.cuda.is_available()=False"
+        for pkg in _XPU_NATIVE_PACKAGES:
+            if importlib.util.find_spec(pkg) is not None:
+                return False, f"厂商包 {pkg} 已安装：疑似 masquerade 栈，cuda claim 不成立"
         name = _cuda_device_name()
         if any(k in name for k in _XPU_MARKERS):
             return False, f"CUDA API 存在但卡名 '{name}' 命中 XPU 标记（masquerade，不计为 NVIDIA）"
@@ -196,10 +211,16 @@ class TorchXpuMasqueradePlatform(_TorchAccelBase):
     def detect(cls):
         if not torch.cuda.is_available():
             return False, "torch.cuda.is_available()=False"
+        hits = []
+        for pkg in _XPU_NATIVE_PACKAGES:
+            if importlib.util.find_spec(pkg) is not None:
+                hits.append(f"厂商包 {pkg} 已安装（native 通道）")
         name = _cuda_device_name()
         if any(k in name for k in _XPU_MARKERS):
-            return True, f"torch.cuda 背后卡名 '{name}' 命中 XPU 标记（masquerade 栈）"
-        return False, f"卡名 '{name}' 无 XPU 标记"
+            hits.append(f"卡名 '{name}' 命中 XPU 标记")
+        if hits:
+            return True, "torch.cuda 背后是 masquerade 栈：" + "；".join(hits)
+        return False, f"卡名 '{name}' 无 XPU 标记，厂商包 {list(_XPU_NATIVE_PACKAGES)} 均未安装"
 
 
 class TorchXpuNativePlatform(_TorchAccelBase):
