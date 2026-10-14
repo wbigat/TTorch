@@ -11,8 +11,7 @@
 
 因此构建期动态计算 purelib 相对 data 的路径（通常是
 `lib/pythonX.Y/site-packages`）。代价：产出的 wheel 与构建时的
-Python 小版本绑定——这是 `.pth` 类包的固有性质（厂商的
-torch_xmlir / xswift_ext 同样如此），不是本项目的设计缺陷。
+Python 小版本绑定——这是 `.pth` 类包的固有性质，不是本项目的设计缺陷。
 """
 import os
 import sysconfig

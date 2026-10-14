@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 **/.DS_Store
+**/._*
 
 # 构建产物（build/ 残留会导致 wheel 打包旧代码，见 scripts/build_and_install.sh）
 build/

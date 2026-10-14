@@ -12,7 +12,7 @@
         （跨硬件精度口径；bf16 vs fp32 的 rel_err 只打印不卡阈值）
 
 真实 XPU 环境待验证项（本地 CPU 已验证路径之外）：
-  - masquerade 探测的卡名标记是否命中真实 XPU 卡（ adapters_real._XPU_MARKERS ）
+  - masquerade 探测的卡名标记是否命中真实 XPU 卡（ spec.py 的 _XPU_MARKERS ）
   - native xpu 栈的 mem_get_info/get_rng_state 是否存在（缺失自动降级，看日志）
   - SDK 版本协商范围（TorchCudaPlatform.sdk_range 对定制栈可能需放宽）
 """
@@ -23,7 +23,8 @@ import sys
 import torch
 
 import framework_real
-from ttorch.bridge import bindings_torch, cuda_compat, platform_mgr, platform_specs
+from ttorch.bridge import module_binding, cuda_compat
+from ttorch.platform import manager
 
 
 def rel_err(a, b):
@@ -37,30 +38,21 @@ def main():
     ap.add_argument("--steps", type=int, default=50)
     args = ap.parse_args()
 
-    # 注册只登记轻量 spec：四个平台的实现本体此刻都未被 import，
-    # 激活哪个才 import 哪个（见 platform_specs.py 模块注释）
-    for spec in platform_specs.REAL_PLATFORMS:
-        platform_mgr.register(spec)
+    # 内置平台已在 import ttorch.platform 时自动注册（adapters/__init__ 扫描）
 
     print(f"[env] torch={torch.__version__}")
     if args.platform == "auto":
-        platform_mgr.auto_activate()
+        manager.auto_activate()
     else:
-        platform_mgr.select(args.platform)
-    print(f"[env] vendor={platform_mgr.vendor_name()} "
-          f"device_name={platform_mgr.device_name()} "
-          f"device_spec={platform_mgr.device_spec()}")
+        manager.select(args.platform)
+    print(f"[env] vendor={manager.activation().vendor_name} "
+          f"device_name={manager.activation().device_name} "
+          f"device_spec={manager.activation().device_spec()}")
 
     print("\n== 1. cuda-compat 绑定真实 torch.cuda（扫尾白名单=framework_real）==")
-    # 平台 overlay：torch.cuda 为非功能桩的栈（cpu-dev）剔除能力类绑定，
-    # 避免 is_available 的"真"回答误导 torch 内部守卫（见 bindings_torch.entries）
-    exclude_cap = platform_mgr.device_name() == "cpu"
-    entries = bindings_torch.entries(exclude_capability=exclude_cap)
+    entries = module_binding.entries()
     cuda_compat.activate(entries, default_deny=False,
                          sweep_packages=["framework_real"])
-    if exclude_cap:
-        print("  平台 overlay：cpu-dev 剔除能力类绑定，"
-              "is_available 语义由 platform_mgr.capability 直接供给")
 
     print("\n== 2. admission：绑定正确性 ==")
     ctx = {"vendor_cuda": torch.cuda}
@@ -70,7 +62,7 @@ def main():
         print(f"  [{'PASS' if ok else 'FAIL'}] {e.test.__name__}: {detail}")
         n_fail += 0 if ok else 1
 
-    dev = torch.device(platform_mgr.device_spec())
+    dev = torch.device(manager.activation().device_spec())
     print(f"\n== 3. 功能验收：fp32 SFT（device={dev}）==")
     losses, logits_fp32, mem_info, n_params = framework_real.sft_run(
         dev, args.steps, "fp32")
@@ -93,7 +85,7 @@ def main():
     print(f"  fp32 rel_err={err_fp32:.3e}（阈值 5e-3）  bf16 rel_err={err_bf16:.3e}（参考值）")
     prec_ok = err_fp32 < 5e-3
 
-    platform_mgr.finalize()
+    manager.finalize()
 
     print("\n== 判定 ==")
     checks = {"admission": n_fail == 0, "functional_fp32": func_ok,

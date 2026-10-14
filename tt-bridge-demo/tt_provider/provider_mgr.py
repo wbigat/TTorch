@@ -78,7 +78,7 @@ _platform_probe = None  # attach_platform() 注入：() -> 当前平台名
 
 
 def attach_platform(probe):
-    """注入平台名来源（demo: lambda: platform_mgr.active().name）。"""
+    """注入平台名来源（demo: lambda: manager.activation().name）。"""
     global _platform_probe
     _platform_probe = probe
 

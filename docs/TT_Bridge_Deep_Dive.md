@@ -15,9 +15,9 @@ Bridge 由两大块组成，**组织上同属 Bridge**：
 | Platform Manager | 多 platform 注册/选择/构建/probe + 每平台 adapter（填非标接口 gap）；**统一 runtime 接口是它的顺带产物** | 随硬件/SDK 演进，中等 |
 
 > **统一接口不再是独立模块**（2026-10-10 修正，替代之前"三大块"的划分）：  
-> 原 TT Universal API 没有任何独立语义内容——契约由 `PlatformAdapter` 接口定义，  
+> 原 TT Universal API 没有任何独立语义内容——契约由 `PlatformHandle` 接口定义，  
 > 分发是 `select()` 之后一行转发的机械门面。所以它作为**概念/契约**存在（见 §3），  
-> 作为**代码**并入 Platform Manager：`PlatformAdapter`（契约本体）+ 模块级门面函数（分发器）。  
+> 作为**代码**并入 Platform Manager：`PlatformHandle`（契约本体）+ 模块级门面函数（分发器）。  
 > 这也理顺了 accelerator 代理路径：官方已支持的符号，policy 的 remap target 以后可直接指  
 > `torch.accelerator.*`，连门面都绕过——门面只为扩展位存在，更不该独立成模块。
 
@@ -26,15 +26,14 @@ Bridge 由两大块组成，**组织上同属 Bridge**：
 ```text
 框架 CUDA 调用点（不改框架源码，运行时重绑）
    → cuda_compat 逐符号决策
-       ├─ remap      → Platform Manager 门面（行为/状态查询）或 capability 缓存（能力）
-       │             → active adapter → 厂商接口
+       ├─ remap      → interface 转发函数 → 激活的 platform 实现 → 厂商接口
        ├─ fallback   → torch-native 等价路径（不经过门面）
        └─ exception  → 明确报错
 ```
 
 **要守的是依赖方向，不是包归属**：
 
-- Provider 可依赖 Platform Manager（门面函数、capability、stream/event 契约）；
+- Provider 可依赖 Platform Manager（门面函数、接口存在性内省、stream/event 契约）；
 - Provider **不依赖** `cuda_compat`（不碰框架调用点替换）；
 - `cuda_compat` **不依赖** Provider（功能判定里没有"等 Provider 来救"）。
 
@@ -100,9 +99,8 @@ Bridge 必须在 **framework import / model build 之前**激活。多框架组�
 ```yaml
 - symbol: torch.cuda.set_device
   intent: 把当前进程绑定到一张加速设备
-  category: behavior                   # behavior / state_query / capability
   decision: remap                      # remap / fallback / exception
-  target: platform.set_device          # 门面函数（行为/状态查询）或 cap:<key>（能力）
+  target: set_device                   # interface 的转发函数
   test_id: compat.test.device.set_device_equivalence
   framework_range: "swift>=3.0"
   notes: 仅覆盖"选择当前设备"语义，不含可见性过滤
@@ -123,7 +121,7 @@ v4 的 YAML+校验器是在弥补字符串引用的缺陷，v5 让大部分缺�
 | 忘注册              | —            | 默认拒绝兜底（未注册符号绑 exception）                                                    |
 | 可评审 diff         | 手改 YAML      | **YAML 降级为生成物**：`export_yaml()` 快照，CI diff 必须一致，永远与代码同步                     |
 
-保留下来的机制不变：显式 `register()`（不用装饰器——数据流显式，且"忘注册"有默认拒绝兜底）、`__post_init__` 形态一致性检查（remap 不许免检、capability 不许带 impl）、默认拒绝 + coverage 对账、冻结（frozen dataclass）。
+保留下来的机制不变：显式 `register()`（不用装饰器——数据流显式，且"忘注册"有默认拒绝兜底）、`__post_init__` 形态一致性检查（remap 不许免检）、默认拒绝 + coverage 对账、冻结（frozen dataclass）。
 
 **唯一新增的设计约束**：`symbol=vendor_cuda.set_device` 要求 policy 模块 import 目标模块。真实场景中 `torch.cuda` 很轻，但若框架的 CUDA 痕迹藏在重量级模块里，policy 加载时机要与 bootstrap 顺序协调。
 
@@ -152,7 +150,7 @@ v4 的 YAML+校验器是在弥补字符串引用的缺陷，v5 让大部分缺�
 
 | 决策                   | 行为                                                        |
 | -------------------- | --------------------------------------------------------- |
-| `remap`              | 已证明等价，改绑到 Platform Manager 门面（行为/状态查询）或 capability 缓存（能力） |
+| `remap`              | 已证明等价，改绑到 interface 的转发函数（统一转发到激活的 platform 实现） |
 | `fallback`（含 forbid） | 放弃该能力，走 torch-native 等价路径或显式禁用，**不经过门面**                  |
 | `exception`          | 无等价且必需 → 明确报错，不静默伪装                                       |
 
@@ -167,12 +165,12 @@ v4 的 YAML+校验器是在弥补字符串引用的缺陷，v5 让大部分缺�
 ## 3. 统一 runtime 接口：契约层（非独立模块，Provider 也消费）
 
 > 本章内容是**契约**——接口的语义约定与分类规则。代码形态上它已并入  
-> Platform Manager（`PlatformAdapter` + 门面函数），见 §0。
+> Platform Manager（`PlatformHandle` + 门面函数），见 §0。
 
 ### 3.1 取交集 + 扩展协议，避免膨胀
 
 - **核心契约** = 所有 platform 必须实现（取交集）
-- **扩展协议** = capability 声明，由 Provider 消费
+- **扩展协议** = 可选能力，由 Provider 消费（是否存在由实测/内禀判定，不经平台自报）
 
 不这么做，"universal"会膨胀成谁都实现不全的接口。
 
@@ -186,11 +184,13 @@ v4 的 YAML+校验器是在弥补字符串引用的缺陷，v5 让大部分缺�
    | 判定问题                                   | 是                      | 否                            |
    | -------------------------------------- | ---------------------- | ---------------------------- |
    | Q1 调用有副作用？（改设备/runtime 状态、入队工作、影响后续执行） | **行为接口** → 统一门面 / 扩展位  | 进 Q2                         |
-   | Q2 答案在进程生命周期内会变？                       | **状态查询** → 门面只读接口，不许缓存 | **静态事实** → capability schema |
-   - capability schema：probe 期一次填充的静态事实，消费者是选择/门禁逻辑；
+   | Q2 答案在进程生命周期内会变？                       | **状态查询** → 门面只读接口，不许缓存 | **静态事实** → 也按只读接口处理 |
    - 状态查询 API：只读但动态（`memory_allocated`、`mem_get_info`），热路径实时读；
-   - 行为 API：有副作用，走门面分发到 active adapter。
-   - **平局规则**：分不清时默认归 runtime API——动态查询错当 capability 是正确性 bug（读到过期值），静态事实错当 API 只是多一次调用，代价不对称，倒向安全侧。
+   - 行为 API：有副作用，走门面分发到激活的 platform 实现；
+   - 静态事实（`is_available`/`device_count` 等）：查询本身廉价。2026-10-14 起
+     不再为它们单设 capability 缓存表，与状态查询同为普通只读接口——
+     不值得为廉价查询建一套 probe 期填充 + 校验的机制。
+   - **平局规则**：分不清时默认归 runtime API——动态查询错当静态缓存是正确性 bug（读到过期值），静态事实错当 API 只是多一次调用，代价不对称，倒向安全侧。
 
 **处置原则（2026-10-10 定稿）：社区的不确定性不进入设计。** 所有扩展位按"上游永远不会支持"建设——契约冻结、版本化、准入测试齐全，是 TT 的永久资产；上游哪天支持了，只是 policy `target` 改一行的免费替换项，不是设计依赖。`upstream_status` 降级为 policy 表上的备注字段，不参与任何决策。
 
@@ -198,7 +198,6 @@ v4 的 YAML+校验器是在弥补字符串引用的缺陷，v5 让大部分缺�
 
 | 类别             | 社区未支持时怎么办                                                                                                                  | 对上游的免疫力     |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| **capability** | **天然免疫——它从来不在 accelerator 路线上。**&#x63;apability schema 是 TT 自有体系，由 Platform probe 实测填充，永远不暴露为对外 runtime API。"社区不支持"对这类是伪问题 | 完全免疫        |
 | **状态查询**       | 开只读扩展位，契约**写死口径**（如显存统计含不含 cache/碎片），各 adapter 实现对齐口径，准入测试验证口径一致性；调用方不许缓存                                                  | 免疫：契约 TT 冻结 |
 | **行为**         | 开扩展位，契约写清副作用范围（如 synchronize 的 device-wide 等待范围），adapter 填 gap，准入测试验证副作用语义                                                 | 免疫：契约 TT 冻结 |
 
@@ -213,6 +212,14 @@ v4 的 YAML+校验器是在弥补字符串引用的缺陷，v5 让大部分缺�
 **元规则**：每个扩展位都必须能写出所有 platform 适用的契约文档；写不出来说明语义不通用，退回第一层。扩展位数量应为个位数——持续膨胀说明在重造 accelerator，方向错了。
 
 ### 3.3 分成三类的意义
+
+> **2026-10-14 修订**：三类已简化为两类 runtime 接口（行为 / 状态查询）——
+> 原"capability"一类作为**交付机制**被移除：静态事实（is_available/device_count）
+> 改普通只读接口（查询廉价，不值得缓存表）；可选能力（graph 捕获/异步通信）改
+> conformance 无条件实测、结果即事实，不再"平台自报 + 验证自报"。
+> 行为 vs 状态查询的二分仍是写 adapter 时的有效思考框架（决定契约写法与
+> conformance 测试形态），但它现在是 `PlatformBase` docstring 里的接入指引，
+> 不再是绑定表里的 `Category` 枚举字段。下面保留原三类推理作演进记录。
 
 1. **生命周期与变更频率不同**：capability 随硬件/SDK 演进（最慢）；状态查询契约稳定但值动态；行为接口涉及并发/正确性语义，最易踩坑。混在一起管，就会把静态事实当行为绑定、把动态查询当事实缓存——两类典型 bug 的温床。
 2. **验证方法不同**：capability 验"实测与声明一致"；状态查询验"口径一致"（与原生对账）；行为验"语义等价"（副作用/等待范围）。一套准入测试模板套不了三类——**分类决定测试形态**。
@@ -234,7 +241,7 @@ Platform 声明支持的契约版本；契约变更需全平台回归。
 
 ---
 
-## 4. Platform Manager：Bridge 两块之二（Provider 读其 capability 与门面）
+## 4. Platform Manager：Bridge 两块之二（Provider 读其接口与门面）
 
 ### 4.1 构建期与启动期严格分离
 
@@ -247,7 +254,7 @@ Platform 声明支持的契约版本；契约变更需全平台回归。
 
 ### 4.1a 激活方式：自动检测 + 证据打印 + override 逃生通道（2026-10-10 三次定稿）
 
-> **管理面/适配面分文件 + 实现惰性导入（2026-10-12 落地，`platform_specs.py`）**：
+> **管理面/适配面分文件 + 实现惰性导入（2026-10-12 落地；现 `spec.py` + `adapters/`）**：
 > register 登记的是轻量 `PlatformSpec`（身份元数据 + `detect` + 实现模块路径 `impl`），
 > 实现本体由 `_activate()` 在平台确定后才 import。两条硬理由：
 > ① **厂商包 import 有副作用**——KL3 的 `torch_xmlir` 一经 import 即执行
@@ -255,7 +262,7 @@ Platform 声明支持的契约版本；契约变更需全平台回归。
 > 机器上轻则污染进程重则 ImportError；② **PrivateUse1 栈的设备模块是运行时注册的**
 > （`_register_device_module`），`mod = getattr(torch, "xpu", None)` 作为类属性在
 > import 期求值必然拿到 None，故 adapter 改持 `mod_path` 字符串、激活期解析。
-> 由此 `platform_specs.py` 有一条硬约束：**detect 只许 `find_spec`（查找不导入）/
+> 由此 `spec.py` 有一条硬约束：**detect 只许 `find_spec`（查找不导入）/
 > torch 自带 API / 设备节点探测，禁止 import 任何厂商包**——这正是"detect 只看不
 > 初始化"在代码组织上的落地。detect 保持真实函数引用（code-first 不丢），只有实现
 > 本体降级为字符串路径。
@@ -275,25 +282,29 @@ device count、stream/event、async comm、IPC/P2P、allocator 特性、dtype �
 
 **算子覆盖度是最关键的一项**——它直接决定 `fail_fast` 的判定：某个必需算子没有实现，就该明确报错而不是训练中途崩。
 
-### 4.2a capability schema 与分档（demo v7 落地）
+### 4.2a 接口的"不支持"与可选能力的实测（2026-10-14 重写，取代 capability schema）
 
-capability 表不再是 adapter 自由发挥的 dict——合法 key 集合有注册表  
-（`CAP_SCHEMA`），与 registry.py 同构的防手滑设计：
+不再有一张平台自报的 capability 表（原 `CAP_SCHEMA` 的 probed/declared/identity
+分档已删除）。取而代之的是两条更简单的规则：
 
-| 规则                                   | 行为                                                               |
-| ------------------------------------ | ---------------------------------------------------------------- |
-| 未知 key                               | 激活期报错（防手滑）                                                       |
-| probed 档（device_count、p2p）           | 必须从硬件实测填充，缺失即拒绝激活（不许编）；真实性由 conformance 的 `cap_matches_probe` 背书 |
-| declared 档（graph_capture、async_comm） | adapter 承诺；**承诺 True 必须有背书测试且通过**，缺失补 False                      |
-| 类型不符                                 | 激活期报错                                                            |
+- **不支持 = 不实现**：`PlatformBase` 的每个接口默认抛 `TTPlatformError("unsupported")`，
+  平台不实现某接口即不支持，调到才报错；调用方（如 checkpoint）`except
+  TTPlatformError` 走降级。接口存在性用 `supports(name)` 内省（子类是否覆盖
+  默认实现）——派生自实现、不会撒谎，也不需要 conformance 回头验证声明的真假。
+- **可选能力 = 实测，不声明**：graph 捕获 / 异步通信这类"平台可能有也可能没有"
+  的能力，conformance 无条件跑一次实测，**结果即事实**。取代了原先"平台自报
+  True 再验证它没说谎"的两步走——没有自报这个不可信输入，就不需要验证它的机制。
 
-`device_wide_sync` 是契约强制项而非可选项：所有 adapter 必须通过对应的强制 conformance 测试，声明只作 provenance。
+为什么删掉那张表（演进教训）：capability 表的 keys 曾退化为"复述实现已知事实"
+（device_wide_sync 无人消费、graph_capture 是我们自己探测后又自验的自证循环），
+字符串 key 散落在 6 处且只有"平台自报"一处被校验。删掉后这些信息全部由
+实现本身或实测派生，字符串脆弱问题一并消失。
 
 ### 4.3 conformance 套件：激活期门禁
 
-与 admission 分层：**admission（cuda-compat 侧）验绑定正确性**（符号绑对、两种引用观测一致）；**conformance（platform 侧）验 adapter 契约履行**。任一强制测试 FAIL 即**拒绝激活且不切换 active**——不合格 adapter 活不进运行期（demo：naive adapter 被拦）。
+与 admission 分层：**admission（cuda-compat 侧）验绑定正确性**（符号绑对、两种引用观测一致）；**conformance（platform 侧）验 adapter 契约履行**。任一强制测试 FAIL 即**拒绝激活且不切换 activation**——不合格 adapter 活不进运行期（demo：naive adapter 被拦）。
 
-强制套件（demo 已落地）：`sync_scope_device_wide`、`stream_dynamic_coverage`（运行期新建 stream 也必须被 device-wide sync 覆盖）、`mem_query_realtime`（口径 + 禁缓存）、`cap_matches_probe`。背书测试：`graph_capture_roundtrip`、`async_comm_smoke`。
+强制套件（demo 已落地）：`sync_scope_device_wide`、`stream_dynamic_coverage`（运行期新建 stream 也必须被 device-wide sync 覆盖）、`mem_query_realtime`（口径 + 禁缓存）、`mem_info_consistency`、`rng_state_roundtrip`、`stream_fencing_semantics`、`stream_ctx_restore`、`device_identity_consumable`。可选能力实测（不阻断激活，结果即事实）：`graph_capture_roundtrip`、`async_comm_smoke`。
 
 完整版另含：算子覆盖、数值、分布式（DP/TP）、checkpoint、RNG 一致性。
 
@@ -322,7 +333,7 @@ Python 层门面只解决 Python 符号的分发；C++ 侧接口（自定义算�
 | 阶段 | 产物 | 失败行为 |
 |---|---|---|
 | 构建期 | 可链接的 platform 产物清单 | 构建失败 |
-| 启动期 | platform 自动检测激活（证据打印）+ capability 快照 + runtime report | fail fast（含多命中拒绝猜测） |
+| 启动期 | platform 自动检测激活（证据打印）+ runtime report | fail fast（含多命中拒绝猜测） |
 | 导入期 | cuda_compat 绑定结果 + trace | 按 policy：fallback / exception |
 | 运行期 | 只执行已绑定结果 | 不做重新探测；异常走错误映射 |
 

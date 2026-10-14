@@ -1,9 +1,8 @@
 """模拟厂商 custom_ops 命名空间（torch.ops.custom_ops 的 demo 对应物）。
 
-真实形态见 xmegatron_ext/components/core/models/common/embeddings/rope_utils.py：
-RotaryPositionalEmbeddingWithFreqFunction 内调 torch.ops.custom_ops.rotary_pos_emb
-——厂商编译的 AOT kernel，黑盒、平台限定、有隐含适用条件（融合路径只在
-mscale==1.0 时被选中，见 _apply_rotary_pos_emb_bshd 的分支）。
+对应厂商编译的 AOT 融合 kernel：黑盒、平台限定、有隐含适用条件（融合路径
+只在 mscale==1.0 时被选中）——这正是它需要 provider 门禁（适用性谓词 +
+收益证据）而非裸替换的原因。
 
 数值语义与 reference 一致；本 mock 只保留结构：fwd/bwd 成对、out= 传参风格。
 """

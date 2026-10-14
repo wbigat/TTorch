@@ -2,8 +2,10 @@
 
 > 数据源：`/Users/vector/code/train/ms-swift`（main@21ada4620，528 个 py 文件）。
 > 方法：全仓枚举 `torch.cuda.*` / `.cuda()` / CUDA 相关环境变量 / 厂商工具链调用，
-> 按我们的三类接口（behavior / state_query / capability）与三种决策
-> （remap / fallback / exception）归类，对照 demo v9 的 9 符号盘点面找缺口。
+> 按接口性质（有副作用的行为 / 动态只读的状态查询）与三种决策
+> （remap / fallback / exception）归类，对照 demo 盘点面找缺口。
+> （2026-10-14：原 capability 一类已删除——静态事实改普通只读接口，
+> 可选能力改 conformance 实测，见 TT_Bridge_Deep_Dive.md §4.2a。）
 > 日期：2026-10-12。
 
 ## 0. 两个结构性发现（先于 API 清单）
@@ -26,12 +28,12 @@
 
 | API | 频次 | 代表调用点 | 三类归属 | 语义/风险 |
 |---|---|---|---|---|
-| `torch.cuda.is_available` | 10 | `rollout.py:406`（`f'cuda:{rank}' if ... else 'cpu'`）、`activation_cpu_offload.py:16`、`trainers/mixin.py:698` | capability | **分支选择器**：结果直接决定设备字符串形态。masquerade 平台上答案与 vendor 身份脱钩（GCU 报 True） |
+| `torch.cuda.is_available` | 10 | `rollout.py:406`（`f'cuda:{rank}' if ... else 'cpu'`）、`activation_cpu_offload.py:16`、`trainers/mixin.py:698` | state_query | **分支选择器**：结果直接决定设备字符串形态。masquerade 平台上答案与 vendor 身份脱钩（GCU 报 True） |
 | `torch.cuda.current_device` | 17 | **关键：`megatron/utils/utils.py:214-221`、`parallel_utils.py:14,24`、`trainers/base.py:1043` 把它当 `device=` 参数直接传给 `torch.tensor/empty`** | state_query | 返回值被当**设备标识**用（不只索引）。非 CUDA 平台上 `torch.tensor(device=<int>)` 语义直接断裂——这是最容易漏的隐性契约 |
 | `torch.cuda.set_device` | 2+封装 | `torch_utils.py:165`、`infer_engine/utils.py:393` | behavior | 标准 |
-| `torch.cuda.device_count` | 1+封装 | `torch_utils.py:172` | capability | 标准 |
+| `torch.cuda.device_count` | 1+封装 | `torch_utils.py:172` | state_query | 标准 |
 | `torch.cuda.is_initialized` | 1 | `dataset/packing.py:29` | state_query | lazy-init 判定，packing 的 device 放置前提 |
-| `get_physical_device_count` 内部 | 1 处函数 | `torch_utils.py:187-244` | capability | **直接调 pynvml / 读 `/proc/driver/nvidia` / 起 `nvidia-smi` 子进程**——厂商工具链硬依赖，绕过 mask 查物理卡数 |
+| `get_physical_device_count` 内部 | 1 处函数 | `torch_utils.py:187-244` | state_query | **直接调 pynvml / 读 `/proc/driver/nvidia` / 起 `nvidia-smi` 子进程**——厂商工具链硬依赖，绕过 mask 查物理卡数 |
 
 ### 1.2 同步与 stream 原语
 
@@ -97,7 +99,7 @@ checkpoint save/resume）还需补齐：
 
 | 缺口 | 归属 | 建议决策 | 理由 |
 |---|---|---|---|
-| `is_available` | capability | remap → capability `device_available` | 分支选择器，10 处调用；masquerade 语义由双身份机制兜底 |
+| `is_available` | state_query | remap → `interface.is_available`（普通转发） | 分支选择器，10 处调用；masquerade 语义由双身份机制兜底 |
 | **stream 对象族**（`Stream`/`current_stream`/`stream` ctx/`wait_stream`） | behavior | remap → Platform Manager stream 门面 | megatron 路径 ddp fencing 必触发；demo 完全没有 stream 对象模型，**是当前最大结构性缺口** |
 | RNG state 三件套（`get/set_rng_state`、`get_rng_state_all`） | state_query+behavior | remap → adapter 的 RNG 语义对齐 | checkpoint save/resume 正确性；xmegatron 已证明 XPU 需要对齐 |
 | `current_device` 的 **device 标识语义** | state_query | 契约澄清：返回值必须能被 `torch.tensor(device=)` 消费 | 17 处调用里至少 6 处当 device 用；adapter 契约文档化 + conformance 加测 |
@@ -111,7 +113,7 @@ checkpoint save/resume）还需补齐：
 | `memory_reserved` / `max_memory_allocated` / `max_memory_reserved` / `reset_peak_memory_stats` | state_query+behavior | remap；峰值统计无对应的平台 fallback 到 allocated 口径并在 provenance 记录口径降级 |
 | `is_initialized` | state_query | remap |
 | `ipc_collect` | behavior | remap，平台无 IPC 时 fallback no-op |
-| `get_device_capability` | capability | remap → capability 等价 key（不是返回 sm 元组，是"支持哪档 kernel 特性"的映射表） |
+| `get_device_capability` | state_query | remap → 等价能力查询接口（不是返回 sm 元组，是"支持哪档 kernel 特性"的映射） |
 | `_set_allocator_settings`（expandable_segments） | behavior | **fallback no-op + trace**——私有配置的降级样板 |
 
 ### P2 —— 盘点面机制扩展（超出 torch.cuda.* 符号表）
@@ -131,7 +133,7 @@ checkpoint save/resume）还需补齐：
    正确性）。
 3. swift 自带的 `torch_utils` 分支抽象和 `npu_patch` 目录证明：没有统一
    Bridge 时，平台适配 = 分支膨胀 + 裸 patch 堆积。我们的盘点面（四分表）
-   + Platform Manager 门面 + capability 双身份正好收编这三类混乱。
+   + Platform Manager 门面 + 双身份正好收编这三类混乱。
 4. 下一步候选：~~demo 补 stream 门面 + RNG state 两个 P0 族~~（已完成，
    demo v10 第 11 节基础 SFT 流程实战通过）；再把 `bindings.py` 扩到
    20 符号规模（P1 族）验证真实盘点面下 default-deny 的工作量。
@@ -145,15 +147,21 @@ P0 接口族在 mock demo 验证后，移植真实 torch 时又暴露出四个 m
 |---|---|---|---|
 | G9 | **绑定落点≠定义模块**：`torch.cuda.Stream/mem_get_info/get_rng_state` 等定义在 `torch.cuda.streams/memory/random` 子模块再 re-export；按 `symbol.__module__` 绑定只改了子模块，框架侧 `torch.cuda.X` 仍指原实现（14 条 policy 只生效 8 条，mem_get_info 直撞真实 CUDA 报 AssertionError） | mock vendor_cuda 是单模块，无 re-export 形态 | `Entry.bind_module` 显式指定绑定落点（框架可见路径），default-deny 分组同步 |
 | G10 | **adapter 直调 `mod.X` 会无限递归**：绑定后 `torch.cuda.synchronize` 已是门面，adapter 再调就是 门面→adapter→门面 | mock adapter 用独立 hw 对象，不经过被 patch 模块 | 真实 adapter 全部经 `_orig(name)` 走 `_origin_` 留痕（绑定机制顺带产物成为官方逃生通道） |
-| G11 | **能力类绑定的"说谎"半径**：cpu-dev 上把 `torch.cuda.is_available` 绑成 True，AdamW 的 graph capture 健康检查经 `torch.accelerator` 走到 dummy cuda 直接炸 | mock 没有"torch 内部也消费这些符号"的维度 | 平台 overlay 最小实例：torch.cuda 为非功能桩的栈剔除能力类绑定，框架语义由 `platform_mgr.capability()` 直接供给；masquerade 栈无此问题（shim 真实可工作） |
+| G11 | **能力类绑定的"说谎"半径**：cpu-dev 上把 `torch.cuda.is_available` 绑成 True，AdamW 的 graph capture 健康检查经 `torch.accelerator` 走到 dummy cuda 直接炸 | mock 没有"torch 内部也消费这些符号"的维度 | 教训是"硬件在场"类符号的回答会误导 torch 内部守卫。2026-10-14 起它是普通转发接口（无能力缓存表、无 overlay 剔除），治理方向是让平台如实回答；masquerade 栈 shim 真实可工作，无此问题 |
 | G12 | 门面签名必须是 torch 真实签名超集（`synchronize(device)` 等可选 device 参） | mock 调用点全部无参 | 契约/门面/adapter 全链路 `device=None` |
 | G13 | `get_rng_state(None)` 在 torch 2.9 会炸（内部直接 `device.index`）——None=当前设备必须**省略实参**，不能位置透传 None | KL3 真机 conformance 首跑 Traceback 实锤（2026-10-12） | adapter 内 `fn() if device is None else fn(device)` |
-| G14 | **绑定的爆炸半径不止于框架调用点**：被绑符号所在模块的**原实现内部**也引用同模块符号。`torch.cuda.current_stream` 的全局名空间就是被改过的 `torch.cuda.__dict__`，其内部 `Stream(stream_id=..., device_index=..., device_type=...)` 落到门面 → `TypeError: Stream.__new__() got an unexpected keyword argument 'stream_id'`；放行 TTStream 则更隐蔽（`'TTStream' object has no attribute 'record_event'`） | mock vendor_cuda 的函数内部不互相构造对象；G12 只覆盖了"框架调用点的签名"，没覆盖"原实现内部的构造签名" | **G12 原则推广到构造型符号**：门面签名是厂商真实构造签名的超集，按**调用者**分流——无参=框架语义返回 TTStream，带厂商构造 kwargs=原实现内部，经新增契约 `PlatformAdapter.stream_wrap()` 回落原生对象。admission 新增 `vendor_internal_construction` 守门 |
+| G14 | **绑定的爆炸半径不止于框架调用点**：被绑符号所在模块的**原实现内部**也引用同模块符号。`torch.cuda.current_stream` 的全局名空间就是被改过的 `torch.cuda.__dict__`，其内部 `Stream(stream_id=..., device_index=..., device_type=...)` 落到门面 → `TypeError: Stream.__new__() got an unexpected keyword argument 'stream_id'`；放行 TTStream 则更隐蔽（`'TTStream' object has no attribute 'record_event'`） | mock vendor_cuda 的函数内部不互相构造对象；G12 只覆盖了"框架调用点的签名"，没覆盖"原实现内部的构造签名" | **G12 原则推广到构造型符号**：interface.Stream 签名取厂商构造签名超集（`**kwargs`），无参/带参都原样转发给原生 Stream 类，**两者都返回厂商原生对象**（门面不包装；2026-10-13 移除 TTStream：Bridge 只管入口路由，返回对象用各平台 adapter 原生，上层不主动管理）。admission `vendor_internal_construction` 守门（判据=门面返回值与 adapter 契约同型） |
 
 **G14 的一般化结论**：凡 remap 的符号是**类/构造器**（Stream、Event、Graph…），
 都要检查"该模块的原实现内部是否用它构造对象"。这类调用的身份判据是**调用者**
 （带厂商私有构造参数的只可能是厂商栈自己），不是参数形态；放行原则是原样回落，
 不拿门面冒充厂商内部数据结构。
+
+**推论（2026-10-13 移除 TTStream 后确立）**：构造型符号的门面只做**入口路由**，
+不包装返回对象——框架与厂商内部拿到的都是 adapter 返回的原生对象，对象的方法
+形态（`wait_stream` 等）由各平台保证。这消除了"自定义包装流入厂商内部被当原生
+对象用"的整类风险（G14 的第二失败形态 `'TTStream' object has no attribute
+'record_event'` 因此从机制上不复存在）。
 
 ### 真实环境校准结果（2026-10-12 KL3 机器实测）
 
@@ -179,8 +187,8 @@ python real_sft_smoke.py --platform cpu     # 无卡机器 dev 验证
 
 待真实环境校准（本地 CPU 路径已验证之外）：
 1. ~~masquerade 卡名标记命中~~ **已闭环**（见上节：改用 torch_xmlir 厂商包探测）；
-2. native xpu 栈 `mem_get_info/get_rng_state` 是否存在——不存在会自动
-   声明 capability=False 并降级，看 conformance 的 skipped 行；
+2. native xpu 栈 `mem_get_info/get_rng_state` 是否存在——不存在则调用时抛
+   unsupported，conformance 对应测试自动跳过（看 skipped 行）；
 3. `TorchCudaPlatform.sdk_range=("11.0","13.5")` 对定制栈可能需放宽
    （KL3 报 `torch=2.9.0+cu129`，当前取值范围内）；
 4. bf16 vs fp32 的 rel_err 参考值（CPU 实测 7.2e-3，仅打印不卡阈值）。
@@ -198,7 +206,7 @@ TT Bridge 跑通真实 Qwen3.5-0.8B 的 fwd/bwd/optimizer step。**
 | xswift_ext/xmegatron_ext 由环境变量控制，无需删包改 `.pth` | `XSWIFT_PLUGIN_ENABLE=0` 即不激活（`auto_init._is_enabled()` 默认 "0"）；实测 `xswift_ext.entry`/`swift`/`megatron`/`mcore_bridge` 全部 `参与=False` |
 | 厂商基座必须保留，且与 TT 共存无冲突 | `torch_xmlir` 经 `torch_xmlir.pth` 的 `hook_torch()` 加载，`参与=True`；XCCL/SYMBOL_REWRITE 照常 |
 | transformers 5.12.1 **内置**支持 `qwen3_5`，无 remote code | 模型目录无 `.py`；`AutoConfig` 直出 `model_type=qwen3_5` |
-| Bridge 绑定被真实框架消费 | `torch.cuda.{synchronize,current_stream,mem_get_info,get_rng_state}` 全部指向 `tt_bridge.platform_mgr.*` |
+| Bridge 绑定被真实框架消费 | `torch.cuda.{synchronize,current_stream,mem_get_info,get_rng_state}` 全部指向 `ttorch.platform.interface.*` |
 | 功能穿透成立 | 单 batch 过拟合 `loss 15.6669 -> 0.0002`（20 步）；admission 14/14 PASS |
 
 **本轮确立的真实接入形态（自造替身察觉不到的）**：

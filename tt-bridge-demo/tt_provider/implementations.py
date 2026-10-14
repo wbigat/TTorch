@@ -2,8 +2,8 @@
 
 本 demo 三个模块语义：
 - rmsnorm（compute 插槽）：(x, w, eps) -> y，张量用 float list 模拟
-- rope_bshd（compute 插槽，完整实例）：对照 xmegatron_ext 的 fused RoPE
-  与 xswift_ext 的裸替换 wrapper，见下文出处注释
+- rope_bshd（compute 插槽，完整实例）：一个厂商融合实现 + 一个裸替换
+  wrapper 的组合，见下文出处注释
 - moe_block（schedule 插槽）：一组 expert thunk 的执行时序
 
 三类实现（对照定稿）：
@@ -27,7 +27,7 @@ import math
 from mock_hw import XpuHwError
 
 import vendor_ops
-from tt_bridge import platform_mgr
+from tt_bridge import manager
 from tt_provider import provider_mgr
 
 # ------------------------------------------------------------------
@@ -130,7 +130,7 @@ def overlap_schedule(thunks):
     消费 Platform Manager 的 active adapter 拿异步句柄——Provider 对
     Bridge 的合法依赖方式。
     """
-    hw = platform_mgr.active().hw
+    hw = manager.activation().hw
     handles = [hw.submit_async(0, f"thunk-{i}") for i in range(len(thunks))]
     results = [t() for t in thunks]
     for h in handles:
@@ -141,11 +141,9 @@ def overlap_schedule(thunks):
 # ------------------------------------------------------------------
 # tp_linear：schedule 插槽第二个完整实例——TP 通算 overlap
 #
-# 真实出处：xmegatron_ext tensor_parallel/layers.py 的
-# LinearWithGradAccumulationAndAsyncCommunication（hydrax.xaccelerator）：
-# forward 里把 all-gather 通信异步化、与本地 matmul 交叠；backward 把
-# wgrad/dgrad 分解，wgrad 不等通信。本 demo 抽象为 (comm_thunks,
-# compute_thunks) 两组任务的时序安排——结果不变，只改时序。
+# 技术原型是 TP 通算 overlap：forward 里把 all-gather 通信异步化、与本地
+# matmul 交叠；backward 把 wgrad/dgrad 分解，wgrad 不等通信。本 demo 抽象为
+# (comm_thunks, compute_thunks) 两组任务的时序安排——结果不变，只改时序。
 # ------------------------------------------------------------------
 
 
@@ -164,7 +162,7 @@ def overlap_tp_schedule(comm_thunks, compute_thunks):
     提交/等待的留痕上；真实场景 comm_thunks 由 comm stream 承载，
     与 compute stream 并行。
     """
-    hw = platform_mgr.active().hw
+    hw = manager.activation().hw
     handles = [hw.submit_async(1, f"comm-{i}")  # stream 1 = comm stream
                for i, _ in enumerate(comm_thunks)]
     for t in comm_thunks:
@@ -179,12 +177,9 @@ def overlap_tp_schedule(comm_thunks, compute_thunks):
 # rope_bshd：compute 插槽（完整实例，对照真实代码）
 #
 # 真实出处：
-# - reference = Megatron 的 unfused 路径（_apply_rotary_pos_emb_bshd 中
-#   mscale!=1.0 的分支：cos/sin * mscale + _rotate_half）
-# - 厂商融合 = xmegatron_ext rope_utils.py 的 RotaryPositionalEmbeddingWithFreqFunction
-#   （torch.ops.custom_ops.rotary_pos_emb，fwd/bwd 成对），仅 mscale==1.0 适用
-# - 选择逻辑 = xswift_ext patcher.py 的 apply_rotary_pos_emb_bshd_wrapper
-#   （能 import 到 XME 实现就替换——本 demo 把它正规化为 provider + 门禁）
+# - reference = 非融合路径：cos/sin * mscale + _rotate_half（mscale!=1.0 也适用）
+# - 厂商融合 = 融合 kernel（fwd/bwd 成对），仅 mscale==1.0 适用
+# - 选择逻辑：能拿到融合实现就替换——本 demo 把它正规化为 provider + 门禁
 #
 # 签名：rope_bshd(t, freqs, mscale=1.0) -> out，三者均为等长 float list
 # （单行演示；真实张量 [s, ..., d] 的逐元素结构相同）。

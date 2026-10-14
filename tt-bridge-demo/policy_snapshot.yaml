@@ -1,103 +1,86 @@
 version: 1
 symbols:
 - symbol: vendor_cuda.set_device
-  category: behavior
   decision: remap
   target: set_device
   intent: 把当前进程绑定到一张加速设备
   test: set_device_equivalence
 - symbol: vendor_cuda.synchronize
-  category: behavior
   decision: remap
   target: synchronize
   intent: 等待设备上全部工作完成（device-wide，不是 current-stream）
   test: sync_binding
 - symbol: vendor_cuda.range_push
-  category: behavior
   decision: remap
   target: range_push
   intent: profiler 区间标注；torch.accelerator 暂无对应，走 TT 扩展位
   test: annotate_delivered
 - symbol: vendor_cuda.Stream
-  category: behavior
   decision: remap
   target: Stream
   intent: stream 对象族（创建/当前流/上下文/跨流等待）；megatron ddp fencing 必触发，整体绑到门面
   test: stream_binding
 - symbol: vendor_cuda.current_stream
-  category: state_query
   decision: remap
   target: current_stream
   intent: 当前 stream 句柄（动态只读）
   test: stream_binding
 - symbol: vendor_cuda.stream
-  category: behavior
   decision: remap
   target: stream
   intent: stream 上下文管理器：进入切换、退出恢复
   test: stream_binding
 - symbol: vendor_cuda.set_rng_state
-  category: behavior
   decision: remap
   target: set_rng_state
   intent: checkpoint resume 恢复 RNG；非法值经 adapter 翻译成统一错误
   test: rng_binding
 - symbol: vendor_cuda.empty_cache
-  category: behavior
   decision: remap
   target: empty_cache
   intent: allocator 提示；rollout/转换路径高频
   test: empty_cache_binding
 - symbol: vendor_cuda.current_device
-  category: state_query
   decision: remap
   target: current_device
   intent: 查询当前设备；返回值必须能当设备标识回喂（swift 6+ 处传给 torch.tensor(device=)）
   test: current_device_consistency
 - symbol: vendor_cuda.memory_allocated
-  category: state_query
   decision: remap
   target: memory_allocated
   intent: 查询显存水位（动态只读，口径=已分配字节，禁缓存）
   test: mem_binding
 - symbol: vendor_cuda.mem_get_info
-  category: state_query
   decision: remap
   target: mem_get_info
   intent: (free, total) 字节元组；patcher max_memory 初始化形态
   test: mem_info_binding
 - symbol: vendor_cuda.get_rng_state
-  category: state_query
   decision: remap
   target: get_rng_state
   intent: checkpoint save 读 RNG 状态（不透明 str 契约）
   test: rng_binding
 - symbol: vendor_cuda.is_available
-  category: capability
   decision: remap
-  target: cap:device_available
+  target: is_available
   intent: 分支选择器（设备字符串形态决策）；masquerade 语义由双身份兜底
-  test: cap_binding_device_available
+  test: binding_identity_is_available
 - symbol: vendor_cuda.device_count
-  category: capability
   decision: remap
-  target: cap:device_count
-  intent: 可见设备数（静态事实，probe 期填充，不进 runtime API）
-  test: cap_binding_device_count
+  target: device_count
+  intent: 可见设备数
+  test: binding_identity_device_count
 - symbol: vendor_cuda.can_device_access_peer
-  category: capability
   decision: remap
-  target: cap:p2p
-  intent: P2P 是否可用（静态事实，选择期消费，不进 runtime API）
-  test: cap_binding_p2p
+  target: can_device_access_peer
+  intent: 两卡间能否 P2P（逐对回答，转发厂商原生实现）
+  test: binding_identity_can_device_access_peer
 - symbol: vendor_cuda.graph_capture
-  category: behavior
   decision: fallback
   target: eager
   intent: CUDA Graph 加速；当前平台无等价物，退回 eager，功能不受影响
   test: null
 - symbol: vendor_cuda.profiler_start
-  category: behavior
   decision: exception
   target: null
   intent: CUDA 专属 profiler 入口；无等价且非必需，调用方应删除

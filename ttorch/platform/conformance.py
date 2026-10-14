@@ -4,12 +4,15 @@
 - admission（cuda-compat 侧）验"绑定正确性"——框架侧语义在替换后保持；
 - conformance（本模块）验"adapter 正确性"——契约被真正实现。
 
-激活期由 platform_mgr._activate 调用：任一强制测试 FAIL 即拒绝激活；
-declared 能力承诺 True 必须有 BACKING 中的背书测试且通过。
+激活期由 manager._activate 调用：任一强制测试 FAIL 即拒绝激活。
 
-能力裁剪（真实环境必需）：测试标注所需能力，平台声明 False 时跳过
-（门面会对相应 API 报 unsupported，框架走降级路径）——真实栈可能合法地
-没有 graph_capture / mem 查询，一刀切 FAIL 会误杀。
+裁剪依据是**实现**而非声明（2026-10-14）：测试标注所需的平台接口，平台
+没实现（`adapter.supports(api)` 为假）就跳过——真实栈可能合法地没有 mem
+查询 / stream 族，一刀切 FAIL 会误杀。关键区分：**没实现=跳过**（合法降级，
+调用方收 unsupported），**实现了但没过契约=FAIL**（拒绝激活）。
+
+可选能力（graph 捕获 / 异步通信）走 _ENDORSEMENT：无条件实测，结果即事实，
+不阻断激活——取代了原先"平台自报 capability=True 再验证它没说谎"的两步走。
 
 测试分层：mock adapter 带 hw 钩子（submit/pending/alloc/wait_edges）走
 深测版（能构造确定性反例）；真实 adapter 没有钩子，走 tensor 级契约版
@@ -18,6 +21,12 @@ declared 能力承诺 True 必须有 BACKING 中的背书测试且通过。
 from collections import namedtuple
 
 Result = namedtuple("Result", ["name", "ok", "detail"])
+
+__all__ = ["Result", "run",
+           "sync_scope_device_wide", "stream_dynamic_coverage",
+           "mem_query_realtime", "graph_capture_roundtrip",
+           "async_comm_smoke", "rng_state_roundtrip", "stream_fencing_semantics",
+           "stream_ctx_restore", "mem_info_consistency", "device_identity_consumable"]
 
 
 def _dev(adapter):
@@ -29,6 +38,19 @@ def _hw_hooks(adapter):
     """mock 深测钩子；真实 adapter 返回 None。"""
     hw = getattr(adapter, "hw", None)
     return hw if hw is not None and hasattr(hw, "submit") else None
+
+
+def _stream_key(s):
+    """stream 身份的稳定可比较 key（测试判等用，不是平台契约）。
+
+    真实 torch Stream 每次包装可能是新对象（`current_stream()` 内部按
+    stream_id/device_index 重新构造），直接比对象会误判；取
+    (device_index, stream_id) 作稳定 key。mock 的 stream 对象自带可比较
+    语义，原样返回即可。
+    """
+    if hasattr(s, "stream_id"):
+        return (getattr(s, "device_index", None), s.stream_id)
+    return s
 
 
 def sync_scope_device_wide(adapter):
@@ -46,11 +68,11 @@ def sync_scope_device_wide(adapter):
     x = torch.randn(256, 256, device=dev)
     expect = (x @ x).cpu()
     out = torch.empty(256, 256, device=dev)
-    side = adapter.stream_create()
-    main = adapter.stream_current()
-    adapter.stream_set(side)
+    side = adapter.Stream()
+    main = adapter.current_stream()
+    adapter.set_stream(side)
     out.copy_(x @ x)  # 侧流上的异步 work
-    adapter.stream_set(main)
+    adapter.set_stream(main)
     adapter.synchronize()
     ok = torch.allclose(out.cpu(), expect)
     return Result("sync_scope_device_wide", ok,
@@ -69,12 +91,12 @@ def stream_dynamic_coverage(adapter):
                       f"{adapter.name}: 新建 stream {sid} 残留 {left}")
     import torch
     dev = _dev(adapter)
-    sid = adapter.stream_create()
-    prev = adapter.stream_current()
+    sid = adapter.Stream()
+    prev = adapter.current_stream()
     out = torch.empty(128, device=dev)
-    adapter.stream_set(sid)
+    adapter.set_stream(sid)
     out.copy_(torch.full((128,), 7.0, device=dev))
-    adapter.stream_set(prev)
+    adapter.set_stream(prev)
     adapter.synchronize()
     ok = bool((out.cpu() == 7.0).all())
     return Result("stream_dynamic_coverage", ok,
@@ -106,53 +128,37 @@ def mem_query_realtime(adapter):
                   f"{adapter.name}: tensor alloc 64MiB 前后 delta={delta}")
 
 
-def cap_matches_probe(adapter):
-    """probed 能力必须实测：capability 表与直接查硬件的结果一致。"""
-    caps = adapter.capabilities()
-    hw = _hw_hooks(adapter)
-    if hw is not None:
-        count = hw.device_count() if hasattr(hw, "device_count") else hw.deviceCount()
-        ok = caps["p2p"] == hw.p2p_supported and caps["device_count"] == count
-        return Result("cap_matches_probe", ok,
-                      f"{adapter.name}: p2p 声明={caps['p2p']} 实测={hw.p2p_supported}；"
-                      f"device_count 声明={caps['device_count']} 实测={count}")
-    mod = getattr(adapter, "mod", None)  # 真实 adapter 的 torch.cuda/torch.xpu 模块
-    if mod is not None:
-        real = mod.device_count()
-        ok = caps["device_count"] == real
-        return Result("cap_matches_probe", ok,
-                      f"{adapter.name}: device_count 声明={caps['device_count']} torch 实测={real}")
-    ok = caps["device_count"] >= 1
-    return Result("cap_matches_probe", ok,
-                  f"{adapter.name}: 无 probe 钩子，契约级校验 device_count={caps['device_count']}")
-
-
 def graph_capture_roundtrip(adapter):
-    """graph_capture=True 的背书：硬件确实能捕获执行。"""
-    if not adapter.capabilities().get("graph_capture"):
-        return Result("graph_capture_roundtrip", True, "declared False，无需背书")
+    """graph 捕获能力的**实测**：能捕获并重放即支持，捕获不了即不支持。
+
+    不阻断激活（不在强制套件里）：不支持 graph 捕获是合法的平台状态。
+    结果本身就是事实——取代了原先"平台自报 graph_capture=True 再来验证
+    它有没有说谎"的两步走。
+    """
     hw = _hw_hooks(adapter)
     if hw is not None:
+        if not hasattr(hw, "capture"):
+            return Result("graph_capture_roundtrip", True,
+                          f"{adapter.name}: 不支持 graph 捕获（硬件无 capture）")
         r = hw.capture(lambda: "ok")
         return Result("graph_capture_roundtrip", r == "ok",
                       f"{adapter.name}: capture 执行 -> {r}")
-    # 真实栈：declared 档"承诺 True 必须有背书"不允许放过，用 torch 原生
-    # graph 实测捕获+重放（判据=replay 真的执行了被捕获的 op，而非 capture
-    # 期顺带执行）。async_comm 可留待 provider 门禁实测，graph_capture 无此兜底。
+    # 真实栈：用 torch 原生 graph 实测捕获+重放（判据=replay 真的执行了被
+    # 捕获的 op，而非 capture 期顺带执行）。
     import torch
     mod = getattr(adapter, "mod", None)
-    if mod is None or not hasattr(mod, "CUDAGraph"):
-        return Result("graph_capture_roundtrip", False,
-                      f"{adapter.name}: 声明 graph_capture=True 但 {mod} 无 CUDAGraph")
+    if not adapter.supports("Stream") or mod is None or not hasattr(mod, "CUDAGraph"):
+        return Result("graph_capture_roundtrip", True,
+                      f"{adapter.name}: 不支持 graph 捕获（无 CUDAGraph 或无 stream 接口）")
     try:
         x = torch.ones(8, device=_dev(adapter))
-        main = adapter.stream_current()      # 捕获前的 warmup 必须在 side stream 上
-        side = adapter.stream_create()
-        adapter.stream_wait(side, main)
-        adapter.stream_set(side)
+        main = adapter.current_stream()     # 捕获前的 warmup 必须在 side stream 上
+        side = adapter.Stream()
+        side.wait_stream(main)              # 原生 stream 的对象方法（非平台契约）
+        adapter.set_stream(side)
         x.mul_(1)
-        adapter.stream_set(main)
-        adapter.stream_wait(main, side)
+        adapter.set_stream(main)
+        main.wait_stream(side)
         g = mod.CUDAGraph()
         with mod.graph(g):
             x.mul_(2)
@@ -162,21 +168,23 @@ def graph_capture_roundtrip(adapter):
         ok = bool((x == before * 2).all())
         detail = f"{adapter.name}: capture+replay 生效={ok}（replay 前 {before[0]} -> 后 {x[0]}）"
     except Exception as e:
-        ok = False
-        detail = (f"{adapter.name}: 声明 graph_capture=True 但实测捕获失败 "
+        # 捕获失败 = 该平台不支持 graph 捕获，如实记录而非判 FAIL
+        ok = True
+        detail = (f"{adapter.name}: 实测不支持 graph 捕获 "
                   f"{type(e).__name__}: {e}")
     return Result("graph_capture_roundtrip", ok, detail)
 
 
 def async_comm_smoke(adapter):
-    """async_comm=True 的背书：异步提交句柄可用且 wait 后完成。"""
-    if not adapter.capabilities().get("async_comm"):
-        return Result("async_comm_smoke", True, "declared False，无需背书")
+    """异步通信能力的**实测**：异步提交句柄可用且 wait 后完成。
+
+    同 graph_capture_roundtrip：不阻断激活，结果即事实。
+    """
     hw = _hw_hooks(adapter)
     if hw is None:
-        # 真实栈的异步通信由 provider 门禁实测，此处只做声明存在性校验
+        # 真实栈的异步通信由 provider 收益门禁实测，此处不下结论
         return Result("async_comm_smoke", True,
-                      f"{adapter.name}: 无 probe 钩子，declared=True 留待 provider 收益门禁实测")
+                      f"{adapter.name}: 无 probe 钩子，留待 provider 收益门禁实测")
     hw.submit(0, "a")
     h = hw.submit_async(0, "b")
     h.wait()
@@ -188,7 +196,7 @@ def async_comm_smoke(adapter):
 def rng_state_roundtrip(adapter):
     """RNG 契约：get->set->get 回环一致；非法值必须抛统一错误（checkpoint
     resume 正确性；xmegatron 的 XPU RNG 对齐补丁证明此路径必踩）。"""
-    from ttorch.bridge.platform_adapter import TTPlatformError
+    from ttorch.platform.platform_handle import TTPlatformError
     s = adapter.get_rng_state()
     adapter.set_rng_state(s)
     back = adapter.get_rng_state()
@@ -211,22 +219,22 @@ def stream_fencing_semantics(adapter):
     fencing 的语义基础——只做对形状不做对依赖等于没做）。"""
     hw = _hw_hooks(adapter)
     if hw is not None:
-        side = adapter.stream_create()
-        main = adapter.stream_current()
-        adapter.stream_wait(side, main)
+        side = adapter.Stream()
+        main = adapter.current_stream()
+        side.wait_stream(main)
         ok = (side, main) in adapter.hw.wait_edges
         return Result("stream_fencing_semantics", ok,
                       f"{adapter.name}: 依赖边({side},{main}) 记录={ok}")
     import torch
     dev = _dev(adapter)
-    main = adapter.stream_current()
-    side = adapter.stream_create()
+    main = adapter.current_stream()
+    side = adapter.Stream()
     x = torch.full((128,), 2.0, device=dev)
     y = torch.empty(128, device=dev)
-    adapter.stream_wait(side, main)  # side 等 main 上的生产完成
-    adapter.stream_set(side)
+    side.wait_stream(main)  # side 等 main 上的生产完成（原生对象方法）
+    adapter.set_stream(side)
     y.copy_(x * 3)
-    adapter.stream_set(main)
+    adapter.set_stream(main)
     adapter.synchronize()
     ok = bool((y.cpu() == 6.0).all())
     return Result("stream_fencing_semantics", ok,
@@ -235,16 +243,16 @@ def stream_fencing_semantics(adapter):
 
 def stream_ctx_restore(adapter):
     """stream 上下文契约：切换后恢复，当前流读数正确。
-    判等走 stream_key（真实 torch Stream 对象每次包装可能不同）。"""
-    key = adapter.stream_key
-    cur = adapter.stream_current()
-    side = adapter.stream_create()
-    adapter.stream_set(side)
-    mid = adapter.stream_current()
-    adapter.stream_set(cur)
-    ok = key(mid) == key(side) and key(adapter.stream_current()) == key(cur)
+    判等走 _stream_key（真实 torch Stream 对象每次包装可能不同）。"""
+    key = _stream_key
+    cur = adapter.current_stream()
+    side = adapter.Stream()
+    adapter.set_stream(side)
+    mid = adapter.current_stream()
+    adapter.set_stream(cur)
+    ok = key(mid) == key(side) and key(adapter.current_stream()) == key(cur)
     return Result("stream_ctx_restore", ok,
-                  f"{adapter.name}: cur={key(cur)} 切换后={key(mid)} 恢复={key(adapter.stream_current())}")
+                  f"{adapter.name}: cur={key(cur)} 切换后={key(mid)} 恢复={key(adapter.current_stream())}")
 
 
 def mem_info_consistency(adapter):
@@ -273,41 +281,46 @@ def device_identity_consumable(adapter):
                   f"{adapter.name}: current_device={idx} 回喂 set_device 成功={ok}")
 
 
-# 强制契约测试：所有 adapter 必过（除非所需能力声明 False 被裁剪）
-MANDATORY = [sync_scope_device_wide, stream_dynamic_coverage,
-             mem_query_realtime, cap_matches_probe,
+# 强制契约测试：所有 adapter 必过（平台未实现所需接口时自动跳过）
+_MANDATORY = [sync_scope_device_wide, stream_dynamic_coverage,
+             mem_query_realtime,
              rng_state_roundtrip, stream_fencing_semantics,
              stream_ctx_restore, mem_info_consistency,
              device_identity_consumable]
 
-# 各强制测试所需能力：平台声明 False 时裁剪（跳过），门面会报 unsupported
-REQUIRED_CAP = {
-    "sync_scope_device_wide": "stream_api",
-    "stream_dynamic_coverage": "stream_api",
-    "stream_fencing_semantics": "stream_api",
-    "stream_ctx_restore": "stream_api",
-    "mem_query_realtime": "memory_query",
-    "mem_info_consistency": "memory_query",
-    "rng_state_roundtrip": "rng_state",
+# 各强制测试所需的平台接口：平台没实现就跳过该测试（2026-10-14 取代原
+# _REQUIRED_CAP 的能力声明裁剪——裁剪依据从"平台自报 cap=False"改成
+# "实现里有没有这个方法"，事实派生自实现，不经自报）。
+_REQUIRED_API = {
+    "sync_scope_device_wide": "Stream",
+    "stream_dynamic_coverage": "Stream",
+    "stream_fencing_semantics": "Stream",
+    "stream_ctx_restore": "Stream",
+    "mem_query_realtime": "memory_allocated",
+    "mem_info_consistency": "mem_get_info",
+    "rng_state_roundtrip": "get_rng_state",
 }
 
-# declared 能力的背书测试：承诺 True 才需要跑
-BACKING = {"graph_capture": graph_capture_roundtrip,
-           "async_comm": async_comm_smoke}
+# 可选能力的背书测试：**无条件跑**，结果即事实（2026-10-14 取代原 _BACKING
+# 的"声明 True 才跑"——不再有自报的 graph_capture / async_comm 可信问题，
+# 跑不通就是不支持。这两项不进强制套件：不支持是合法的，不该拒绝激活）。
+_ENDORSEMENT = [graph_capture_roundtrip, async_comm_smoke]
 
 
 def run(adapter):
-    """跑强制套件（按能力裁剪） + 声明了 True 的能力的背书测试。"""
-    caps = adapter.capabilities()
+    """跑强制套件（按实现裁剪）+ 可选能力背书（实测产出事实，不阻断激活）。
+
+    裁剪与失败的区分：平台**没实现**该接口 -> 跳过（合法的能力裁剪，框架
+    会收到 unsupported 走降级）；实现了但**没过契约** -> FAIL（拒绝激活）。
+    """
     results = []
-    for t in MANDATORY:
-        req = REQUIRED_CAP.get(t.__name__)
-        if req and not caps.get(req):
+    for t in _MANDATORY:
+        api = _REQUIRED_API.get(t.__name__)
+        if api and not adapter.supports(api):
             results.append(Result(t.__name__, True,
-                                  f"skipped: 平台声明 {req}=False（门面报 unsupported，框架降级）"))
+                                  f"skipped: 平台未实现 {api}()（调用方收 unsupported，走降级）"))
             continue
         results.append(t(adapter))
-    for key, test in BACKING.items():
-        if caps.get(key):
-            results.append(test(adapter))
+    for t in _ENDORSEMENT:
+        results.append(t(adapter))
     return results

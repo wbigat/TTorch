@@ -20,8 +20,8 @@ import os
 
 import torch
 
-from ttorch.bridge import platform_mgr
-from ttorch.bridge.platform_adapter import TTPlatformError
+from ttorch.platform import interface, manager
+from ttorch.platform.platform_handle import TTPlatformError
 
 SCHEMA_VERSION = "tt-single-card-v1"
 
@@ -46,7 +46,7 @@ def _rng_state():
     在 resume 时告警，而不是假装存了（能力驱动降级，不静默伪装）。
     """
     try:
-        device = platform_mgr.get_rng_state()
+        device = interface.get_rng_state()
     except TTPlatformError as e:
         device = None
         print(f"[ckpt] 设备 RNG 不可用，降级: {e}")
@@ -59,8 +59,8 @@ def save(path, model, optimizer, step, extra=None):
     payload = {
         "schema": SCHEMA_VERSION,
         "fingerprint": _fingerprint(model),
-        "platform": {"vendor": platform_mgr.vendor_name(),
-                     "device": platform_mgr.device_name()},
+        "platform": {"vendor": manager.activation().vendor_name,
+                     "device": manager.activation().device_name},
         "step": step,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -97,9 +97,9 @@ def load(path, model, optimizer, strict_platform=False):
             f"（参数名或 shape 变了，strict 加载会漏权重）")
 
     saved_plat = payload.get("platform", {})
-    if saved_plat.get("vendor") != platform_mgr.vendor_name():
+    if saved_plat.get("vendor") != manager.activation().vendor_name:
         msg = (f"[ckpt] 跨平台 resume: 存于 {saved_plat.get('vendor')}，"
-               f"当前 {platform_mgr.vendor_name()}")
+               f"当前 {manager.activation().vendor_name}")
         if strict_platform:
             raise RuntimeError(msg + "（strict_platform=True）")
         print(msg + "（权重可移植，RNG 序列不保证逐位一致）")
@@ -112,7 +112,7 @@ def load(path, model, optimizer, strict_platform=False):
         torch.set_rng_state(rng["cpu"])
     if rng.get("device") is not None:
         try:
-            platform_mgr.set_rng_state(rng["device"])
+            interface.set_rng_state(rng["device"])
         except TTPlatformError as e:
             print(f"[ckpt] 设备 RNG 恢复失败，降级: {e}")
     else:

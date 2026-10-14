@@ -87,7 +87,7 @@
 ### P0 —— 真实需求已被两处代码证明
 
 1. **cuda-compat 缺 WRAP 决策（仅正确性 wrapper）**。当前只有 remap/fallback/exception 三种替换式决策；xswift 里一半补丁是 wrapper（增强/围栏/注入），且支持一符号多 wrapper 叠加。→ `Decision` 增加 `WRAP`，Entry 增加 `wraps` 列表（有序叠加），绑定后仍留 `_origin_` 痕。**注意边界**：这只承载正确性 wrapper；性能目的的 wrapper（JIT 包装原生小算子链）属 Provider 的 wrap_native 构建策略，已落地 demo v3——见 §5 二维模型。
-2. **Platform 双身份：`platform_name()`（vendor 身份）与 `device_name()`（torch 设备类型）分离**。冒充 CUDA 的栈（torch_xmlir/MACA/GCU）会让 CUDA detect 误命中；`device_name` 写错品牌名会导致 `torch.tensor(device=)` 报错、优化器 `device.type` 比较静默失效（FlagOS 有注释在案的真实坑）。→ **已落地（demo v9）**：`PlatformAdapter` 增加 `vendor_name`/`device_name`/`masquerades_as` 类属性；双身份作为 capability 的 identity 档由 manager 注入（adapter 不许自报，防冒充）；`auto_activate` 中 native 命中把被冒充的 compat claim 降级为证据；red 用例证明无 native adapter 时冒充必然得逞。
+2. **Platform 双身份：`platform_name()`（vendor 身份）与 `device_name()`（torch 设备类型）分离**。冒充 CUDA 的栈（torch_xmlir/MACA/GCU）会让 CUDA detect 误命中；`device_name` 写错品牌名会导致 `torch.tensor(device=)` 报错、优化器 `device.type` 比较静默失效（FlagOS 有注释在案的真实坑）。→ **已落地（demo v9）**：`PlatformHandle` 增加 `vendor_name`/`device_name`/`masquerades_cuda` 类属性（双身份由 spec 承载，实现类不许自报，防冒充）；`auto_activate` 中 native 命中把被冒充的 compat claim 降级为证据；red 用例证明无 native adapter 时冒充必然得逞。
 3. **盘点面扩展**：patch 目标不止 vendor_cuda 模块函数——`os.environ.get`、`torch.nn.Conv3d.forward`、`torch.distributed.checkpoint` 内部函数都在列。default-deny 的覆盖面定义要从"vendor_cuda.__all__"扩为"框架用到的全部硬件相关符号表"。
 
 ### P1 —— 工程化强度
@@ -100,21 +100,21 @@
 ### P2 —— 记录为已知边界，暂不实现
 
 8. **懒加载 vs code-first 的张力**：FlagOS register 只存字符串路径（不在该平台就绝不 import 其库）；我们 code-first 真实对象引用 import 期即解析（拼写即炸），代价是全部 vendor 实现 eager import。折中候选：provider impl 支持惰性工厂（`impl_factory: Callable[[], Callable]`），门禁期才解析。
-   **platform 侧已落地（2026-10-12，`platform_specs.py`）**：按"管理面 eager / 适配面 lazy"切开——detect 与身份元数据保持真实引用（code-first 优势不丢），只有实现本体降级为 `impl="module:Class"` 字符串，`_activate()` 才 import。实测佐证了 FlagOS 这条设计的必要性：本机 `import torch_xmlir` 即触发 SYMBOL_REWRITE 与 libbkcl 加载，eager import 全部 vendor adapter 在异构机群上不可接受。另有一条 FlagOS 未记录的收益：PrivateUse1 的 `torch.xpu` 是厂商包运行时注册的属性，类属性 import 期求值必拿 None，惰性是正确性要求而不只是性能优化。**provider 侧仍待办**（见 §4 行动顺序）。
+   **platform 侧已落地（2026-10-12；现 `spec.py`）**：按"管理面 eager / 适配面 lazy"切开——detect 与身份元数据保持真实引用（code-first 优势不丢），只有实现本体降级为 `impl="module:Class"` 字符串，`_activate()` 才 import。实测佐证了 FlagOS 这条设计的必要性：本机 `import torch_xmlir` 即触发 SYMBOL_REWRITE 与 libbkcl 加载，eager import 全部 vendor adapter 在异构机群上不可接受。另有一条 FlagOS 未记录的收益：PrivateUse1 的 `torch.xpu` 是厂商包运行时注册的属性，类属性 import 期求值必拿 None，惰性是正确性要求而不只是性能优化。**provider 侧仍待办**（见 §4 行动顺序）。
 9. **异构混训（hetero）与"进程级单 platform"假设冲突**。FlagOS hetero 支持同进程多芯片类型（flagcx）；我们 auto_activate 多命中 fail fast。文档明记：若未来做异构混训，该假设要打破。
 10. **契约探测技巧**（inspect 调用方源码判断契约形态，dcp.py 实例）——用于一个 patch 兼容多个上游版本。技巧保留，遇具体案例再用。
 11. **RNG conformance 测试**未实现（定稿已列）；wrap_model 类"不报错只出 NaN"的补丁证明 behavior 类必须配 conformance 背书。
 
 ### 我们独有、FlagOS/xExt 都没有的（方向性确认）
 
-provenance 全量审计（gate/select/call/switch + fallback_actual）；三级准入门禁（功能/精度/收益）；switch 运行时控制 + reference 不可禁用；supports 逐调用适用性谓词；capability probed/declared 分档 + conformance 激活门禁；集中 env registry（FlagOS 也缺）。
+provenance 全量审计（gate/select/call/switch + fallback_actual）；三级准入门禁（功能/精度/收益）；switch 运行时控制 + reference 不可禁用；supports 逐调用适用性谓词；conformance 激活门禁（接口不支持抛 unsupported、可选能力实测派生）；集中 env registry（FlagOS 也缺）。
 
 ---
 
 ## 4. 建议行动顺序
 
 1. cuda-compat 增加 WRAP 决策 + wrapper 链（P0-1），demo 用 wrap_model 式围栏补丁验证；
-2. PlatformAdapter 双身份 + detect 优先级（P0-2），demo 加一个"冒充 CUDA 的厂商栈"用例（detect cuda=True 但 native vendor 优先）；
+2. PlatformHandle 双身份 + detect 优先级（P0-2），demo 加一个"冒充 CUDA 的厂商栈"用例（detect cuda=True 但 native vendor 优先）；
 3. Entry 增加框架版本窗口 + drift warning（P1-5）；
 4. env registry（P1-6）作为 switch 的环境变量后端；
 5. workflow 型 provider 概念与注册位（P1-4），先设计评审后实现。

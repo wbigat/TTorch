@@ -17,8 +17,8 @@ def init_device(local_rank):
 
 
 def pick_comm_path():
-    """初始化期按能力选通信路径（capability：选择期消费）。"""
-    return "p2p-direct" if can_device_access_peer() else "staging-buffer"
+    """初始化期按两卡 P2P 可达性选通信路径。"""
+    return "p2p-direct" if can_device_access_peer(0, 1) else "staging-buffer"
 
 
 def memory_report():

@@ -46,9 +46,11 @@ import ttorch; ttorch.activate()
 ## 设计要点
 
 - **两类决策分离**：`cuda_compat` 管框架 CUDA 调用点（remap / fallback /
-  exception），Platform Manager 管平台注册与能力探测，统一接口是后者的顺带产物；
-- **能力驱动，禁止身份判定**：capability 分 probed（必须硬件实测）与 declared
-  （承诺 True 必须有 conformance 背书）两档；
+  exception），Platform Manager 管平台注册/检测/激活与生命周期，统一接口是
+  后者的顺带产物；
+- **不支持即不实现，禁止身份判定**：接口默认抛 unsupported，平台不实现即不支持
+  （`supports()` 内省存在性）；可选能力由 conformance 实测派生，不经平台自报；
+  身份（vendor/device）由 spec 承载、实现类不许自报；
 - **两层门禁**：admission 验绑定正确性，conformance 验 adapter 契约履行，
   任一不过拒绝激活；
 - **惰性导入**：register 只登记轻量 spec，厂商实现在平台确定后才 import——

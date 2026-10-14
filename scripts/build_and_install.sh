@@ -35,7 +35,8 @@ python - <<'PY'
 import importlib, sysconfig, os, sys
 m = importlib.import_module("ttorch")
 assert "site-packages" in m.__file__, f"装的不是 site-packages 版本: {m.__file__}"
-for sub in ("ttorch.bridge", "ttorch.checkpoint", "ttorch.data"):
+for sub in ("ttorch.bridge", "ttorch.platform", "ttorch.checkpoint",
+            "ttorch.diagnostics"):
     importlib.import_module(sub)
 pth = os.path.join(sysconfig.get_path("purelib"), "ttorch_auto_init.pth")
 assert os.path.exists(pth), f".pth 未落位: {pth}"

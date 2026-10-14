@@ -151,7 +151,7 @@ import tt
 
 ### 4.2 Bridge 子模块
 
-Bridge 组织上由两大块构成（2026-10-10 二次定稿）：**cuda-compat**（CUDA 调用点策略：remap / fallback / exception）与 **Platform Manager**（platform 类型注册/环境自动检测激活/构建/probe + per-platform adapter，填非标接口 gap；C++ 接口走编译期 Bazel 选择或启动期动态绑定）。**统一 runtime 接口不是独立子模块**——它没有独立语义内容：契约由 adapter 接口定义，分发是 `select()` 之后一行转发的机械门面，因此作为代码并入 Platform Manager（契约本体 + 门面函数），作为概念/契约见 `TT_Bridge_Deep_Dive.md` §3。执行链路：框架 CUDA 调用点 → cuda-compat 决策 → remap 到 Platform Manager 门面（行为/状态查询）或 capability 缓存（能力）→ adapter → 厂商接口；fallback 走 torch-native；exception 明确报错。要守的约束是依赖方向（Provider 可消费 Platform Manager 的门面与 capability，但 Provider 不依赖 cuda-compat、cuda-compat 不依赖 Provider），不是包归属。
+Bridge 组织上由两大块构成（2026-10-10 二次定稿）：**cuda-compat**（CUDA 调用点策略：remap / fallback / exception）与 **Platform Manager**（platform 类型注册/环境自动检测激活/构建/probe + per-platform adapter，填非标接口 gap；C++ 接口走编译期 Bazel 选择或启动期动态绑定）。**统一 runtime 接口不是独立子模块**——它没有独立语义内容：契约由 adapter 接口定义，分发是 `select()` 之后一行转发的机械门面，因此作为代码并入 Platform Manager（契约本体 + 门面函数），作为概念/契约见 `TT_Bridge_Deep_Dive.md` §3。执行链路：框架 CUDA 调用点 → cuda-compat 决策 → remap 到 interface 转发函数 → 激活的 platform 实现 → 厂商接口；fallback 走 torch-native；exception 明确报错。要守的约束是依赖方向（Provider 可消费 Platform Manager 的门面与接口，但 Provider 不依赖 cuda-compat、cuda-compat 不依赖 Provider），不是包归属。
 
 下表是两大块内部的细分子模块：
 
@@ -205,7 +205,7 @@ Swift、MCore、DeepSpeed、verl 以及其第三方依赖中的 CUDA 痕迹应�
 
 | 类别          | 典型调用                                                                                     | Bridge 处理方式                                                   |
 | ----------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| 通用设备语义      | `is_available`、`device_count`、`set_device`、`synchronize`、RNG、autocast、基础内存查询             | **remap** 到 Platform Manager 统一门面（行为/状态查询）或 capability 缓存（静态事实），经 active adapter 落到厂商接口；对齐 PyTorch accelerator 语义 |
+| 通用设备语义      | `is_available`、`device_count`、`set_device`、`synchronize`、RNG、autocast、基础内存查询             | **remap** 到 interface 转发函数，经激活的 platform 实现落到厂商接口；对齐 PyTorch accelerator 语义 |
 | 分布式语义       | NCCL 初始化、collective、P2P、异步 Work                                                          | 保持 `torch.distributed/c10d` 语义；`torch.tt.comm` 只包装元数据与扩展 hint |
 | CUDA 专属性能能力 | CUDA Graph、NVTX、TF32、SM capability、`CUDA_DEVICE_MAX_CONNECTIONS`                         | 不伪兼容；feature gate 禁用或回退 torch-native 路径。Provider 可提供更优实现，但**功能可达不等待 Provider** |
 | 第三方 CUDA 扩展 | Apex、Transformer Engine、FlashAttention、bitsandbytes、DeepSpeed OpBuilder、Triton CUDA path | 纯 torch-native fallback 或显式禁用；不放进 Bridge 模拟。厂商 / Provider 可提供加速实现，但**其缺失时功能路径仍成立** |

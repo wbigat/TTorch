@@ -54,8 +54,11 @@ def memory_allocated():
     return _require().memory_allocated()
 
 
-def can_device_access_peer():
-    """能力陈述：P2P 是否可用（静态平台事实，进程内不变）。"""
+def can_device_access_peer(device, peer_device):
+    """对齐真实 torch 签名：两张卡之间能否 P2P（逐对回答）。
+
+    mock 拓扑单一，硬件用统一的 p2p_supported 作答；真实栈应逐对查询。
+    """
     return _require().p2p_supported
 
 

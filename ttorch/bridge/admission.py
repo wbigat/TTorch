@@ -6,63 +6,50 @@
 - conformance（platform 侧）验 adapter 契约履行：sync 等待范围、状态
   查询口径、capability 声明真实性——激活期强制执行，见 conformance.py。
 
+组织：按符号分组，与 module_binding.py 的注册顺序对齐。mock demo 专属的
+测试单独标注——真实 torch.cuda 的 policy（module_binding.py）不含这些符号。
+
 不再有字符串 id 注册表——引用即对象，写错名字 import 期就炸。
 每个测试返回 (ok, detail)。
 """
-from ttorch.bridge import platform_mgr
+from ttorch.platform import interface, manager
+
+
+# ==========================================================================
+# 行为（behavior）：有副作用，验语义等价 / 对象形态
+# ==========================================================================
+
+# --- set_device ---
+
+def set_device_roundtrip(ctx):
+    """set_device 绑定正确性（真实环境版）：经绑定符号设置后回读一致。"""
+    idx = interface.current_device()
+    ctx["vendor_cuda"].set_device(idx)
+    ok = ctx["vendor_cuda"].current_device() == idx
+    return ok, f"set_device({idx}) 后 current_device 回读一致 -> {ok}"
 
 
 def set_device_equivalence(ctx):
+    """set_device（mock 版）：走 framework 替身的 init_device。"""
     dev = ctx["framework"].init_device(1)
-    ok = dev == 1 and platform_mgr.current_device() == 1
+    ok = dev == 1 and interface.current_device() == 1
     return ok, f"绑定后 current_device={dev}，两种引用观测一致"
 
 
-def current_device_consistency(ctx):
-    v = ctx["vendor_cuda"].current_device()
-    u = platform_mgr.current_device()
-    return v == u, f"框架侧读到 {v}，门面读到 {u}"
-
-
-def annotate_delivered(ctx):
-    hw = platform_mgr.active().hw
-    platform_mgr.range_push("__probe__")
-    ok = "__probe__" in hw.marks
-    return ok, f"range_push 落到硬件: {hw.marks}"
-
+# --- synchronize ---
 
 def sync_binding(ctx):
-    ok = ctx["vendor_cuda"].synchronize is platform_mgr.synchronize
+    ok = ctx["vendor_cuda"].synchronize is interface.synchronize
     return ok, f"vendor_cuda.synchronize 绑到门面 -> {ok}"
 
 
-def mem_binding(ctx):
-    ok = ctx["vendor_cuda"].memory_allocated is platform_mgr.memory_allocated
-    return ok, f"vendor_cuda.memory_allocated 绑到门面 -> {ok}"
-
-
-def mem_info_binding(ctx):
-    ok = ctx["vendor_cuda"].mem_get_info is platform_mgr.mem_get_info
-    return ok, f"vendor_cuda.mem_get_info 绑到门面 -> {ok}"
-
-
-def rng_binding(ctx):
-    vc = ctx["vendor_cuda"]
-    ok = (vc.get_rng_state is platform_mgr.get_rng_state
-          and vc.set_rng_state is platform_mgr.set_rng_state)
-    return ok, f"get/set_rng_state 绑到门面 -> {ok}"
-
-
-def empty_cache_binding(ctx):
-    ok = ctx["vendor_cuda"].empty_cache is platform_mgr.empty_cache
-    return ok, f"vendor_cuda.empty_cache 绑到门面 -> {ok}"
-
+# --- Stream / current_stream / stream（stream 对象族，ddp fencing 必触发）---
 
 def stream_binding(ctx):
     vc = ctx["vendor_cuda"]
-    ok = (vc.Stream is platform_mgr.Stream
-          and vc.stream is platform_mgr.stream
-          and vc.current_stream is platform_mgr.current_stream)
+    ok = (vc.Stream is interface.Stream
+          and vc.stream is interface.stream
+          and vc.current_stream is interface.current_stream)
     return ok, f"Stream/stream/current_stream 绑到门面 -> {ok}"
 
 
@@ -71,26 +58,89 @@ def vendor_internal_construction(ctx):
     同模块符号，必须仍拿到厂商原生对象。
 
     `torch.cuda.current_stream` 的全局名空间就是被我们改过的
-    `torch.cuda.__dict__`，其内部 `Stream(stream_id=...)` 会落到门面；
-    门面若不分流，返回的 TTStream 会被当作原生 stream 继续流进厂商栈
-    （实测表现：`'TTStream' object has no attribute 'record_event'`）。
+    `torch.cuda.__dict__`，其内部 `Stream(stream_id=...)` 会落到门面。
+    TT 不包装返回对象：门面把 adapter 返回的**厂商原生 stream** 原样透传
+    给框架与厂商内部，不存在"自定义包装被当原生对象用"的错位（旧 TTStream
+    流入 torch 内部曾炸 `'TTStream' object has no attribute 'record_event'`）。
 
-    判据：经门面取当前流，其 .sid 必须是厂商原生类型而非 TTStream。
+    判据：门面返回值与 adapter 契约返回值同型（无中间包装层）。
     """
-    from ttorch.bridge.platform_adapter import TTStream
-    if not platform_mgr.capability("stream_api"):
-        return True, "平台声明 stream_api=False，无 stream 对象族"
-    sid = platform_mgr.current_stream().sid
-    ok = not isinstance(sid, TTStream)
-    return ok, (f"原实现内部构造回落厂商原生对象 -> {type(sid).__name__}"
-                f"（非 TTStream={ok}）")
+    a = manager.activation()
+    if not a.supports("current_stream"):
+        return True, "平台未实现 current_stream，无 stream 对象族"
+    via_interface = interface.current_stream()
+    direct = a.current_stream()
+    ok = type(via_interface) is type(direct)
+    return ok, (f"门面透传厂商原生 stream -> {type(via_interface).__name__}"
+                f"（与 adapter 契约同型={ok}）")
 
 
-def make_cap_binding_test(attr, key):
-    """能力类绑定正确性：框架侧符号读到的是 capability 缓存里的值。"""
-    def cap_binding(ctx):
-        v = getattr(ctx["vendor_cuda"], attr)()
-        c = platform_mgr.capability(key)
-        return v == c, f"{attr}()={v}，capability[{key}]={c}"
-    cap_binding.__name__ = f"cap_binding_{key}"
-    return cap_binding
+# --- empty_cache ---
+
+def empty_cache_binding(ctx):
+    ok = ctx["vendor_cuda"].empty_cache is interface.empty_cache
+    return ok, f"vendor_cuda.empty_cache 绑到门面 -> {ok}"
+
+
+# --- range_push（mock 专属；真实 torch.cuda policy 未纳入此符号）---
+
+def annotate_delivered(ctx):
+    hw = manager.activation().hw
+    interface.range_push("__probe__")
+    ok = "__probe__" in hw.marks
+    return ok, f"range_push 落到硬件: {hw.marks}"
+
+
+# ==========================================================================
+# 状态查询（state_query）：动态只读，验口径一致 + 绑定指向
+# ==========================================================================
+
+# --- current_device ---
+
+def current_device_consistency(ctx):
+    v = ctx["vendor_cuda"].current_device()
+    u = interface.current_device()
+    return v == u, f"框架侧读到 {v}，门面读到 {u}"
+
+
+# --- memory_allocated ---
+
+def mem_binding(ctx):
+    ok = ctx["vendor_cuda"].memory_allocated is interface.memory_allocated
+    return ok, f"vendor_cuda.memory_allocated 绑到门面 -> {ok}"
+
+
+# --- mem_get_info ---
+
+def mem_info_binding(ctx):
+    ok = ctx["vendor_cuda"].mem_get_info is interface.mem_get_info
+    return ok, f"vendor_cuda.mem_get_info 绑到门面 -> {ok}"
+
+
+# --- get_rng_state + set_rng_state（RNG 配对：save 读侧 / resume 写侧）---
+# set_rng_state 在 module_binding 里归 behavior，这里与 get 配对一起验。
+
+def rng_binding(ctx):
+    vc = ctx["vendor_cuda"]
+    ok = (vc.get_rng_state is interface.get_rng_state
+          and vc.set_rng_state is interface.set_rng_state)
+    return ok, f"get/set_rng_state 绑到门面 -> {ok}"
+
+
+# ==========================================================================
+# 通用：绑定指向校验（按对象身份比对，适用于任何纯转发符号）
+# ==========================================================================
+
+def binding_identity(attr):
+    """绑定正确性：框架侧符号确实指向 TT 门面（对象身份比对）。
+
+    用于 is_available / device_count / can_device_access_peer 这类纯转发
+    接口——它们经 interface 直达平台实现，验"绑对了指向"即足够，无需比对取值。
+    """
+    def check(ctx):
+        bound = getattr(ctx["vendor_cuda"], attr)
+        expected = getattr(interface, attr)
+        ok = bound is expected
+        return ok, f"{attr} 绑到门面 -> {ok}"
+    check.__name__ = f"binding_identity_{attr}"
+    return check

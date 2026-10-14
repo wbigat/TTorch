@@ -9,8 +9,8 @@ CPU(dev) 上。唯一的可移植性约定：设备构造走 bridge 的 device_s
 import torch
 from torch import nn
 
-from ttorch.bridge import platform_mgr
-from ttorch.bridge.platform_adapter import TTPlatformError
+from ttorch.platform import manager
+from ttorch.platform.platform_handle import TTPlatformError
 
 VOCAB, DIM, HEADS, LAYERS, SEQ, BATCH = 512, 256, 4, 2, 64, 8
 
@@ -79,7 +79,7 @@ def _bridge_io(step):
         # checkpoint 形态：RNG 存取回环（megatron_lm_utils.py:107/599）
         state = torch.cuda.get_rng_state()
         torch.cuda.set_rng_state(state)
-    if platform_mgr.capability("stream_api"):
+    if manager.activation().supports("Stream"):
         # ddp 侧流 fencing 形态（megatron_lm_utils.py:686-704）：双向依赖边
         side = torch.cuda.Stream()
         main = torch.cuda.current_stream()

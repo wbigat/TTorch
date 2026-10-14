@@ -1,10 +1,8 @@
 """Provider 垂直切片 demo v4：schedule 插槽第二实例（TP 通算 overlap）。
 
-v4 新增：tp_linear 语义的 schedule 完整实例，对照 xmegatron_ext
-tensor_parallel/layers.py 的 LinearWithGradAccumulationAndAsyncCommunication
-（all-gather 异步化 + wgrad/dgrad 分解）。抽象为 (comm_thunks,
-compute_thunks) 时序安排：缺省串行 -> overlap provider 过门禁接管，
-结果逐位对账。
+v4 新增：tp_linear 语义的 schedule 完整实例——TP 通算 overlap（all-gather
+通信异步化 + wgrad/dgrad 分解）。抽象为 (comm_thunks, compute_thunks)
+时序安排：缺省串行 -> overlap provider 过门禁接管，结果逐位对账。
 
 v3 新增（用户纠偏）：wrapper 按目的分属两层——cuda-compat 的 WRAP 是
 正确性 delta（摘掉会错）；性能目的的 wrapper 属 Provider，作为 impl 的
@@ -13,11 +11,10 @@ v3 新增（用户纠偏）：wrapper 按目的分属两层——cuda-compat 的
 build/wraps 进入 gate/select provenance。
 
 v2 在 v1（registry/selection/门禁/switch/回退/provenance）之上补齐三个坑，
-并以 fused RoPE（BSHD）为完整实例——对照真实代码：
-- xmegatron_ext rope_utils.py::_apply_rotary_pos_emb_bshd（厂商融合 kernel
-  RotaryPositionalEmbeddingWithFreqFunction，仅 mscale==1.0 走融合路径）
-- xswift_ext patcher.py::apply_rotary_pos_emb_bshd_wrapper（裸替换逻辑：
-  能 import 到 XME 实现就换——无门禁、无 provenance、无 switch）
+并以 fused RoPE（BSHD）为完整实例——一个"厂商融合 kernel + 裸替换 wrapper"
+的真实组合：
+- 厂商融合 kernel：仅 mscale==1.0 走融合路径，其余回退非融合
+- 裸替换 wrapper：能 import 到融合实现就换——无门禁、无 provenance、无 switch
 
 补齐的坑：
 1. 逐调用适用性谓词 supports：mscale!=1.0 时融合 kernel 不适用，
@@ -26,10 +23,14 @@ v2 在 v1（registry/selection/门禁/switch/回退/provenance）之上补齐三
    默认只记录，provider 声明 min_speedup 才强制拒绝（no_benefit）
 3. torch.ops.tt.* 注册位：tt_ops 模块，框架只面向语义名编程
 """
-from tt_bridge import platform_mgr
-from tt_bridge.adapters import XpuPlatform
+from tt_bridge import manager
+from tt_bridge.adapters import XPU_SPEC
 from tt_provider import implementations as impl
 from tt_provider import provenance, provider_mgr, tt_ops
+
+# 独立实例隔离（真实平台已在 import 时自动注册进默认单例，见 demo_bridge 注释）
+from ttorch.platform import PlatformManager, PlatformRegistry  # noqa: E402
+manager.set_instance(PlatformManager(PlatformRegistry()))
 
 X8 = [0.13, -1.27, 0.85, 0.44, -0.62, 0.99, -0.31, 0.71]
 W8 = [1.0, 0.9, 1.1, 1.0, 0.8, 1.2, 1.0, 0.95]
@@ -46,9 +47,9 @@ def print_select(summary):
 
 
 print("== 0. Bridge 平台激活（Provider 消费 Platform Manager，单向只读）==")
-platform_mgr.register(XpuPlatform)
-platform_mgr.auto_activate()
-provider_mgr.attach_platform(lambda: platform_mgr.active().name)
+manager.register(XPU_SPEC)
+manager.auto_activate()
+provider_mgr.attach_platform(lambda: manager.activation().name)
 
 print("\n== 1. 无性能 Provider 基线：只有 reference（摘掉全部 Provider 的世界）==")
 out = provider_mgr.call("rmsnorm", X8, W8)
@@ -126,8 +127,7 @@ r2 = provider_mgr.call("moe_block", list(impl.MOE_THUNKS), slot="schedule")
 assert r2 == r == [2.0, 4.0, 6.0]
 print(f"  overlap 接管后结果完全一致: {r2}（schedule 只改时序不改语义）")
 
-print("\n  -- 6a. TP 通算 overlap（对照 xmegatron_ext layers.py 的"
-      " LinearWithGradAccumulationAndAsyncCommunication）--")
+print("\n  -- 6a. TP 通算 overlap（all-gather 异步化 + wgrad/dgrad 分解）--")
 r = provider_mgr.call("tp_linear", list(impl.TP_COMM_THUNKS),
                       list(impl.TP_COMPUTE_THUNKS), slot="schedule")
 print(f"  无 provider 时缺省串行（通信完再计算）: {r}")
@@ -142,7 +142,7 @@ r2 = provider_mgr.call("tp_linear", list(impl.TP_COMM_THUNKS),
 assert r2 == r == [1.5, 2.5]
 print(f"  overlap 接管后结果完全一致: {r2}（只改时序不改语义）")
 
-print("\n== 7. 完整实例：fused RoPE（BSHD），对照 xswift_ext/xmegatron_ext 真实代码 ==")
+print("\n== 7. 完整实例：fused RoPE（BSHD）==")
 provider_mgr.provider_register(provider_mgr.Provider(
     name="fused-aot-vendor-rope", kind="fused_aot_vendor", semantic="rope_bshd",
     slot="compute", impl=impl.fused_aot_vendor_rope_bshd, platforms=frozenset({"xpu"}),
@@ -198,4 +198,4 @@ provenance.export_jsonl(snap)
 print(f"\n  已导出 {os.path.basename(snap)}（{len(provenance.RECORDS)} 条）")
 
 print("\n== 11. 生命周期收尾 ==")
-platform_mgr.finalize()
+manager.finalize()

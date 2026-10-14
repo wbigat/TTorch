@@ -1,4 +1,4 @@
-"""真实 Qwen3.5 SFT 穿透 smoke：不经 xswift/megatron，纯 transformers + TT。
+"""真实 Qwen3.5 SFT 穿透 smoke：不经厂商训练框架封装，纯 transformers + TT。
 
 目的（穿透优先，不铺面）：验证 TT 在**真实模型 + 真实框架 + 真实数据**下
 成立。与 real_sft_smoke.py 的分工：后者用自造 TinyLLM 验 P0 接口族的契约
@@ -14,7 +14,7 @@
   厂商基座 torch_xmlir 保留）；
 - 不做 LoRA、TP/PP/EP 并行、MoE dispatcher、多模态 ViT、packing；
 - 多卡分布式（环境不支持）；
-- policy 表仍是 bindings_torch 的 14 符号，未纳入的走 default-deny。
+- policy 表仍是 module_binding 的 14 符号，未纳入的走 default-deny。
 
 用法：
   python real_qwen_smoke.py
@@ -109,7 +109,7 @@ def main():
     tt.start_call_trace()  # 装探针：后续统计运行期真实中转
 
     # 框架 import 必须在 tt.activate() 之后
-    from ttorch import data as tt_data
+    import tt_data
     import ttorch.checkpoint as tt_checkpoint
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

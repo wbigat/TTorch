@@ -11,17 +11,16 @@ v10 新增（对照 TT_Swift_Cuda_API_Inventory.md 的 P0 清单）：
 - 第 11 节：基础 SFT 流程实战（swift 主链路形态），在 xpu-only
   机器上不改框架源码跑通
 
-v9 新增（FlagOS 真坑沉淀）：
+v9 新增（双身份与 masquerade）：
 - 双身份：vendor_name（厂商身份，provider 分发/provenance 用）与
   device_name（torch 认得的设备类型，框架 device.type 比较的存活线），
-  作为 capability 的 identity 档由 manager 注入，adapter 不许自报
+  由 spec 承载、实现类不许自报（防冒充）
 - masquerade 降级：GCU 类栈冒充 CUDA（torch.cuda.is_available() 报 True），
   native 探测命中时把被冒充的 compat claim 降级为证据而非冲突；
   无 native adapter 时冒充必然得逞（对照演示双身份必须成对建设）
 
 v8 仅做组织调整：adapter 契约（platform_adapter.py）与各实现
-（adapters.py）独立成文件，platform_mgr.py 只剩管理面 + 分发门面；
-另补 capabilities() 全量快照查询。
+（adapters.py）独立成文件，interface.py 只剩管理面 + 分发门面；
 
 场景：xpu-only 机器（没有 CUDA 驱动），框架源码一行不改。
 """
@@ -31,9 +30,14 @@ from collections import Counter
 import framework
 import mock_hw
 import vendor_cuda
-from tt_bridge import bindings  # noqa: F401  # import 即注册（binding_register 调用在模块级）
-from tt_bridge import admission, cuda_compat, platform_mgr, registry  # noqa: F401
-from tt_bridge.adapters import CudaPlatform, GcuPlatform, NaiveXpuPlatform, XpuPlatform
+from tt_bridge import bindings  # noqa: F401  # import 即注册（register_binding 调用在模块级）
+from tt_bridge import admission, binding_registry, cuda_compat, interface, manager  # noqa: F401
+from tt_bridge.adapters import CUDA_SPEC, GCU_SPEC, NAIVE_XPU_SPEC, XPU_SPEC
+
+# mock demo 用独立实例隔离：import ttorch.platform 时已把真实平台自动注册进
+# 默认单例；mock 换一套干净实例，避免真实平台与假平台在检测期互相干扰。
+from ttorch.platform import PlatformManager, PlatformRegistry  # noqa: E402
+manager.set_instance(PlatformManager(PlatformRegistry()))
 
 print("== 0. 未激活 Bridge：框架在 xpu-only 机器上直接跑 ==")
 try:
@@ -43,15 +47,15 @@ except RuntimeError as e:
     print(f"  崩溃（符合预期）: {e}")
 
 print("\n== 1. Platform Manager：注册全部类型 + 自动检测 + 激活门禁 ==")
-platform_mgr.register(XpuPlatform)
-platform_mgr.register(CudaPlatform)      # 注册了但本机检测为 absent
-platform_mgr.register(NaiveXpuPlatform)  # auto_detect=False，不参与自动检测
-platform_mgr.auto_activate()             # 内部：版本协商 -> init -> schema -> conformance
+manager.register(XPU_SPEC)
+manager.register(CUDA_SPEC)       # 注册了但本机检测为 absent
+manager.register(NAIVE_XPU_SPEC)  # auto_detect=False，不参与自动检测
+manager.auto_activate()             # 内部：版本协商 -> init -> schema -> conformance
 
 # red 1：多种硬件同时在线时拒绝猜测
 mock_hw.PRESENT_HARDWARE.add("cuda")
 try:
-    platform_mgr.auto_activate()
+    manager.auto_activate()
     print("  意外成功（不应发生）")
 except RuntimeError as e:
     print(f"  多平台冲突 fail fast（符合预期）: {e}")
@@ -60,54 +64,54 @@ finally:
 
 # red 2：不填 gap 的 adapter 被 conformance 门禁拦在激活期
 try:
-    platform_mgr.select("xpu-naive")
+    manager.select("xpu-naive")
     print("  意外成功（不应发生）")
-except platform_mgr.TTPlatformError as e:
+except manager.TTPlatformError as e:
     print(f"  naive adapter 被门禁拦下（符合预期）: {e}")
 
 # red 3：SDK 版本越界被版本协商拦下
 _orig_ver = mock_hw.XpuHw.sdk_version
 mock_hw.XpuHw.sdk_version = "9.9"
 try:
-    platform_mgr.select("xpu")
+    manager.select("xpu")
     print("  意外成功（不应发生）")
-except platform_mgr.TTPlatformError as e:
+except manager.TTPlatformError as e:
     print(f"  SDK 版本越界被拦（符合预期）: {e}")
 finally:
     mock_hw.XpuHw.sdk_version = _orig_ver
 
 # red 4：masquerade —— GCU 栈冒充 CUDA，native 探测命中后 cuda claim 降级
-platform_mgr.register(GcuPlatform)
+manager.register(GCU_SPEC)
 _saved_hw = set(mock_hw.PRESENT_HARDWARE)
 mock_hw.PRESENT_HARDWARE.clear()
 mock_hw.PRESENT_HARDWARE.add("gcu")
-platform_mgr.auto_activate()
-assert platform_mgr.vendor_name() == "gcu", platform_mgr.vendor_name()
-assert platform_mgr.device_name() == "cuda", platform_mgr.device_name()
-print(f"  GCU 机器：激活 vendor={platform_mgr.vendor_name()}，"
-      f"torch 视角 device_name={platform_mgr.device_name()} "
+manager.auto_activate()
+assert manager.activation().vendor_name == "gcu", manager.activation().vendor_name
+assert manager.activation().device_name == "cuda", manager.activation().device_name
+print(f"  GCU 机器：激活 vendor={manager.activation().vendor_name}，"
+      f"torch 视角 device_name={manager.activation().device_name} "
       f"（未误判成 NVIDIA，框架 device.type 比较继续成立）")
 
 # red 4 对照：native adapter 缺失时冒充必然得逞 —— 双身份必须成对建设
-platform_mgr._REGISTRY.pop("gcu")
-platform_mgr.auto_activate()
-_trapped = platform_mgr.vendor_name()
+manager.unregister("gcu")
+manager.auto_activate()
+_trapped = manager.activation().vendor_name
 assert _trapped == "nvidia-cuda", _trapped
 print(f"  对照（无 GCU native adapter）：误激活 vendor={_trapped}，masquerade 得逞")
-platform_mgr.register(GcuPlatform)
+manager.register(GCU_SPEC)
 mock_hw.PRESENT_HARDWARE.clear()
 mock_hw.PRESENT_HARDWARE.update(_saved_hw)
-platform_mgr.auto_activate()  # 恢复 xpu 激活态，继续主流程
+manager.auto_activate()  # 恢复 xpu 激活态，继续主流程
 
 print("\n== 2. policy 注册表（code-first，import 期已完成全部校验）==")
-entries = registry.entries()
-cats = Counter(e.category.value for e in entries)
-print(f"  注册 {len(entries)} 条: {dict(cats)}")
+entries = binding_registry.get_entries()
+decs = Counter(e.decision.value for e in entries)
+print(f"  注册 {len(entries)} 条: {dict(decs)}")
 
 print("\n== 3. cuda-compat 激活（绑定 + from-import 扫尾 + 默认拒绝）==")
 cuda_compat.activate(entries)
-ok = framework.set_device is platform_mgr.set_device
-print(f"  from-import 扫尾生效: framework.set_device is platform_mgr.set_device -> {ok}")
+ok = framework.set_device is interface.set_device
+print(f"  from-import 扫尾生效: framework.set_device is interface.set_device -> {ok}")
 assert ok
 print(f"  原始实现留痕: hasattr(vendor_cuda, '_origin_set_device') -> "
       f"{hasattr(vendor_cuda, '_origin_set_device')}")
@@ -119,8 +123,7 @@ for e in entries:
     if e.test and e.test not in ran:
         ran.add(e.test)
         ok, detail = e.test(ctx)
-        print(f"  [{'PASS' if ok else 'FAIL'}] {e.test.__name__:<24} "
-              f"@{e.category.value:<12}: {detail}")
+        print(f"  [{'PASS' if ok else 'FAIL'}] {e.test.__name__:<28}: {detail}")
 
 print("\n== 5. 默认拒绝：未注册的符号 ==")
 try:
@@ -135,7 +138,7 @@ framework.all_reduce_hook()
 print(f"  behavior   : pick_comm_path -> {framework.pick_comm_path()}"
       f"（capability 选择期消费：XPU 无 P2P，走 staging）")
 framework.annotated_step(lambda: None)
-print(f"  behavior   : annotated_step -> 硬件 marks={platform_mgr.active().hw.marks}")
+print(f"  behavior   : annotated_step -> 硬件 marks={manager.activation().hw.marks}")
 print(f"  state_query: memory_report -> {framework.memory_report()}B（实时读）")
 r = framework.capture_step(lambda: "train step executed (eager)")
 print(f"  fallback   : graph_capture -> {r}")
@@ -148,14 +151,14 @@ print("\n== 7. 统一错误映射：厂商原生错误 -> TTPlatformError ==")
 try:
     framework.init_device(99)  # 越界设备号
     print("  意外成功（不应发生）")
-except platform_mgr.TTPlatformError as e:
+except manager.TTPlatformError as e:
     print(f"  非法设备 -> 统一类别 [{e.category}]（XpuHwError 已被 adapter 翻译）: {e}")
 
 print("\n== 8. 导出 YAML 快照（生成物，CI diff 评审用，永不手改）==")
 snap = os.path.join(os.path.dirname(__file__), "policy_snapshot.yaml")
 # 限定 mock policy：REGISTRY 是进程级全局，真实 torch.cuda 的条目
-# （bindings_torch）若被 import 过也在其中，不过滤会污染本快照
-registry.export_yaml(snap, bind_module="vendor_cuda")
+# （module_binding）若被 import 过也在其中，不过滤会污染本快照
+binding_registry.export_entries(snap, bind_module="vendor_cuda")
 with open(snap) as f:
     print("\n".join("  " + line for line in f.read().splitlines()[:8]))
 print(f"  ...（完整快照见 {os.path.basename(snap)}，提交时 diff 必须一致）")
@@ -164,9 +167,9 @@ print("\n== 9. 覆盖对账 + trace（Bridge 侧 provenance，可导出）==")
 for dotted, status in cuda_compat.coverage_report(entries, ["vendor_cuda"]):
     print(f"  {dotted:<38}{status}")
 print()
-print(f"  {'symbol':<36}{'category':<14}{'decision':<14}{'target':<18}swept")
-for t in cuda_compat.TRACE:
-    print(f"  {t['symbol']:<36}{t['category']:<14}{t['decision']:<14}"
+print(f"  {'symbol':<36}{'decision':<14}{'target':<18}swept")
+for t in cuda_compat.trace():
+    print(f"  {t['symbol']:<36}{t['decision']:<14}"
           f"{str(t['target']):<18}{t['swept_modules']}")
 
 print("\n== 11. 基础 SFT 流程实战（P0 接口族，swift 主链路形态）==")
@@ -177,18 +180,18 @@ free_gb, total_gb = framework.device_budget_gb()
 assert total_gb == 80.0 and 0 < free_gb <= total_gb
 print(f"  设备预算: free={free_gb}GB / total={total_gb}GB（patcher max_memory 形态）")
 t, dev_id = framework.tensor_on_current_device(4)
-assert len(t) == 4 and dev_id == platform_mgr.current_device()
+assert len(t) == 4 and dev_id == interface.current_device()
 print(f"  current_device 当设备标识: tensor(len=4) on device={dev_id}"
       f"（megatron utils.py:214 形态）")
 ckpt = framework.sft_step()
-hw = platform_mgr.active().hw
+hw = manager.activation().hw
 assert len(hw.wait_edges) >= 2, hw.wait_edges  # 双向 fencing 依赖边
 print(f"  sft_step 完成: RNG 已存={ckpt['rng']!r}，fencing 依赖边={hw.wait_edges}")
 framework.resume_from(ckpt)
-assert platform_mgr.get_rng_state() == ckpt["rng"]
+assert interface.get_rng_state() == ckpt["rng"]
 print(f"  resume: RNG 回环一致（megatron_lm_utils.py:107/599 形态）")
 assert "purge" in hw.marks  # empty_cache 落到 XPU 非标 purge
 print(f"  empty_cache -> XPU 非标 purge 留痕: {hw.marks}")
 
 print("\n== 10. 生命周期收尾 ==")
-platform_mgr.finalize()
+manager.finalize()

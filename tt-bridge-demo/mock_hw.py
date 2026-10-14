@@ -35,6 +35,37 @@ class AsyncHandle:
             self._done = True
 
 
+class MockStream:
+    """mock 平台的原生 stream 对象（对标真实栈 torch.cuda.Stream：自带
+    wait_stream 方法——那是框架 ddp fencing 的对象方法形态）。
+
+    mock 硬件内部仍用 int sid 记账；本对象 __hash__/__eq__ 与裸 sid 兼容，
+    使 streams dict / wait_edges / current_stream 的 int 语义不受影响。
+    存在理由：TT 门面不再包装 stream（无 TTStream），各平台原生对象须自带
+    框架要用的方法，mock 的"原生对象"因此从裸 int 升级为本类。
+    """
+
+    def __init__(self, sid, hw):
+        self.sid = sid
+        self._hw = hw
+
+    def wait_stream(self, other):   # 框架侧 fencing 形态（对象方法）
+        # 模拟"原生 stream 的原生方法"（对标 torch.cuda.Stream.wait_stream，
+        # 真实栈不经 TT adapter）。mock 硬件的跨流等待物理含义 = wait_edges
+        # 留痕，直接记录——与 CudaHw.wait_stream / XpuHw.streamWait 的接口名
+        # 差异无关（那是实现类填 gap 的事，非对象方法的事）。
+        self._hw.wait_edges.append((self, other))
+
+    def __eq__(self, o):
+        return self.sid == (o.sid if isinstance(o, MockStream) else o)
+
+    def __hash__(self):
+        return hash(self.sid)
+
+    def __repr__(self):
+        return f"<MockStream:{self.sid}>"
+
+
 # 模拟"当前机器上插了什么卡"。真实环境的对应物是驱动/SO/设备节点的存在性
 # 探测（只看不初始化）；demo 用这个集合模拟。本场景是 xpu-only 机器。
 PRESENT_HARDWARE = {"xpu"}
@@ -53,7 +84,7 @@ class CudaHw:
         注意：GCU 栈会冒充 CUDA（torch.cuda.is_available() 报 True，
         CUDA API 有响应），所以 gcu 在场时本探测也会命中——这是
         compat claim，不是 native 证据，靠 GcuHw.probe_present +
-        masquerades_as 降级机制纠正。
+        masquerades_cuda 降级机制纠正。
         """
         return "cuda" in PRESENT_HARDWARE or "gcu" in PRESENT_HARDWARE
 
@@ -64,7 +95,7 @@ class CudaHw:
         self.marks = []  # profiler 标注记录
         self.streams = {0: [], 1: [], 2: []}  # stream_id -> pending work
         self._next_stream = 3
-        self.current_stream = 0        # 当前 stream id
+        self.current_stream = MockStream(0, self)  # 当前 stream（原生对象）
         self.wait_edges = []           # 跨流依赖留痕 [(waiter, waitee)]
         self._rng = "cuda-rng-seed-0"  # RNG 状态（契约：不透明 str）
         self.total_mem = 80 * 1024**3  # 物理显存 80GB
@@ -85,7 +116,7 @@ class CudaHw:
         sid = self._next_stream
         self._next_stream += 1
         self.streams[sid] = []
-        return sid
+        return MockStream(sid, self)
 
     def submit(self, stream_id, work):
         self.streams[stream_id].append(work)
@@ -174,7 +205,7 @@ class XpuHw:
         self.marks = []
         self.streams = {0: [], 1: [], 2: []}
         self._next_stream = 3
-        self.current_stream = 0
+        self.current_stream = MockStream(0, self)
         self.wait_edges = []              # 跨流依赖留痕
         self._rng = "xpu-rng-seed-0"      # RNG 状态（契约：不透明 str）
         self.total_mem_mib = 80 * 1024    # 物理显存 80GB（非标：MiB 单位）
@@ -197,7 +228,7 @@ class XpuHw:
         sid = self._next_stream
         self._next_stream += 1
         self.streams[sid] = []
-        return sid
+        return MockStream(sid, self)
 
     def submit(self, stream_id, work):
         self.streams[stream_id].append(work)
