@@ -11,26 +11,44 @@ import 的模块，顺序本身无法补救——激活时机是硬约束，不�
 - 激活编排 + 激活状态：ttorch.bridge.bootstrap（cuda-compat 使能的主控）
 - 平台注册/检测/门禁/生命周期：ttorch.platform.manager
 - 平台的 torch 接口暴露（policy 绑定目标）：ttorch.platform.interface
-- 绑定状态确认 + 运行期中转统计：ttorch.diagnostics（观测是独立工程资产）
-- checkpoint：ttorch.checkpoint
+- 模块级性能实现（provider）：ttorch.provider（自动注册/生效/选择）
+- 观测/验证/溯源（witness）：ttorch.witness（执行数据采集 + bridge/provider 取证）
+- checkpoint（save/resume + schema 校验 + RNG）：ttorch.bridge.checkpoint
 - 打包/自动激活：ttorch._auto_init（.pth 钩子）
 
-依赖方向（单向）：bootstrap / cuda_compat → platform；platform 不认识 bridge。
+依赖方向（单向）：bootstrap / cuda_compat → platform；provider → platform；
+platform 不认识 bridge / provider。
 """
 from ttorch.bridge import bootstrap as _bootstrap
 from ttorch.platform.platform_handle import TTPlatformError  # noqa: F401  # 再导出
 
 __all__ = ["activate", "active", "is_active", "device_spec", "finalize",
-           "check_bindings", "start_call_trace", "call_trace_report",
-           "TTPlatformError", "FRAMEWORK_PACKAGES"]
+           "provider_wrap", "check_bindings", "start_call_trace",
+           "call_trace_report", "TTPlatformError", "FRAMEWORK_PACKAGES"]
 
 
 def activate(platform="auto", sweep_packages=None):
-    """激活 TT Bridge（platform 检测 + 门禁 + cuda-compat 绑定 + 扫尾验收）。
+    """激活 TT（platform 检测 + cuda-compat 绑定 + provider 自动注册）。
 
-    实现见 bridge.bootstrap.activate()。幂等：重复调用返回同一结果。
+    Bridge 实现见 bridge.bootstrap.activate()；随后 provider 层自动注册全部
+    已知 provider 并接线平台探测（见 provider.manager.activate()）。幂等。
     """
-    return _bootstrap.activate(platform=platform, sweep_packages=sweep_packages)
+    act = _bootstrap.activate(platform=platform, sweep_packages=sweep_packages)
+    # provider 自动注册 + 接线（平台已激活）。惰性 import 保持 import ttorch 轻。
+    from ttorch.provider import manager as _provider_mgr
+    _provider_mgr.activate()
+    return act
+
+
+def provider_wrap(model):
+    """自动发现并 patch 模型里匹配已注册 provider 的模块（自动生效）。
+
+    在模型建好（from_pretrained / 搬到设备）之后调用一次：模型里的
+    RMSNorm/RoPE 等模块被路由到对应 provider，首次前向时按平台自动选实现。
+    返回 patch 的模块数。
+    """
+    from ttorch.provider import manager as _provider_mgr
+    return _provider_mgr.wrap_model(model)
 
 
 def active():
@@ -56,28 +74,28 @@ def finalize():
     _bootstrap.finalize()
 
 
-# --- 观测：转发到 ttorch.diagnostics，本体不在此 ---
+# --- 观测/验证：转发到 ttorch.witness，本体不在此 ---
 
 def check_bindings():
     """绑定正确性自检（admission 全套）。返回 (n_fail, rows)。"""
-    from ttorch import diagnostics
-    return diagnostics.check_bindings(active().entries)
+    from ttorch import witness
+    return witness.check_bindings(active().entries)
 
 
 def start_call_trace():
     """给门面装计数探针，统计运行期实际经 TT 中转的调用。"""
-    from ttorch import diagnostics
-    return diagnostics.start_call_trace(active().entries)
+    from ttorch import witness
+    return witness.start_call_trace(active().entries)
 
 
 def call_trace_report(min_calls=1, exclude_prefixes=None):
     """中转证据报告。exclude_prefixes 默认排除本项目自带的 smoke/验收代码
     （它们对门面的调用不算"框架侧"证据）。"""
-    from ttorch import diagnostics
+    from ttorch import witness
     if exclude_prefixes is None:
         exclude_prefixes = ("real_qwen_smoke", "real_sft_smoke",
                             "checkpoint", "framework_real")
-    return diagnostics.call_trace_report(min_calls, exclude_prefixes)
+    return witness.call_trace_report(min_calls, exclude_prefixes)
 
 
 # 扫尾白名单再导出（本体在 bridge.bootstrap，激活编排的默认配置）

@@ -12,19 +12,28 @@ xmegatron_ext）跑通完整 swift-megatron SFT —— 训练脚本一行不改�
 开发方针是**穿透优先、不铺开面**：完备性现阶段放低，未纳入 policy 的 API
 直接报未实现，先把一条端到端链路打穿再扩面。当前 policy 14 个符号。
 
+**provider 已起步**：bridge 之外补齐了性能实现层与观测层——首个真实 provider
+（RMSNorm，KL3）跑通"自动注册→自动生效→自动选择"的整网使能（数值与厂商逐位一致），
+并收拢观测/验证/溯源为独立的 witness 层。实测结论与经验教训见
+`docs/TT_Provider_Function_Map.md` §6。
+
 ## 目录
 
 ```
-ttorch/              正式包（Part 1：Bridge 功能接入层）
-  __init__.py          统一入口：activate / device_spec / check_bindings / 中转证据
+ttorch/              正式包（四层收束，顶层只做转发）
+  __init__.py          统一入口：activate / device_spec / provider_wrap / check_bindings
   _auto_init.py        .pth 钩子：环境变量控制的自动激活
-  bridge/              cuda_compat（符号决策）+ Platform Manager（平台注册/检测/门禁）
-  checkpoint.py        checkpoint bridge：schema 校验 + RNG + resume 连续性
-  data.py              SFT 数据面：chat template + loss mask
+  bridge/              CUDA 接口兼容（cuda_compat 符号决策）+ bootstrap（激活编排）
+                       + checkpoint（save/resume + schema 校验 + RNG）
+  platform/            Platform Manager：平台注册/检测/门禁/生命周期 + torch 接口暴露
+  provider/            module 级性能实现：两层 Provider/ProviderImpl + 自动注册/生效/选择
+  witness/             观测/验证/溯源：统一 provenance + bridge API 验证 + 运行期中转
+                       + provider 精度/性能验证原语
 tests/               测试与验收（分层说明见 tests/README.md）
 scripts/             工程工具（打包安装等）
-tt-bridge-demo/      mock 机制演示（假硬件走通设计意图，含 red 用例）
+tt-bridge-demo/      mock 机制演示（假硬件走通 Bridge 设计意图，含 red 用例）
 tt-schedule-demo/    schedule provider 机制演示
+tt-provider-demo/    真实硬件（KL3）provider 机制演示（RMSNorm 门禁/选择/回退/整网使能）
 docs/                架构设计与真实环境踩坑记录（G 系列）
 ```
 
@@ -45,9 +54,16 @@ import ttorch; ttorch.activate()
 
 ## 设计要点
 
+四层收束，依赖单向（bridge→platform、provider→platform、bridge/provider→witness）：
+**bridge** 功能接入（CUDA 调用点接管 + checkpoint）、**platform** 硬件抽象、
+**provider** module 级性能实现、**witness** 观测/验证/溯源。
+
 - **两类决策分离**：`cuda_compat` 管框架 CUDA 调用点（remap / fallback /
   exception），Platform Manager 管平台注册/检测/激活与生命周期，统一接口是
   后者的顺带产物；
+- **provider 失败只降性能不降功能**：每个 module provider 自带 native 底线
+  （torch 原生单算子），高性能 impl 经三级门禁（功能/精度/收益）选用，
+  失败/关闭即回退 native，可 kill switch 整体退场；
 - **不支持即不实现，禁止身份判定**：接口默认抛 unsupported，平台不实现即不支持
   （`supports()` 内省存在性）；可选能力由 conformance 实测派生，不经平台自报；
   身份（vendor/device）由 spec 承载、实现类不许自报；

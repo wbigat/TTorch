@@ -389,6 +389,14 @@ Bazel/编译期的意义是确定哪些 SDK、ABI 和 Platform 包能够安全�
 
 ## 7. Execution Provider：模块级性能兑现层
 
+> **实施状态（2026-10-15）**：本节是 Provider 的**目标形态**（面向 ParallelLinear/
+> MoE、ModuleSemanticSpec 归一化、framework_module_adapter、Reference/Jit/Native
+> 三分、megatron 路径）。当前**首个落地**走的是更小的 transformers/eager 路径——
+> RMSNorm provider：两层结构（`Provider`/`ProviderImpl`）+ 自动注册/生效/选择 +
+> 统一 provenance，代码在 `ttorch/provider/`。as-built 结构、实测结论与经验教训见
+> `TT_Provider_Function_Map.md` §6。ModuleSemanticSpec / framework_module_adapter /
+> megatron 路径的 ParallelLinear 仍是后续方向（本节愿景不变）。
+
 ### 7.1 Provider 的职责
 
 Provider 解决的问题是：**某类训练模块在当前 Platform 上如何以可替换、可验证、可回退的方式执行。**
@@ -547,6 +555,11 @@ tt/
       metrics.py
       numerical_check.py
 ```
+
+> 实施状态（2026-10-15）：此 `observability/` 层已落地为 **`ttorch/witness/`**——
+> `witness/provenance.py`（统一事件流）、`witness/bindings.py`（bridge API 验证）、
+> `witness/call_trace.py`（运行期中转证据）、`witness/verify.py`（provider 精度/
+> 性能验证原语）。witness 与 bridge/platform/provider 平行为第四层。
 
 ---
 

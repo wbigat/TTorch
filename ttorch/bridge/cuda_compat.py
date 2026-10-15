@@ -15,6 +15,7 @@ YAML 降级为生成物（binding_registry.export_entries 快照，供评审 dif
 import importlib
 import sys
 
+from ttorch.witness import provenance
 from ttorch.platform import manager
 from ttorch.bridge.binding_registry import Decision, Entry
 
@@ -25,19 +26,24 @@ class TTCompatError(RuntimeError):
     pass
 
 
-# 绑定去向记录（Bridge 侧 provenance）：append-only 日志，运行期会增长
-# （fallback 每次执行都会追加）。匿名为 _TRACE——暴露成 public 可变 list
-# 会被外部 append/clear 破坏（同 binding_registry 的 _REGISTRY 考量），
-# 外部经 trace() 取只读快照。
-# 不搞 class：它只是无规则的追加日志（无注册/查重逻辑），一个 list +
-# 只读 getter 足够；BindingRegistry 那种有规则的才值得封装成类。
-_TRACE = []
+# 绑定去向记录统一进 witness.provenance（layer="bridge"），与 provider 的
+# 门禁/选择/调用事件共一份事件流——排障时一份报告同时覆盖"符号被替换成什么"
+# （bridge）与"模块加速选了谁"（provider）。trace() 保留为兼容视图：把统一
+# 信封适配回历史字段（symbol/decision/target/swept_modules），供既有打印用。
 
 
 def trace():
     """绑定去向记录的只读快照（tuple）。每项含 symbol/decision/target/
-    intent/swept_modules，可导出（Bridge 侧 provenance）。"""
-    return tuple(_TRACE)
+    intent/swept_modules。
+
+    存储已统一进 witness.provenance（layer="bridge"）；本函数把统一信封适配回
+    历史字段，供既有消费方用。新代码请直接读 ttorch.witness.provenance。
+    """
+    return tuple(
+        {"symbol": r["subject"], "decision": r["outcome"],
+         "target": r["evidence"].get("target"), "intent": r["evidence"].get("intent"),
+         "swept_modules": r["evidence"].get("swept_modules")}
+        for r in provenance.records(provenance.LAYER_BRIDGE))
 
 
 def _rebind_and_sweep(source_module, attr, new_impl, original, sweep_packages=None):
@@ -73,8 +79,8 @@ def _rebind_and_sweep(source_module, attr, new_impl, original, sweep_packages=No
 
 def _fallback_eager(dotted):
     def impl(fn, *a, **k):
-        _TRACE.append(dict(symbol=dotted, decision="fallback-exec",
-                           target="eager", intent="运行时退回 eager 执行", swept_modules=0))
+        provenance.record(provenance.LAYER_BRIDGE, "bind", dotted, "fallback-exec",
+                          target="eager", intent="运行时退回 eager 执行", swept_modules=0)
         return fn(*a, **k)
     return impl
 
@@ -110,8 +116,8 @@ def activate(entries, default_deny=True, sweep_packages=None):
         attr = e.symbol.__name__
         n_swept = _rebind_and_sweep(module, attr, _impl_for(e), getattr(module, attr), sweep_packages)
         managed.add(e.dotted)
-        _TRACE.append(dict(symbol=e.dotted, decision=e.decision.value,
-                           target=e.target, intent=e.intent, swept_modules=n_swept))
+        provenance.record(provenance.LAYER_BRIDGE, "bind", e.dotted, e.decision.value,
+                          target=e.target, intent=e.intent, swept_modules=n_swept)
 
     # 默认拒绝：盘点面内未注册的符号，绑 exception，白名单姿态
     denied = 0
@@ -126,9 +132,9 @@ def activate(entries, default_deny=True, sweep_packages=None):
                     f"{mod_name}.{name}", "未纳入 policy（默认拒绝）：请先盘点、归类、补准入测试"),
                     original, sweep_packages)
                 denied += 1
-                _TRACE.append(dict(symbol=f"{mod_name}.{name}",
-                                   decision="default-deny", target=None,
-                                   intent="未盘点符号，白名单姿态", swept_modules=n_swept))
+                provenance.record(provenance.LAYER_BRIDGE, "bind", f"{mod_name}.{name}",
+                                  "default-deny", target=None,
+                                  intent="未盘点符号，白名单姿态", swept_modules=n_swept)
 
     print(f"[cuda_compat] activated: {len(entries)} policy symbols + {denied} default-deny")
 

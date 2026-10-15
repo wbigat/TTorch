@@ -105,6 +105,24 @@ def is_xpu():                                    # xmegatron_ext/entry.py:257-26
 
 `checkpointing.py`(643行，XTE large_weight ⇄ per-expert 双向转换 + LoRA)、`extensions/transformer_engine.py`、两份 `sft_tokenizer`、`bridge/training/tokenizers/*`、`print.py`(吞吐监控)、`base.py:37-252`(ProfilerCallback 注入)。
 
+### (e) 关键分层结论（2026-10-15 实测确认）
+
+**性能 kernel 的物理本体全部在 torch_xmlir**（`torch.ops.custom_ops.*`，来自
+`libxmlir_custom_ops.so`/`libxpu_dnn.so`）。xmegatron_ext 的"融合算子"
+（SwiGLU/RoPE/MoE a2a）是把 torch_xmlir kernel 包成 autograd.Function/megatron
+层的**封装**；xswift_ext 则是纯框架集成（trainer/checkpoint/lora/数据/conv3d），
+无一行自有 kernel。所以"xswift 不做性能优化"成立；"性能全在 torch_xmlir"要修正为
+"**kernel 在 torch_xmlir，megatron 融合层封装在 xmegatron_ext，swift 集成在
+xswift_ext**"。两个开关（`XSWIFT_PLUGIN_ENABLE`/`XME_PLUGIN_ENABLE`）只门控这两层
+框架集成（`.pth` auto-init + 惰性 import 钩子），不管 torch_xmlir 本体（它永远开）。
+
+**torch_xmlir 自己在 eager/transformers 层也做符号替换**（`symbrewrite/plugins/
+transformers`）：Qwen2/Qwen3/Qwen3.5/Gemma4 等的 `*RMSNorm`、`apply_rotary_pos_emb*`
+已被换成厂商融合实现（RMSNormFunction/FusedRoPEFunc，同源 custom_ops kernel）。
+**这是 eager 路径上 RMSNorm/RoPE 已是融合态的原因**——Provider 在这类算子上的增量
+价值只剩机制（门禁/回退/provenance/开关），净性能持平（见 TT_Provider_Function_Map.md
+§6.2）。**Provider 选题前先查这份符号替换清单，避免在厂商已融合的算子上重复。**
+
 ---
 
 ## 3. Bridge 应当吸收什么

@@ -34,6 +34,7 @@ import argparse
 import math
 import os
 import sys
+import time
 
 import torch
 
@@ -81,6 +82,22 @@ def train_loop(model, opt, batches, device, steps, bridged=True, start=0, fixed=
     return losses
 
 
+def _time_fwd_bwd(model, batches, device, n):
+    """计时不更新权重的 前向+反向（不动 opt.step）——测 RMSNorm provider 的整网
+    计算开销，同时不污染后续训练轨迹的初始权重。"""
+    ids, labels, attn = batches[0]
+    model.train()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n):
+        out = model(input_ids=ids.to(device), labels=labels.to(device),
+                    attention_mask=attn.to(device))
+        out.loss.backward()
+        model.zero_grad()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--platform", default="auto",
@@ -95,6 +112,8 @@ def main():
     ap.add_argument("--max-length", type=int, default=8192)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--ckpt", default="/tmp/tt_qwen_ckpt.pt")
+    ap.add_argument("--no-provider", action="store_true",
+                    help="禁用 provider 自动使能（默认开启：RMSNorm 路由到厂商融合）")
     args = ap.parse_args()
 
     print(f"[env] torch={torch.__version__}")
@@ -110,7 +129,7 @@ def main():
 
     # 框架 import 必须在 tt.activate() 之后
     import tt_data
-    import ttorch.checkpoint as tt_checkpoint
+    import ttorch.bridge.checkpoint as tt_checkpoint
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     print(f"\n== 2. 真实数据 + tokenizer（{os.path.basename(args.data)}）==")
@@ -159,6 +178,21 @@ def main():
         args.model, dtype=dtype, attn_implementation="eager").to(dev)
     print(f"  {type(model).__name__} 参数量="
           f"{sum(p.numel() for p in model.parameters()) / 1e9:.3f}B")
+
+    # provider 自动使能：把模型的 RMSNorm 模块路由到 provider（自动发现+选择厂商
+    # 融合）。A-B 计时不更新权重（只前向+反向），不污染后续训练轨迹。
+    if not args.no_provider:
+        n_wrapped = tt.provider_wrap(model)
+        from ttorch.provider import manager as _pm
+        _pm.set_bypass(True)   # baseline：原始 RMSNorm（厂商栈接管的 RMSNormFunction）
+        _time_fwd_bwd(model, batches, dev, 3)  # warmup
+        t_base = _time_fwd_bwd(model, batches, dev, 6)
+        _pm.set_bypass(False)  # vendor：provider 路由到 torch.ops.custom_ops AOT kernel
+        _time_fwd_bwd(model, batches, dev, 3)  # warmup（首次前向触发自动选择+门禁）
+        t_vendor = _time_fwd_bwd(model, batches, dev, 6)
+        print(f"  provider 自动使能: patch {n_wrapped} 个 RMSNorm 模块；"
+              f"整网前向+反向 {t_base*1e3:.1f} -> {t_vendor*1e3:.1f} ms "
+              f"({t_base/t_vendor:.2f}x)")
     try:
         free, total = torch.cuda.mem_get_info()
         print(f"  mem_get_info（经门面）free={free / 2**30:.1f}GB "
@@ -188,6 +222,8 @@ def main():
     print(f"\n== 5. checkpoint resume：从 step {args.resume_at} 恢复重跑 ==")
     model2 = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=dtype, attn_implementation="eager").to(dev)
+    if not args.no_provider:
+        tt.provider_wrap(model2)   # resume 模型同样走 provider（轨迹一致）
     opt2 = torch.optim.AdamW(model2.parameters(), lr=args.lr)
     step = tt_checkpoint.load(args.ckpt, model2, opt2)
     losses_r = train_loop(model2, opt2, batches, dev, rest, start=0, fixed=True)

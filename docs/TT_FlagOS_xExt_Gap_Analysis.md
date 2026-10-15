@@ -1,6 +1,10 @@
 # TT Bridge/Provider vs FlagOS / xswift_ext / xmegatron_ext 差距分析
 
 日期：2026-10-11。基准：tt-bridge-demo v8（Bridge 两块）+ tt_provider v2（三级门禁/supports/switch/provenance/tt_ops）。
+
+> 注（2026-10-15）：本文的 mock `tt_provider v2` 已落地为真实生产包 `ttorch/provider`
+> （两层 Provider/ProviderImpl + 自动注册/生效/选择 + 统一 provenance），首个真实
+> provider（RMSNorm, KL3）实测与经验教训见 `TT_Provider_Function_Map.md` §6。
 证据来源：Megatron-LM-FL 全量扫描（1165 py，重点 `megatron/plugin/`）、xswift_ext 与 xmegatron_ext 全部 60+ 文件精读。
 
 ---

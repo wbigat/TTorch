@@ -10,9 +10,15 @@
 
 工程工具（打包安装等）在仓库根目录的 `scripts/`，不属于测试分层。
 
-mock demo（`tt-bridge-demo/`、`tt-schedule-demo/`）是**机制演示**而非测试，
-保留在原位：它们用假硬件把 Bridge/Provider 的设计意图走一遍，包括正常路径
-与 red 用例（门禁拦截、冲突 fail fast），是设计文档的可执行版本。
+demo 是**机制演示**而非测试，保留在原位，是设计文档的可执行版本：
+
+- mock demo（`tt-bridge-demo/`、`tt-schedule-demo/`）用假硬件把 Bridge/Provider
+  的设计意图走一遍，包括正常路径与 red 用例（门禁拦截、冲突 fail fast）。
+- `tt-provider-demo/` 用**真实硬件**（KL3）验证 provider 性能增量机制——真实
+  RMSNorm provider 的门禁/选择/回退/provenance + 整网自动使能（`tt.activate()`
+  自动注册 → `tt.provider_wrap(model)` 自动生效 → 首次前向自动选择）。详见其 README。
+
+e2e 的 `real_qwen_smoke.py` 已默认开启 provider 自动使能（`--no-provider` 可关）。
 
 ## integration
 
