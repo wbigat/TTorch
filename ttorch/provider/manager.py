@@ -17,8 +17,8 @@ auto_detect 结果在该 provider 内选第二层实现（各硬件高性能 imp
                选择、分发；provenance 写入统一事件流（witness.provenance），
                精度/性能测量复用 witness.verify。
 
-依赖方向：provider -> witness（记录+测量）、provider -> platform（只读激活平台名，
-经 attach_platform 注入）单向；绝不碰 cuda-compat。
+依赖方向：provider -> witness（记录+测量）、provider -> platform（只读激活
+平台 handle，经 attach_platform 注入）单向；绝不碰 cuda-compat。
 """
 import torch
 
@@ -53,6 +53,12 @@ class ProviderManager:
         self._call_count = {}    # impl name -> 成功调用次数（热路径观测，轻量）
         self._called_once = set()  # 已记录"首次成功调用"provenance 的 impl
         self._bypass = False     # 全局旁路：True 时被 wrap 的模块走原始实现（A-B 对比/退场）
+        self._fn_registered = set()  # 已注册到后置绑定通道的函数符号（幂等）
+
+    def is_bypassed(self):
+        """全局旁路状态（只读）。ProviderModuleForward / FunctionDispatcher 的
+        bypass 判断统一走这里，不直读私有属性。"""
+        return self._bypass
 
     def set_bypass(self, on):
         """全局旁路开关：on=True 时所有被 wrap 的模块走原始实现（不经 provider）。
@@ -65,11 +71,19 @@ class ProviderManager:
                           "bypass" if on else "active")
 
     def attach_platform(self, probe):
-        """注入当前平台名来源（生产：lambda: platform_manager.activation().name）。"""
+        """注入当前平台 PlatformHandle 来源（生产：platform_manager.activation）。
+
+        probe 返回 handle 而非平台名：门禁探测要经 handle.device_spec() 拿真实
+        设备标识（"cuda:0"/"xpu:0"），硬编码 "cuda" 在 xpu-native 上是错的。
+        """
         self._platform_probe = probe
 
-    def _platform(self):
+    def _handle(self):
         return self._platform_probe() if self._platform_probe else None
+
+    def _platform(self):
+        h = self._handle()
+        return h.name if h is not None else None
 
     # --------------------------------------------------------------
     # registry（登记第一层 Provider；其 impl 运行态默认启用）
@@ -107,16 +121,33 @@ class ProviderManager:
             if self.registry.get(provider.semantic) is None:
                 self.register(provider)
                 registered.append(provider.semantic)
+        # 函数级接入：有 bind_points 的 provider 注册到后置绑定通道
+        # （绑定目标 = dispatcher，调用经 manager.call 分发——与模块级共享
+        # 门禁/回退/开关）。install 由 ttorch.activate() 在之后调用。
+        from ttorch.provider import fn_binding
+        for provider in self.registry.all():
+            for mod, attr in provider.bind_points:
+                dotted = f"{mod}.{attr}"
+                if dotted in self._fn_registered:
+                    continue
+                self._fn_registered.add(dotted)
+                fn_binding.register_binding(fn_binding.PerfBinding(
+                    dotted=dotted, module=mod, attr=attr,
+                    factory=lambda orig, _sem=provider.semantic:
+                        fn_binding.make_dispatcher(_sem, orig)))
         if self._platform_probe is None:
-            self.attach_platform(lambda: platform_manager.activation().name)
+            self.attach_platform(platform_manager.activation)
         # 启动期 provenance：可复现快照（平台 + 能力 + 版本 + 注册了哪些 provider）。
         # §4"可复现"硬要求——另一次运行凭这份快照重放同一套选择。
+        # 能力面从"实现即事实"派生（supports 内省子类覆盖）；capabilities() 自报表
+        # 已废除（platform_base.py 注释），此处不得再调。
         if registered:
+            from ttorch.platform.platform_base import TORCH_API
             act = platform_manager.activation()
             provenance.record(provenance.LAYER_PROVIDER, "session", "provider",
                               "activated", platform=act.name, vendor=act.vendor_name,
                               device_name=act.device_name,
-                              capabilities=act.capabilities(),
+                              supported=[n for n in TORCH_API if act.supports(n)],
                               torch_version=torch.__version__, registered=registered)
 
     def wrap_model(self, model):
@@ -136,9 +167,12 @@ class ProviderManager:
             for p in providers:
                 if any(cls_name == mn or cls_name.endswith(mn) for mn in p.module_names):
                     try:
-                        module.forward = p.wrap_module(module)
+                        new_forward = p.wrap_module(module)
                     except TypeError:
                         break  # 无 weight Parameter 等，跳过该模块
+                    if new_forward is None:
+                        break  # 数值自检未过：不接管（provenance 已记），模块保持原样
+                    module.forward = new_forward
                     module._tt_provider_wrapped = True
                     wrapped.append(f"{cls_name}->{p.semantic}")
                     n += 1
@@ -162,33 +196,54 @@ class ProviderManager:
     # --------------------------------------------------------------
     # gate：功能 & 精度 & 收益三级准入（候选 vs 该 provider 的 native）
     # --------------------------------------------------------------
-    def _gate(self, provider, impl):
+    def _gate(self, provider, impl, ref=None):
         """对一个高性能 impl 跑三级准入（功能/精度/收益的测量本体在 witness.verify）。
 
         返回 (ok, reason, evidence)。选择缓存与 provenance 记录在本层，测量复用
         witness.verify.verify_impl——验证（测量）与选择（编排）解耦。
+
+        ref：首次真实调用的 (args, kwargs)——探测输入跟随真实负载的
+        shape/dtype/device（门禁结论才可外推到生产；固定 fp32 大方阵既不是
+        真实负载，还在首个训练 step 中途白占显存）。device 经 handle
+        .device_spec() 取自当前平台，不硬编码 "cuda"（xpu-native 上是错的）。
+        sync 注入平台 synchronize——不经 bridge 单独用 provider 时
+        torch.cuda.is_available() 在 xpu-native 上为假，计时需要它同步。
         """
-        return verify.verify_impl(impl, provider.native, provider.probe_input,
+        handle = self._handle()
+        device = handle.device_spec() if handle is not None else None
+        sync = (handle.synchronize
+                if handle is not None and handle.supports("synchronize") else None)
+        return verify.verify_impl(impl, provider.native,
+                                  lambda: provider.probe_input(ref=ref, device=device),
                                   min_speedup=impl.min_speedup,
                                   enforce_benefit=(impl.kind != "reference"),
-                                  rtol=_RTOL, atol=_ATOL)
+                                  sync=sync, rtol=_RTOL, atol=_ATOL)
 
-    def _gate_cached(self, provider, impl):
-        if impl.name not in self._gate_cache:
-            ok, reason, evidence = self._gate(provider, impl)
-            self._gate_cache[impl.name] = (ok, reason, evidence)
+    def _gate_cached(self, provider, impl, ref=None, sig=None):
+        """门禁缓存按 (impl, 负载签名)——门禁结论只对测量过的负载成立：
+        shape/参数变了必须重新门禁（实测教训：shape-sensitive impl 在首个
+        shape 通过后，第二个 shape 静默算错 max_err=1.0）。"""
+        key = (impl.name, sig)
+        if key not in self._gate_cache:
+            ok, reason, evidence = self._gate(provider, impl, ref)
+            self._gate_cache[key] = (ok, reason, evidence)
             provenance.record(provenance.LAYER_PROVIDER, "gate", impl.name,
                               "pass" if ok else "fail",
                               semantic=provider.semantic, slot=provider.slot,
                               reason=reason, build=impl.build, version=impl.version,
                               wraps=list(impl.wraps), **evidence)
-        return self._gate_cache[impl.name]
+        return self._gate_cache[key]
 
     # --------------------------------------------------------------
     # selection：按平台在该 provider 内选 impl，门禁 + 优先级，回退 native
     # --------------------------------------------------------------
-    def select(self, semantic, slot="compute"):
-        """为一个模块语义选定实现。返回摘要（同时写 provenance）。"""
+    def select(self, semantic, slot="compute", ref=None, sig=None):
+        """为一个模块语义 + 负载签名选定实现。返回摘要（同时写 provenance）。
+
+        ref/sig：真实调用的 (args, kwargs) 及其负载签名——门禁探测输入据此
+        对齐生产负载（shape/dtype/device/标量参数），绑定与门禁结论都只对该
+        负载成立（缓存按签名，见 _gate_cached / call）。
+        """
         provider = self.registry.get(semantic)
         if provider is None:
             raise KeyError(f"provider '{semantic}' 未注册，可选: {self.registry.names()}")
@@ -200,17 +255,17 @@ class ProviderManager:
             if not self._enabled.get(impl.name, True):
                 rejected.append((impl.name, "disabled_by_switch"))
                 continue
-            ok, reason, _ = self._gate_cached(provider, impl)
+            ok, reason, _ = self._gate_cached(provider, impl, ref, sig)
             if not ok:
                 rejected.append((impl.name, reason))
                 continue
             gated.append(impl)
 
         chosen = max(gated, key=lambda i: _KIND_PRIORITY.get(i.kind, 0)) if gated else native
-        self._binding[(semantic, slot)] = (provider, chosen)
+        self._binding[(semantic, slot, sig)] = (provider, chosen)
         speedup = None
-        if chosen is not native and chosen.name in self._gate_cache:
-            speedup = self._gate_cache[chosen.name][2].get("speedup")
+        if chosen is not native and (chosen.name, sig) in self._gate_cache:
+            speedup = self._gate_cache[(chosen.name, sig)][2].get("speedup")
         summary = {"semantic": semantic, "slot": slot, "selected": chosen.name,
                    "selected_build": chosen.build, "selected_speedup": speedup,
                    "rejected": rejected}
@@ -236,7 +291,9 @@ class ProviderManager:
         if impl is provider.native and not on:
             raise ValueError(f"{name} 是 native（功能底线），不可禁用")
         self._enabled[name] = on
-        self._binding.pop((provider.semantic, provider.slot), None)  # 失效绑定，下次 call 重选
+        # 失效该 semantic/slot 下全部负载签名的绑定，下次 call 重选
+        self._binding = {k: v for k, v in self._binding.items()
+                         if k[:2] != (provider.semantic, provider.slot)}
         provenance.record(provenance.LAYER_PROVIDER, "switch", name,
                           "enabled" if on else "disabled")
 
@@ -244,7 +301,8 @@ class ProviderManager:
     # 分发与回退
     # --------------------------------------------------------------
     def _args_sig(self, args, kw):
-        """参数签名：shape/dtype/flags 级信息，不记数据本体（观测用）。"""
+        """参数签名（展示级，provenance 用）：shape/dtype/flags 可读摘要，
+        不记数据本体。与 _call_sig（缓存键，机器比对用）分工，勿混用。"""
         def s(v):
             if isinstance(v, torch.Tensor):
                 return f"{tuple(v.shape)}/{v.dtype}"
@@ -253,17 +311,48 @@ class ProviderManager:
             return repr(v)
         return [s(v) for v in args] + [f"{k}={s(v)}" for k, v in kw.items()]
 
+    def _call_sig(self, args, kw):
+        """负载签名：张量的 (ndim, 特征维, dtype, device) + 非张量参数值（eps 等）。
+
+        门禁与绑定缓存按它分键——门禁结论只对测量过的负载成立。特征维
+        （最后一维）是 kernel 正确性差异的实际载体（实测案例：D=256→512
+        静默算错）；序列/批次维的变化只影响工作量不影响语义——变长训练
+        （padding_free）里每个新长度都重跑门禁的开销不可接受，故归并。
+        """
+        parts = []
+        for v in list(args) + [kw[k] for k in sorted(kw)]:
+            if isinstance(v, torch.Tensor):
+                parts.append((v.ndim, v.shape[-1] if v.ndim else 0,
+                              str(v.dtype), str(v.device)))
+            else:
+                parts.append(repr(v))
+        return tuple(parts)
+
     def call(self, semantic, *args, slot="compute", **kw):
         """经绑定缓存分发；两级回退（inapplicable / error）都只回退 native。
 
-        热路径对齐 torch 原生调用开销：**不逐调用同步、不逐条记录**——成功调用
-        只累加计数，首次成功记一条 provenance（证明分发到了哪个 impl）；回退
-        （罕见）才逐条记录。设备同步只在门禁探测（_probe_us）做，那里才是测
-        吞吐的地方。
+        缓存键含负载签名（_call_sig）——签名计算是几个 tuple/str 操作，
+        相对 kernel 调用可忽略；热路径仍**不逐调用同步、不逐条记录**——成功
+        调用只累加计数，首次成功记一条 provenance；回退（罕见）才逐条记录。
+        设备同步只在门禁探测做，那里才是测吞吐的地方。
         """
-        key = (semantic, slot)
+        sig = self._call_sig(args, kw)
+        key = (semantic, slot, sig)
         if key not in self._binding:
-            self.select(semantic, slot)
+            try:
+                self.select(semantic, slot, ref=(args, kw), sig=sig)
+            except Exception as e:
+                # 门禁/选择基础设施自身失败（probe 构造、平台探测等）不属于某个
+                # impl 的错，但也不许直达训练循环——不变式 1/2 覆盖 gate 全段：
+                # 绑定 native 留证，功能不降级。
+                provider = self.registry.get(semantic)
+                if provider is None:
+                    raise
+                self._binding[key] = (provider, provider.native)
+                provenance.record(provenance.LAYER_PROVIDER, "select",
+                                  f"{semantic}/{slot}", "fallback",
+                                  reason="gate_infra", error=repr(e),
+                                  fallback_actual=provider.native.name)
         provider, impl = self._binding[key]
         native = provider.native
         subject = f"{semantic}/{slot}"
@@ -303,7 +392,8 @@ class ProviderManager:
                                        "platforms": (sorted(i.platforms) if i.platforms else "all")}
                               for i in p.impls}}
                     for p in self.registry.all()},
-                "bindings": {f"{s}/{sl}": impl.name for (s, sl), (pr, impl) in self._binding.items()},
+                "bindings": {f"{s}/{sl}#{abs(hash(sig)) % 0x10000:04x}": impl.name
+                             for (s, sl, sig), (pr, impl) in self._binding.items()},
                 "calls": dict(self._call_count)}
 
 

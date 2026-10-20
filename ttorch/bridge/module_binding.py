@@ -23,6 +23,21 @@ R = Decision.REMAP
 M = "torch.cuda"  # 绑定落点：框架可见的 re-export 路径
 
 
+def _native_stream_class(entry, original):
+    """Stream 是类型位符号：bind 期解析为平台原生 Stream **类对象**。
+
+    不能绑转发函数（`type(torch.cuda.Stream)` 变成 function 后，`Stream | None`
+    返回注解在 import 期求值、isinstance 判定全线 TypeError——transformers 5.x
+    直接导不进来）。现有平台的正确答案都是原生类本身：masquerade/cuda 上原生
+    类即正确（G14：torch 内部 `Stream(stream_id=...)` 构造也经它完成）；
+    cpu/xpu-native 上框架不走 torch.cuda.Stream，保持原生不接管语义。
+    """
+    if not isinstance(original, type):
+        raise TypeError(f"{entry.dotted}: 绑定前值不是类型（{type(original).__name__}），"
+                        f"类型位符号拒绝接管")
+    return original
+
+
 # --- 设备 · 同步 · 流 · RNG·显存写 ---
 
 register_binding(Entry(symbol=torch.cuda.set_device, decision=R,
@@ -34,14 +49,19 @@ register_binding(Entry(symbol=torch.cuda.synchronize, decision=R,
                intent="device-wide 等待；torch 原生语义与契约一致", bind_module=M))
 
 register_binding(Entry(symbol=torch.cuda.Stream, decision=R,
-               impl=interface.Stream, test=admission.vendor_internal_construction,
-               intent="stream 对象族。interface 签名取厂商构造签名的超集：torch "
-                      "内部 current_stream 以 Stream(stream_id=...) 构造，须原样"
-                      "回落原生对象",
+               impl_factory=_native_stream_class, test=admission.stream_class_preserved,
+               intent="stream 类（类型位符号）：绑平台原生类对象而非转发函数——"
+                      "注解求值/isinstance 依赖它是 type；G14 的内部构造经原生类完成",
                bind_module=M))
 register_binding(Entry(symbol=torch.cuda.current_stream, decision=R,
-               impl=interface.current_stream, test=admission.stream_binding,
-               intent="当前 stream 句柄（动态只读）", bind_module=M))
+               impl=interface.current_stream, test=admission.vendor_internal_construction,
+               intent="当前 stream 句柄（动态只读）；G14 验收：门面透传原生 stream "
+                      "对象同型，无中间包装层", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.set_stream, decision=R,
+               impl=interface.set_stream, test=admission.binding_identity("set_stream"),
+               intent="切换当前 stream；契约（TORCH_API）含此符号 policy 就必须管控，"
+                      "否则框架调用绕过门面直达厂商实现——不在链路上、diagnostics 不可见",
+               bind_module=M))
 register_binding(Entry(symbol=torch.cuda.stream, decision=R,
                impl=interface.stream, test=admission.stream_binding,
                intent="stream 上下文管理器", bind_module=M))

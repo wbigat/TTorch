@@ -26,6 +26,17 @@ class TTCompatError(RuntimeError):
     pass
 
 
+# 绑定完成那一刻的对象快照 {(mod_name, attr): obj}——运行期篡改检测的基准
+# （verify_sweep 只在激活末尾跑一次；import 触发的符号替换可能在激活后才
+# 覆盖门面，witness.assert_bindings_intact 据此随时复检）。
+_POST_BIND = {}
+
+
+def post_bind_snapshot():
+    """绑定完成时刻的对象快照（只读副本）。篡改检测的基准，供 witness 用。"""
+    return dict(_POST_BIND)
+
+
 # 绑定去向记录统一进 witness.provenance（layer="bridge"），与 provider 的
 # 门禁/选择/调用事件共一份事件流——排障时一份报告同时覆盖"符号被替换成什么"
 # （bridge）与"模块加速选了谁"（provider）。trace() 保留为兼容视图：把统一
@@ -77,11 +88,28 @@ def _rebind_and_sweep(source_module, attr, new_impl, original, sweep_packages=No
     return n_swept
 
 
-def _fallback_eager(dotted):
-    def impl(fn, *a, **k):
+def _fallback_eager(dotted, original):
+    """FALLBACK = 退回 eager 等价路径（收窄后的显式语义，2026-10-15 修正）。
+
+    仅适配"加速壳"类符号：首参是可调用 body，退回即 eager 执行它
+    （如 graph_capture(body) -> body()）。等价路径**不是**调 original——
+    原生壳本身往往就是当前要避开的平台专属路径（mock 的 graph_capture 会
+    _require CUDA driver）。
+
+    旧形态对首参非 callable 的符号会静默错乱（把第一个参数当函数调）；
+    现在明确报错——该符号应改用 remap/exception 决策。original 参数保留
+    在签名里供未来扩展（如转发到指定等价路径），当前不转发。
+    """
+    def impl(*a, **k):
+        if not (a and callable(a[0])):
+            raise TTCompatError(
+                f"{dotted}: FALLBACK 仅适配首参为 callable 的加速壳符号"
+                f"（如 graph_capture(body)），收到首参 {type(a[0]).__name__ if a else None}；"
+                f"该符号请改用 remap/exception 决策")
         provenance.record(provenance.LAYER_BRIDGE, "bind", dotted, "fallback-exec",
                           target="eager", intent="运行时退回 eager 执行", swept_modules=0)
-        return fn(*a, **k)
+        return a[0](*a[1:], **k)
+    impl.__name__ = dotted.rsplit(".", 1)[-1]
     return impl
 
 
@@ -91,11 +119,15 @@ def _exception_impl(dotted, intent):
     return impl
 
 
-def _impl_for(e: Entry):
+def _impl_for(e: Entry, original):
     if e.decision is Decision.REMAP:
+        if e.impl_factory is not None:
+            # bind 期解析（平台已激活）：类型位符号等需要"绑定对象"而非
+            # 转发函数的条目在此物化（见 Entry.impl_factory）
+            return e.impl_factory(e, original)
         return e.impl
     if e.decision is Decision.FALLBACK:
-        return _fallback_eager(e.dotted)
+        return _fallback_eager(e.dotted, original)
     return _exception_impl(e.dotted, f"当前平台无等价实现且不可禁用。intent: {e.intent}")
 
 
@@ -114,7 +146,9 @@ def activate(entries, default_deny=True, sweep_packages=None):
     for e in entries:
         module = importlib.import_module(e.bind_module or e.symbol.__module__)
         attr = e.symbol.__name__
-        n_swept = _rebind_and_sweep(module, attr, _impl_for(e), getattr(module, attr), sweep_packages)
+        original = getattr(module, attr)
+        n_swept = _rebind_and_sweep(module, attr, _impl_for(e, original), original, sweep_packages)
+        _POST_BIND[(e.bind_module or e.symbol.__module__, attr)] = getattr(module, attr)
         managed.add(e.dotted)
         provenance.record(provenance.LAYER_BRIDGE, "bind", e.dotted, e.decision.value,
                           target=e.target, intent=e.intent, swept_modules=n_swept)
@@ -131,6 +165,7 @@ def activate(entries, default_deny=True, sweep_packages=None):
                 n_swept = _rebind_and_sweep(module, name, _exception_impl(
                     f"{mod_name}.{name}", "未纳入 policy（默认拒绝）：请先盘点、归类、补准入测试"),
                     original, sweep_packages)
+                _POST_BIND[(mod_name, name)] = getattr(module, name)
                 denied += 1
                 provenance.record(provenance.LAYER_BRIDGE, "bind", f"{mod_name}.{name}",
                                   "default-deny", target=None,

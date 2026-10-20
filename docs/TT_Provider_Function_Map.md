@@ -164,6 +164,31 @@ ttorch/provider/
 | 自动生效 | 模型建好后 | `ttorch.provider_wrap(model)` 按 `module_names` 自动发现并 patch |
 | 自动选择 | 首次前向 | 惰性 `select()`：platform 过滤 + 三级门禁 + kind 优先级，写绑定缓存 |
 
+> **函数级接入（2026-10-19，三级接入形态定型）**：框架内部的函数级性能符号
+> （megatron 的 swiglu/rope 等非 nn.Module 调用点）由 `Provider.bind_points`
+> 声明 `(模块路径, 符号名)`，activate 时注册进 `bridge.framework_binding` 的
+> 后置绑定通道（import 钩子在目标模块加载完成时绑定，晚于框架 import 则扫尾）。
+> **绑定目标是 dispatcher（`FunctionDispatcher`）而非厂商实现**——调用经
+> `manager.call` 分发，与模块级共享门禁/回退/开关/bypass/provenance。
+> 这是 §154 依赖条文的扩展点：provider → bridge.framework_binding（注册 API，
+> 单向无环；选择注册式而非 bridge 反向 import provider，保依赖方向）。
+> 第三级"编译级"（torch.compile 无法固定替换的模块）预留为
+> `kind="fused_jit"` 的 ProviderImpl。**L3 待落地清单**（2026-10-20 决策：
+> 无真实 case 不立形态，首个编译驱动出现时再实现）：① artifact_cache 子模块
+> （编译产物缓存 key/guard/失效，§7.4 已列）；② 编译时机与 eager native 的
+> 失败回退衔接；③ `JitProviderImpl` 基类（编译缓存模板）。依据：KLX 的
+> XME_SWIGLU_USE_OKEANOS_DL 互斥路线（fused_ops | jit_compile 生产已验证）。
+> 另：通道 B 机制（fn_binding.py）归 provider 层——§8 边界"Bridge 不负责
+> 模块性能替换"，性能替换的执行动作含机制。
+
+> **门禁口径升级（2026-10-19）**：精度对账在 **fp32 轨道**（判数学等价；
+> bf16 下同语义实现差 1-3 ulp 与语义偏差分不开），且 **fwd+bwd 双验**
+> （厂商 rotary_pos_emb kernel fwd 逐位一致但 bwd 错——只验 fwd 会漏）；
+> 性能测量保持生产 dtype（两轨道分开）。门禁与绑定缓存按**负载签名**
+> `(ndim, 特征维, dtype, device) + 标量参数`分键——特征维变化强制重门禁
+> （shape-sensitive impl 换 shape 静默算错的实测教训），序列/批次维归并
+> （变长训练每步重门禁不可接受）。§509"shape bucket 变化允许重选"的落地。
+
 provenance 与 bridge **统一进 `ttorch.witness.provenance`**（同一事件流，信封
 `seq/ts/layer/event/subject/outcome/evidence`），实现了 §4"与 bridge trace
 统一 schema 合并成一份报告"的硬要求。
@@ -201,3 +226,13 @@ provenance 与 bridge **统一进 `ttorch.witness.provenance`**（同一事件�
    收益必须 forward+backward 都真实跑。
 5. **先查厂商是否已优化该算子**（torch_xmlir 的 symbrewrite 符号替换清单），
    避免重复造轮子；provider 的增量价值在厂商没覆盖的地方。
+6. **厂商 kernel 的 fwd 对不代表 bwd 对**（2026-10-19 实测）：`rotary_pos_emb`
+   fwd 与原生逐位一致（fp32 err 2.4e-7）但 bwd 梯度错（bf16 错 2.43、fp32 轨道
+   直接产 nan）。训练态精度验证必须 fwd+bwd 双验——只验 fwd 会把这种 kernel
+   放进训练链路（XME 无证绑定已中招：实测整网 loss 偏移 4.6e-4）。
+7. **接线产物必须可 pickle**（2026-10-19 实证）：wrap 的 forward 与函数级
+   dispatcher 都会被模块实例持有——闭包让 `torch.save(整模型)` 炸；且符号替换
+   后 orig 的"模块+名字"引用校验必失败，dispatcher 需 `__reduce__` 自定义恢复
+   （从 `_origin_` 留痕拿原实现）。模块级类是唯一正确形态。
+8. **自检/门禁是 provider 内部机制，其失败必须收敛为"不接管"**——fp32 自检期
+   模块异常曾穿透 wrap_model（只 catch TypeError）。机制失败不许影响功能。

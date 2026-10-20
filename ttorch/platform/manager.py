@@ -39,7 +39,14 @@ __all__ = [
 
 
 def _ver_tuple(s):
-    return tuple(int(x) for x in s.split("."))
+    """版本号 -> 比较元组。厂商定制栈常带 local 后缀（"12.4+kl3"/"2.7.1+hstu"），
+    剥 "+" 后段再解析；仍非法时抛受控的 TTPlatformError 而非裸 ValueError——
+    激活期门禁不该以非受控异常形式炸。"""
+    core = str(s).split("+", 1)[0]
+    try:
+        return tuple(int(x) for x in core.split("."))
+    except ValueError as e:
+        raise TTPlatformError("sdk_version", f"无法解析版本号: {s!r}") from e
 
 
 class PlatformManager:

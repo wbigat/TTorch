@@ -11,7 +11,7 @@ eager 注册无副作用；惰性 import 优化暂缓（2026-10-14）。
 import importlib
 
 # 已知模块语义（新增 provider 在此登记）
-SEMANTICS = ("rmsnorm",)
+SEMANTICS = ("rmsnorm", "swiglu", "bias_swiglu", "rope_bshd")
 
 
 def build_all():

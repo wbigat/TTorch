@@ -9,7 +9,7 @@ vendor_internal_construction）。这是**激活期**的取证：符号是否绑
 的附属品。本模块只**读**（entries 由调用方传入），不改绑定——观测与操作分离。
 """
 
-__all__ = ["check_bindings"]
+__all__ = ["check_bindings", "assert_bindings_intact"]
 
 
 def check_bindings(entries):
@@ -28,3 +28,29 @@ def check_bindings(entries):
         rows.append((ok, e.test.__name__, detail))
         n_fail += 0 if ok else 1
     return n_fail, rows
+
+
+def assert_bindings_intact(snapshot):
+    """运行期绑定完整性校验（篡改检测）：当前值是否仍是绑定完成那一刻的对象。
+
+    verify_sweep() 只在激活末尾跑一次；import 触发的符号替换（symbrewrite
+    钩子）可能在 TT 激活**之后**才覆盖门面（并把门面存成 `__origin_X`）——
+    没有本函数，TT 对此无人察觉。可在训练启动后 / step 边界随时调用。
+
+    snapshot：`cuda_compat.post_bind_snapshot()` 的产出（调用方传入——
+    witness 不反向依赖 bridge，观测与操作分离）。篡改记 provenance
+    （outcome="tampered"）。返回 (n_tampered, rows)。
+    """
+    import importlib
+    from ttorch.witness import provenance
+    rows = []
+    n = 0
+    for (mod_name, attr), expected in snapshot.items():
+        cur = getattr(importlib.import_module(mod_name), attr, None)
+        ok = cur is expected
+        if not ok:
+            n += 1
+            provenance.record(provenance.LAYER_BRIDGE, "bind", f"{mod_name}.{attr}",
+                              "tampered", current=repr(cur)[:80])
+        rows.append((ok, f"{mod_name}.{attr}"))
+    return n, rows

@@ -23,6 +23,10 @@ def start_call_trace(entries):
     探针插在门面与框架之间（替换 torch.cuda 上绑定后的符号），框架侧看到的仍是
     绑定结果，行为不变，仅多一层计数。
 
+    覆盖口径：探针只替换 `torch.cuda.X` **属性式**调用点；被扫尾修复的
+    from-import 调用点持有的是门面本体、不经此探针——`call_trace_report`
+    的"框架侧调用次数"是**下界**而非全量。
+
     返回 collections.Counter（符号 -> 次数）；调用方用 call_trace_report() 读取。
     幂等：重复调用返回同一份计数器。
     """

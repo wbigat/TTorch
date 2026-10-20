@@ -48,6 +48,11 @@ class Entry:
     decision: Decision               # 处置策略：remap / fallback / exception
     intent: str                      # 为什么这样处置（没有 intent 的映射半年后没人懂）
     impl: Optional[Callable] = None        # 仅 remap 用：要绑过去的目标实现（真实引用）
+    impl_factory: Optional[Callable] = None  # 仅 remap 用：bind 期解析绑定对象，
+        # 签名 (entry, original) -> object。与 impl 二选一。类型位符号（如
+        # torch.cuda.Stream）必须绑平台原生**类对象**而非转发函数——返回注解
+        # 在 import 期求值（transformers 5.x `Stream | None`）、isinstance 判定、
+        # type() 都依赖它仍是 type；转发函数会让类型位全线崩溃。
     fallback_target: Optional[str] = None  # 仅 fallback 用：等价路径名（仅展示用途，不进 trace 的 target 时也可读）
     test: Optional[Callable] = None        # remap 必填：准入测试（真实函数引用，不许免检）
     bind_module: Optional[str] = None      # 绑定落点模块（框架可见路径）。
@@ -59,7 +64,10 @@ class Entry:
     def __post_init__(self):
         # 形态一致性检查（对象引用已由 import 期保证存在，这里只查组合逻辑）
         if self.decision is Decision.REMAP:
-            assert self.impl is not None, f"{self.dotted}: remap 必须给 impl"
+            assert self.impl is not None or self.impl_factory is not None, \
+                f"{self.dotted}: remap 必须给 impl 或 impl_factory"
+            assert not (self.impl is not None and self.impl_factory is not None), \
+                f"{self.dotted}: impl 与 impl_factory 二选一"
             assert self.test is not None, f"{self.dotted}: remap 必须有准入测试（不许免检）"
         elif self.decision is Decision.FALLBACK:
             assert self.fallback_target, f"{self.dotted}: fallback 缺等价路径名"
@@ -84,7 +92,8 @@ class Entry:
         真正被绑的是 impl 对象。
         """
         if self.decision is Decision.REMAP:
-            return self.impl.__name__
+            return (self.impl.__name__ if self.impl is not None
+                    else f"{self.impl_factory.__name__}()")
         return self.fallback_target
 
 

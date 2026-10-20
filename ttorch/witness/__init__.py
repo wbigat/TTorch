@@ -10,7 +10,9 @@
 - call_trace.py   bridge 运行期中转证据：训练时实际经 TT 中转的调用（start_call_trace/
                   call_trace_report）
 - verify.py       provider 精度/性能验证原语：三级门禁的测量本体（verify_impl /
-                  measure_throughput_us），provider.manager 的 gate 复用
+                  measure_throughput_us），provider.manager 的 gate 复用；
+                  精度对账在 fp32 轨道（判数学等价，fwd+bwd 双验），性能测量用
+                  生产 dtype——两轨道分离
 
 依赖方向（单向、无环）：bridge / provider → witness（记录+验证）；witness → 仅
 platform.interface（call_trace 读门面符号）。witness 不改绑定、不做选择——观测
@@ -22,7 +24,7 @@ from ttorch.witness import provenance  # noqa: F401  # 统一事件流（子模�
 from ttorch.witness.provenance import (  # noqa: F401
     record, records, report, summary, session, export_jsonl,
     LAYER_BRIDGE, LAYER_PROVIDER)
-from ttorch.witness.bindings import check_bindings  # noqa: F401
+from ttorch.witness.bindings import check_bindings, assert_bindings_intact  # noqa: F401
 from ttorch.witness.call_trace import start_call_trace, call_trace_report  # noqa: F401
 from ttorch.witness.verify import verify_impl, measure_throughput_us  # noqa: F401
 
@@ -30,7 +32,7 @@ __all__ = [
     "provenance",
     "record", "records", "report", "summary", "session", "export_jsonl",
     "LAYER_BRIDGE", "LAYER_PROVIDER",
-    "check_bindings",
+    "check_bindings", "assert_bindings_intact",
     "start_call_trace", "call_trace_report",
     "verify_impl", "measure_throughput_us",
 ]

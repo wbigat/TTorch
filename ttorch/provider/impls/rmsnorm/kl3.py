@@ -10,6 +10,12 @@
 直接用于训练会把梯度图在 RMSNorm 处切断（loss 不学）。故包一个
 autograd.Function——forward 走快 kernel，backward 走厂商反向 kernel
 rms_layer_norm_backward。
+
+实现选型（2026-10-15 用户决策）：**保留自包 _RMSNormFn，不复用厂商
+RMSNormFunction**——本 impl 是首个完整 provider 的教学示例，自包保留了
+"推理 kernel 如何包成可训练算子"的完整前反向写法（后续 provider 的参照）。
+厂商封装（torch_xmlir.nn.rms_norm.RMSNormFunction，内建 zcg/fp32 rstd/
+needs_input_grad）已实测与本封装输出逐位一致（fwd err=0.0），需要时可切换。
 """
 import torch
 
@@ -51,6 +57,9 @@ class KL3FusedRMSNorm(ProviderImpl):
     name = "vendor-fused:rmsnorm"
     kind = "fused_aot_vendor"
     platforms = frozenset({"xpu-masquerade"})
+    min_speedup = 1.0  # 收益门禁生效：至少不劣于 native 才启用（probe 基准是
+                       # 未融合分解，厂商融合实测 ~2.5x，门槛有充足裕量）。
+                       # 缺省 0.0 时第三级门禁恒过，"无收益证据不启用"落空。
     intent = "KL3 厂商 AOT 融合 RMSNorm（forward+backward kernel）；前向 vs 未融合 native 2.5x"
 
     def __call__(self, x, w, eps=_EPS):

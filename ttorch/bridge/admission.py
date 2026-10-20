@@ -46,11 +46,24 @@ def sync_binding(ctx):
 # --- Stream / current_stream / stream（stream 对象族，ddp fencing 必触发）---
 
 def stream_binding(ctx):
+    """stream 上下文族绑定指向（Stream 类不在此列——它是类型位符号，
+    绑平台原生类对象，由 stream_class_preserved 单独验收）。"""
     vc = ctx["vendor_cuda"]
-    ok = (vc.Stream is interface.Stream
-          and vc.stream is interface.stream
+    ok = (vc.stream is interface.stream
           and vc.current_stream is interface.current_stream)
-    return ok, f"Stream/stream/current_stream 绑到门面 -> {ok}"
+    return ok, f"stream/current_stream 绑到门面 -> {ok}"
+
+
+def stream_class_preserved(ctx):
+    """类型位符号验收：torch.cuda.Stream 绑定后仍是 type（平台原生类）。
+
+    若被绑成转发函数，`Stream | None` 返回注解在 import 期求值（transformers
+    5.x 真实代码）、isinstance 判定（deepspeed/accelerate/megatron 常见写法）
+    会全线 TypeError。
+    """
+    s = ctx["vendor_cuda"].Stream
+    ok = isinstance(s, type)
+    return ok, f"torch.cuda.Stream 仍是类型（{getattr(s, '__name__', s)!r}）-> {ok}"
 
 
 def vendor_internal_construction(ctx):

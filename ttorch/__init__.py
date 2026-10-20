@@ -23,8 +23,9 @@ from ttorch.bridge import bootstrap as _bootstrap
 from ttorch.platform.platform_handle import TTPlatformError  # noqa: F401  # 再导出
 
 __all__ = ["activate", "active", "is_active", "device_spec", "finalize",
-           "provider_wrap", "check_bindings", "start_call_trace",
-           "call_trace_report", "TTPlatformError", "FRAMEWORK_PACKAGES"]
+           "provider_wrap", "check_bindings", "assert_bindings_intact",
+           "start_call_trace", "call_trace_report", "TTPlatformError",
+           "FRAMEWORK_PACKAGES"]
 
 
 def activate(platform="auto", sweep_packages=None):
@@ -37,6 +38,11 @@ def activate(platform="auto", sweep_packages=None):
     # provider 自动注册 + 接线（平台已激活）。惰性 import 保持 import ttorch 轻。
     from ttorch.provider import manager as _provider_mgr
     _provider_mgr.activate()
+    # 通道 B：框架性能符号的后置绑定——清单已由 provider.activate() 注册，
+    # 此时装 import 钩子（框架在本进程大多尚未 import）。机制在 provider 层
+    # （性能替换的执行归 provider，bridge 只管功能域的 torch.cuda 收束）。
+    from ttorch.provider import fn_binding
+    fn_binding.install()
     return act
 
 
@@ -80,6 +86,18 @@ def check_bindings():
     """绑定正确性自检（admission 全套）。返回 (n_fail, rows)。"""
     from ttorch import witness
     return witness.check_bindings(active().entries)
+
+
+def assert_bindings_intact():
+    """运行期绑定完整性校验（篡改检测）：门面是否仍是绑定完成那一刻的对象。
+
+    import 触发的符号替换（symbrewrite 钩子）可能在 TT 激活之后才覆盖门面，
+    verify_sweep 只在激活末尾跑一次——本函数可在训练启动后/step 边界随时复检。
+    返回 (n_tampered, rows)。
+    """
+    from ttorch import witness
+    from ttorch.bridge import cuda_compat
+    return witness.assert_bindings_intact(cuda_compat.post_bind_snapshot())
 
 
 def start_call_trace():

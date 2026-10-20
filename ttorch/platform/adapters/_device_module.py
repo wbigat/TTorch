@@ -94,7 +94,10 @@ class TorchDeviceModuleBase(PlatformBase):
         return self._orig("current_device")()
 
     def synchronize(self, device=None):
-        self._orig("synchronize")(device)
+        # G13 统一约定：None=当前设备必须**省略实参**，不位置透传——torch 原生
+        # 接受 None，但厂商栈不一定接受（get_rng_state 曾在 torch 2.9 因此炸）。
+        fn = self._orig("synchronize")
+        fn() if device is None else fn(device)
 
     # --- 显存 ---
     def empty_cache(self):
@@ -102,10 +105,12 @@ class TorchDeviceModuleBase(PlatformBase):
             self._orig("empty_cache")()
 
     def memory_allocated(self, device=None):
-        return self._orig("memory_allocated")(device)
+        fn = self._orig("memory_allocated")  # G13：None 省略实参，见 synchronize
+        return fn() if device is None else fn(device)
 
     def mem_get_info(self, device=None):
-        free, total = self._orig("mem_get_info")(device)
+        fn = self._orig("mem_get_info")  # G13：None 省略实参，见 synchronize
+        free, total = fn() if device is None else fn(device)
         return (int(free), int(total))
 
     # --- RNG（torch 原生 ByteTensor 契约，见 _rng.rng_to_state 的 G15 说明）---
