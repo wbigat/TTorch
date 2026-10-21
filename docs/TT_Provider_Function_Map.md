@@ -139,7 +139,7 @@ parallel_linear/          attention/          moe/          norm/     comm_fusio
 ## 6. 实施状态（as-built，2026-10-15）与经验教训
 
 本节记录首个真实 provider（RMSNorm，KL3）落地后的**实际结构**与**实测结论**，
-与前面的设计愿景对照。代码在 `ttorch/provider/`，demo 在 `tt-provider-demo/`。
+与前面的设计愿景对照。代码在 `ttorch/provider/`，demo 在 `examples/provider-demo/`。
 
 ### 6.1 落地的结构（两层 + 三段自动化）
 
@@ -153,8 +153,14 @@ ttorch/provider/
                + ProviderImpl（第二层：某平台一份高性能实现）
   registry.py  ProviderRegistry（按 semantic 注册第一层 Provider）
   manager.py   ProviderManager（门禁/选择/分发/开关/bypass）+ 进程级单例
-  impls/<语义>/  base.py（Provider + native）+ <平台>.py（各硬件 ProviderImpl）
+  fn_binding.py    函数级后置绑定通道（import 钩子 + FunctionDispatcher）
+  bind_targets.py  函数级绑定坐标表（按目标框架分组，含版本窗口）
+  impls/<语义>/  base.py（Provider + native + bind_points）+ <平台>.py（各硬件 ProviderImpl）
 ```
+
+> 替换动作（setattr + 扫尾 + owner 留痕）本身在 `ttorch/utils/_rebind.py`——
+> bridge 与 provider 两个 writer 共用一份实现（详见
+> `docs/TT_Rewrite_Mechanism_Design.md` §4-A）。
 
 三段自动化（对接 framework 的成本压到最低）：
 
@@ -166,8 +172,9 @@ ttorch/provider/
 
 > **函数级接入（2026-10-19，三级接入形态定型）**：框架内部的函数级性能符号
 > （megatron 的 swiglu/rope 等非 nn.Module 调用点）由 `Provider.bind_points`
-> 声明 `(模块路径, 符号名)`，activate 时注册进 `bridge.framework_binding` 的
+> 声明 `(模块路径, 符号名)`，activate 时注册进 `provider/fn_binding.py` 的
 > 后置绑定通道（import 钩子在目标模块加载完成时绑定，晚于框架 import 则扫尾）。
+> 坐标自 2026-10-20 起集中登记在 `bind_targets.py`（此前散在各 `base.py`）。
 > **绑定目标是 dispatcher（`FunctionDispatcher`）而非厂商实现**——调用经
 > `manager.call` 分发，与模块级共享门禁/回退/开关/bypass/provenance。
 > 这是 §154 依赖条文的扩展点：provider → bridge.framework_binding（注册 API，

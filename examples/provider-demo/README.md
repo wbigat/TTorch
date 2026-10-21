@@ -1,19 +1,19 @@
-# tt-provider-demo：真实硬件上的 module 级性能 provider 验证
+# examples/provider-demo：真实硬件上的 module 级性能 provider 验证
 
 验证 `ttorch.provider`（性能增量层）在真实硬件（KL3 / xpu-masquerade）上的完整机制。
 设计依据 `docs/TT_Provider_Function_Map.md`（§6 是 as-built 实施状态与经验教训）。
 
-## 与 tt-bridge-demo 的分工
+## 与 examples/bridge-demo 的分工
 
-- `tt-bridge-demo`：mock 虚拟硬件，验证 **bridge** 的功能可达机制。
-- `tt-provider-demo`：**真实硬件**，验证 **provider** 的性能增量机制——用真实
+- `examples/bridge-demo`：mock 虚拟硬件，验证 **bridge** 的功能可达机制。
+- `examples/provider-demo`：**真实硬件**，验证 **provider** 的性能增量机制——用真实
   RMSNorm provider（torch 原生分解 vs KL3 厂商 AOT 融合 kernel）。
 
 ## 运行
 
 ```bash
 # 环境：KL3 真机（torch_xmlir 厂商栈在场），TT_PLUGIN_ENABLE=0 之外无需特殊配置
-cd tt-provider-demo
+cd examples/provider-demo
 python demo.py                      # 单模块：门禁/选择/回退/provenance 机制
 python demo_e2e.py                  # 整网（Qwen2）：自动注册/生效/选择 + A-B 性能
 python demo_replace_torchxmlir.py   # 等价性：TT provider vs torch_xmlir 的 RMSNorm

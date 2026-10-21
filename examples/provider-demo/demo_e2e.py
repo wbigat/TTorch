@@ -10,7 +10,7 @@
   bypass=False  走 provider -> KL3 厂商融合
   kill switch   关掉厂商 impl -> provider 内回退 native
 
-运行：  cd tt-provider-demo && python demo_e2e.py
+运行：  cd examples/provider-demo && python demo_e2e.py
 """
 import sys
 import time

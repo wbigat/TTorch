@@ -10,6 +10,7 @@ nn.Module——绑定后框架符号 = dispatcher，调用经 manager.call 分�
 import torch
 import torch.nn.functional as F
 
+from ttorch.provider import bind_targets
 from ttorch.provider.spec import Provider, ProviderImpl
 
 
@@ -31,7 +32,7 @@ class SwiGLUProvider(Provider):
     semantic = "swiglu"
     slot = "compute"
     module_names = ()
-    bind_points = (("megatron.core.fusions.fused_bias_swiglu", "swiglu"),)
+    bind_points = bind_targets.bind_points("megatron", "swiglu")
 
     def build_native(self):
         return NativeSwiGLU()

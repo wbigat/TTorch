@@ -1,7 +1,7 @@
 """`.pth` 自动激活钩子：解释器启动阶段按开关激活 TT。
 
 两段式机制：
-    ttorch_auto_init.pth  ->  import ttorch._auto_init
+    ttorch_auto_init.pth  ->  import ttorch.utils._auto_init
 .pth 只负责触发 import；是否真激活由本模块据环境变量决定，**默认不激活**——
 装了包不等于改变行为，这是可安全合入的前提。
 

@@ -35,8 +35,12 @@ python - <<'PY'
 import importlib, sysconfig, os, sys
 m = importlib.import_module("ttorch")
 assert "site-packages" in m.__file__, f"装的不是 site-packages 版本: {m.__file__}"
-for sub in ("ttorch.bridge", "ttorch.platform", "ttorch.checkpoint",
-            "ttorch.diagnostics"):
+# 子模块清单随架构走：checkpoint 已归入 bridge、diagnostics 已改名
+# witness/call_trace（1159c40 重构）；provider/_rebind 为本轮新增。
+for sub in ("ttorch.bridge", "ttorch.platform", "ttorch.provider",
+            "ttorch.witness", "ttorch.bridge.checkpoint",
+            "ttorch.witness.call_trace", "ttorch.utils._rebind",
+            "ttorch.utils._auto_init", "ttorch.provider.bind_targets"):
     importlib.import_module(sub)
 pth = os.path.join(sysconfig.get_path("purelib"), "ttorch_auto_init.pth")
 assert os.path.exists(pth), f".pth 未落位: {pth}"

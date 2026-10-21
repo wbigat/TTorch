@@ -133,6 +133,7 @@ class ProviderManager:
                 self._fn_registered.add(dotted)
                 fn_binding.register_binding(fn_binding.PerfBinding(
                     dotted=dotted, module=mod, attr=attr,
+                    semantic=provider.semantic,
                     factory=lambda orig, _sem=provider.semantic:
                         fn_binding.make_dispatcher(_sem, orig)))
         if self._platform_probe is None:

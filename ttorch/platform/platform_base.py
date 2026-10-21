@@ -53,8 +53,8 @@ __all__ = ["PlatformBase", "TORCH_API"]
 TORCH_API = (
     "set_device", "current_device", "synchronize",
     "empty_cache", "memory_allocated", "mem_get_info",
-    "get_rng_state", "set_rng_state",
-    "Stream", "current_stream", "set_stream", "stream",
+    "get_rng_state", "set_rng_state", "manual_seed",
+    "Stream", "current_stream", "set_stream", "stream", "Event",
     "is_available", "device_count", "can_device_access_peer",
 )
 
@@ -161,6 +161,17 @@ class PlatformBase(ABC):
         """
         raise _unsupported(self, "set_rng_state")
 
+    def manual_seed(self, seed, device=None):
+        """对齐 torch.cuda.manual_seed(seed, device)：全局 RNG 播种。
+
+        与 get/set_rng_state 同属 RNG 族：通信与训练路径都用它做全局播种
+        （megatron 实测 4 处调用点），纳入门面后播种行为进入绑定面（可观测）。
+
+        契约要求同 set_rng_state：device=None 时实现类必须**省略实参**再转发
+        （G13），不能位置透传 None——厂商栈不一定接受 None。
+        """
+        raise _unsupported(self, "manual_seed")
+
     # --- stream ---
     def Stream(self, **kwargs):  # noqa: N802  # 刻意对齐 torch.cuda.Stream 符号名
         """对齐 torch.cuda.Stream(...) 构造：返回平台**原生** stream 对象。
@@ -184,6 +195,18 @@ class PlatformBase(ABC):
     def set_stream(self, stream):
         """对齐 torch.cuda.set_stream(stream)：切换当前 stream。"""
         raise _unsupported(self, "set_stream")
+
+    def Event(self, **kwargs):  # noqa: N802  # 刻意对齐 torch.cuda.Event 符号名
+        """对齐 torch.cuda.Event(...) 构造：返回平台**原生** event 对象。
+
+        注意实际绑定路径：Event 是**类型位符号**，bridge 侧用 `impl_factory`
+        绑的是平台原生类对象本身（同 Stream 的教训——绑成转发函数会让
+        `event: torch.cuda.Event` 注解求值 / isinstance 判定全线 TypeError）。
+        本方法存在是为了**契约自洽**：TORCH_API 列出的符号都必须有统一
+        unsupported 兜底，未实现时抛 TTPlatformError 而非 AttributeError。
+        若将来要走门面构造 event，实现此方法即可。
+        """
+        raise _unsupported(self, "Event")
 
     def stream(self, stream):
         """对齐 torch.cuda.stream(stream)：返回切流的**上下文管理器**。

@@ -49,3 +49,7 @@ class TorchCpuPlatform(PlatformBase):
 
     def set_rng_state(self, state, device=None):
         torch.set_rng_state(rng_from_state(state))
+
+    def manual_seed(self, seed, device=None):
+        """CPU 平台：转发 torch 全局 RNG 播种（无 cuda 播种语义）。"""
+        torch.manual_seed(seed)

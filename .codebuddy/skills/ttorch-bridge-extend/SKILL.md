@@ -73,7 +73,7 @@ swiglu/bias_swiglu_impl（门禁通过）；rope 被 bwd 门禁拒（厂商 kern
 ## 验证（改完必跑）
 
 ```bash
-cd tt-bridge-demo && python3 demo_bridge.py        # mock 全链路（无卡可跑）
+cd examples/bridge-demo && python3 demo_bridge.py        # mock 全链路（无卡可跑）
 # 真实环境：
 python3 -c "import ttorch; ttorch.activate(); print(ttorch.check_bindings())"
 ```

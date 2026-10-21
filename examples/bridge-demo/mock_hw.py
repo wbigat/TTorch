@@ -165,6 +165,11 @@ class CudaHw:
             raise CudaHwError(f"bad rng state type {type(state).__name__}")
         self._rng = state
 
+    def manual_seed(self, seed):
+        """全局播种：状态落成可回读的确定性串（mock 侧只需可验证）。"""
+        self._rng = f"seed:{seed}"
+        return self._rng
+
     def mem_get_info(self):
         return (self.total_mem - self._used, self.total_mem)
 
@@ -262,6 +267,10 @@ class XpuHw:
 
     def streamWait(self, waiter, waitee):  # 非标名
         self.wait_edges.append((waiter, waitee))
+
+    def manualSeed(self, seed):  # 非标名（对齐 rngState/setRngState 的命名风格）
+        self._rng = f"seed:{seed}"
+        return self._rng
 
     def rngState(self):  # 非标名
         return self._rng

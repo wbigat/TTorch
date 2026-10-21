@@ -82,7 +82,7 @@ torch 原生单算子流程，`kind="reference"`，永远启用不可禁用。**
 ## 6. 实测验证（不验不收工，细则见 references/verification.md）
 
 1. 单算子对账：impl vs native，**fwd+bwd 都真跑**（forward-only 提速是假象）；
-2. `tt-provider-demo/demo.py`：门禁 + 开关 + provenance（含反面夹具）；
+2. `examples/provider-demo/demo.py`：门禁 + 开关 + provenance（含反面夹具）；
 3. 整网等价性：`demo_e2e.py`；对比厂商替换时用 `demo_replace_torchxmlir.py` 的
    A/B/C 三态范式；
 4. `tests/e2e/real_qwen_smoke.py`：端到端收敛 + checkpoint 连续性。

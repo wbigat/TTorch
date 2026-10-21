@@ -24,4 +24,4 @@ recipes = ["transformers>=4.40"]
 
 [tool.setuptools.packages.find]
 include = ["ttorch*"]
-exclude = ["tt-bridge-demo*", "tt-schedule-demo*", "docs*"]
+exclude = ["examples*", "examples/schedule-demo*", "docs*"]

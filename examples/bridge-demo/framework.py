@@ -6,9 +6,9 @@ from-import 会在 import 时把对象引用拷进本模块命名空间，
 import vendor_cuda
 from vendor_cuda import (Stream, can_device_access_peer, current_stream,
                          empty_cache, get_rng_state, graph_capture, is_available,
-                         mem_get_info, memory_allocated, profiler_start,
-                         range_push, set_device, set_rng_state, stream,
-                         synchronize)
+                         manual_seed, mem_get_info, memory_allocated,
+                         profiler_start, range_push, set_device, set_rng_state,
+                         stream, synchronize)
 
 
 def init_device(local_rank):

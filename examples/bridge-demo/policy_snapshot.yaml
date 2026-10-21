@@ -35,6 +35,11 @@ symbols:
   target: set_rng_state
   intent: checkpoint resume 恢复 RNG；非法值经 adapter 翻译成统一错误
   test: rng_binding
+- symbol: vendor_cuda.manual_seed
+  decision: remap
+  target: manual_seed
+  intent: 全局 RNG 播种；与 get/set_rng_state 同族，真实 policy 已纳（megatron 通信/训练路径 4 处调用点）
+  test: rng_binding
 - symbol: vendor_cuda.empty_cache
   decision: remap
   target: empty_cache

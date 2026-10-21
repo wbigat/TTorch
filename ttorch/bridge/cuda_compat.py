@@ -15,6 +15,7 @@ YAML 降级为生成物（binding_registry.export_entries 快照，供评审 dif
 import importlib
 import sys
 
+from ttorch.utils import _rebind
 from ttorch.witness import provenance
 from ttorch.platform import manager
 from ttorch.bridge.binding_registry import Decision, Entry
@@ -26,15 +27,15 @@ class TTCompatError(RuntimeError):
     pass
 
 
-# 绑定完成那一刻的对象快照 {(mod_name, attr): obj}——运行期篡改检测的基准
-# （verify_sweep 只在激活末尾跑一次；import 触发的符号替换可能在激活后才
-# 覆盖门面，witness.assert_bindings_intact 据此随时复检）。
-_POST_BIND = {}
-
-
 def post_bind_snapshot():
-    """绑定完成时刻的对象快照（只读副本）。篡改检测的基准，供 witness 用。"""
-    return dict(_POST_BIND)
+    """绑定完成时刻的对象快照（只读副本）。篡改检测的基准，供 witness 用。
+
+    基准取自 `ttorch.utils._rebind.snapshot()`——**全部 writer**（bridge + provider）
+    的统一快照。此前用本模块局部的 `_POST_BIND`，实测覆盖 15 条中 provider
+    函数级绑定 **0 条**（Rewrite 文档 §4-A）：第三方在 TT 激活后覆盖 provider
+    的绑定，TT 无从察觉。
+    """
+    return {k: v[0] for k, v in _rebind.snapshot().items()}
 
 
 # 绑定去向记录统一进 witness.provenance（layer="bridge"），与 provider 的
@@ -57,35 +58,9 @@ def trace():
         for r in provenance.records(provenance.LAYER_BRIDGE))
 
 
-def _rebind_and_sweep(source_module, attr, new_impl, original, sweep_packages=None):
-    """源头 setattr 重绑 + 扫尾修 from-import 陈旧引用（按对象身份匹配）。
-
-    命名即行为：rebind = 源头 setattr 重绑符号；sweep = 遍历框架包修陈旧
-    引用。返回扫尾修复的模块数（n_swept）。
-
-    扫尾范围由 sweep_packages 白名单限定（模块名前缀）：真实环境上
-    全量扫 sys.modules 会把 torch 内部/第三方库对 torch.cuda.X 的引用
-    一并改写，越界风险不可控——框架包（如 swift / framework_real）才是
-    from-import 陈旧引用的产生地。None 表示不限（仅 mock demo 用）。
-    """
-    setattr(source_module, f"_origin_{attr}", original)
-    setattr(source_module, attr, new_impl)
-    n_swept = 0
-    for m in sys.modules.copy().values():
-        if m is source_module:
-            continue
-        mod_name = getattr(m, "__name__", "")
-        if sweep_packages is not None and not any(
-                mod_name == p or mod_name.startswith(p + ".") for p in sweep_packages):
-            continue
-        try:
-            if id(getattr(m, attr, None)) == id(original):
-                setattr(m, f"_origin_{attr}", original)
-                setattr(m, attr, new_impl)
-                n_swept += 1
-        except Exception:
-            continue
-    return n_swept
+# 注：绑定动作（setattr + 扫尾 + owner 留痕）已收进 `ttorch/utils/_rebind.py`，
+# bridge 与 provider 两个 writer 共用一份实现——留痕不再撞名，且完整性检测
+# 基准统一（此前 provider 函数级绑定 0 条覆盖）。见 _rebind.py 模块 docstring。
 
 
 def _fallback_eager(dotted, original):
@@ -147,8 +122,8 @@ def activate(entries, default_deny=True, sweep_packages=None):
         module = importlib.import_module(e.bind_module or e.symbol.__module__)
         attr = e.symbol.__name__
         original = getattr(module, attr)
-        n_swept = _rebind_and_sweep(module, attr, _impl_for(e, original), original, sweep_packages)
-        _POST_BIND[(e.bind_module or e.symbol.__module__, attr)] = getattr(module, attr)
+        n_swept = _rebind.rebind(module, attr, _impl_for(e, original),
+                                 owner="bridge", sweep_packages=sweep_packages)
         managed.add(e.dotted)
         provenance.record(provenance.LAYER_BRIDGE, "bind", e.dotted, e.decision.value,
                           target=e.target, intent=e.intent, swept_modules=n_swept)
@@ -162,10 +137,9 @@ def activate(entries, default_deny=True, sweep_packages=None):
                 if f"{mod_name}.{name}" in managed:
                     continue
                 original = getattr(module, name)
-                n_swept = _rebind_and_sweep(module, name, _exception_impl(
+                n_swept = _rebind.rebind(module, name, _exception_impl(
                     f"{mod_name}.{name}", "未纳入 policy（默认拒绝）：请先盘点、归类、补准入测试"),
-                    original, sweep_packages)
-                _POST_BIND[(mod_name, name)] = getattr(module, name)
+                    owner="bridge", sweep_packages=sweep_packages)
                 denied += 1
                 provenance.record(provenance.LAYER_BRIDGE, "bind", f"{mod_name}.{name}",
                                   "default-deny", target=None,
@@ -190,10 +164,9 @@ def verify_sweep(entries, packages):
     """扫尾验收：检查框架包里是否还有指向绑定前实现的陈旧引用。
 
     `from torch.cuda import synchronize` 会在框架模块里留下独立引用，
-    源头 setattr 改不动它——这正是 _rebind_and_sweep 扫尾（吸收 KLX
-    symbol_rewriter 机制）要解决的。本函数是扫尾的验收，与
-    _rebind_and_sweep 同属绑定机制：按对象身份比对，框架模块里的同名
-    属性必须 is 门面实现。
+    源头 setattr 改不动它——这正是扫尾（吸收 KLX symbol_rewriter 机制）要
+    解决的，扫尾实现在 `_rebind.rebind`（owner 留痕 + 扫尾一处完成）。
+    本函数是扫尾的验收：按对象身份比对，框架模块里的同名属性必须 is 门面。
 
     返回陈旧引用列表（空 = 扫尾干净）。激活编排据此 fail fast——
     扫尾声称覆盖就必须验证到位，否则"接管"只是说法。
@@ -207,7 +180,7 @@ def verify_sweep(entries, packages):
         for attr, impl in bound.items():
             got = getattr(mod, attr, None)
             # 只认"确实持有该符号的旧实现"：同名但无关的对象（如框架自己的
-            # 同名函数）不在此列，判据是存在 _origin_ 留痕且当前值不是门面
-            if got is not None and got is not impl and hasattr(mod, f"_origin_{attr}"):
+            # 同名函数）不在此列，判据是存在 owner 留痕且当前值不是门面
+            if got is not None and got is not impl and _rebind.has_origin(mod, attr):
                 stale.append(f"{mod_name}.{attr}")
     return stale

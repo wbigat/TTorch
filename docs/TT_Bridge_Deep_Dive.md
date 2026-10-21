@@ -108,7 +108,7 @@ Bridge 必须在 **framework import / model build 之前**激活。多框架组�
 
 `intent` 字段最关键——**没有 intent 记录的映射，半年后没人知道当初为什么这么绑。**
 
-**载体演进：从"字符串数据 + 校验器"到"真实对象引用 + 显式注册"**（2026-10-10 v5 demo 落地，`tt-bridge-demo/tt_bridge/registry.py` + `bindings.py`）：
+**载体演进：从"字符串数据 + 校验器"到"真实对象引用 + 显式注册"**（2026-10-10 v5 demo 落地，`ttorch/bridge/binding_registry.py` + `examples/bridge-demo/tt_bridge/bindings.py`）：
 
 v4 的 YAML+校验器是在弥补字符串引用的缺陷，v5 让大部分缺陷**不发生**：
 
@@ -274,7 +274,7 @@ Platform Manager 管理**所有 platform 类型的逻辑注册**（register 只�
 - `select(name)` 保留为调试/测试的显式 override 通道，打印 `via=manual-override`；
 - 测试夹具/变体 adapter 置 `auto_detect = False`，不参与自动检测（demo 的 `NaiveXpuPlatform` 即如此）。
 
-与"不要环境变量魔法"不冲突：反魔法反的是**隐式选择**，不是自动发现——自动检测的每一步证据都必须可打印、可审计。demo（`tt-bridge-demo`）已落地：xpu-only 机器自动激活 xpu 并打印探测证据；模拟双硬件同时在机 → fail fast 并提示 override。
+与"不要环境变量魔法"不冲突：反魔法反的是**隐式选择**，不是自动发现——自动检测的每一步证据都必须可打印、可审计。demo（`examples/bridge-demo`）已落地：xpu-only 机器自动激活 xpu 并打印探测证据；模拟双硬件同时在机 → fail fast 并提示 override。
 
 ### 4.2 probe 清单
 

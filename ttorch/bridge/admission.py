@@ -12,6 +12,8 @@
 不再有字符串 id 注册表——引用即对象，写错名字 import 期就炸。
 每个测试返回 (ok, detail)。
 """
+import torch
+
 from ttorch.platform import interface, manager
 
 
@@ -64,6 +66,41 @@ def stream_class_preserved(ctx):
     s = ctx["vendor_cuda"].Stream
     ok = isinstance(s, type)
     return ok, f"torch.cuda.Stream 仍是类型（{getattr(s, '__name__', s)!r}）-> {ok}"
+
+
+def event_binding(ctx):
+    """Event 验收（类型位 + 跨流同步语义）：通信编排现场的原语，两条都验。
+
+    1) 类型位：绑定后仍是 type（同 Stream 教训——绑成转发函数会让
+       `event: torch.cuda.Event` 注解求值、isinstance 判定全线 TypeError）；
+    2) 语义：record → query/synchronize 必须在真实设备上生效。这条是**行为**
+       验收而非绑定指向——Event 的 record/wait 是流水线 p2p 与 activation
+       offload 串接阶段的唯一机制，语义失真就是跨阶段乱序（静默错）。
+
+    跨流 fencing 实测：侧流做一段工作并 record，主流 wait 该 event 后读结果，
+    数据必须可见——与 conformance 的 stream fencing 同思路，但落在 cuda-compat
+    符号上（该符号是框架侧通信编排的实际落点）。
+    """
+    vc = ctx["vendor_cuda"]
+    ev_cls = vc.Event
+    if not isinstance(ev_cls, type):
+        return False, f"torch.cuda.Event 不是类型（{type(ev_cls).__name__}）"
+    act = manager.activation()
+    if not (act.supports("Stream") and act.supports("stream")):
+        return True, "平台无 stream 族，跳过 Event 语义实测（类型位已验）"
+    try:
+        dev = manager.activation().device_spec()
+        x = torch.ones(256, 256, device=dev)
+        s = vc.Stream()
+        with vc.stream(s):
+            y = (x + 1).sum()   # 侧流上产出，未经同步主流不可见
+        ev = ev_cls()
+        ev.record(s)
+        ev.synchronize()        # 等待侧流完成（跨流 fencing）
+        ok = bool(ev.query()) and float(y) > 0
+        return ok, f"Event 仍是类型且 record/synchronize/query 生效 -> {ok}"
+    except Exception as e:
+        return False, f"Event 语义实测失败 {type(e).__name__}: {e}"
 
 
 def vendor_internal_construction(ctx):
@@ -134,15 +171,43 @@ def mem_info_binding(ctx):
 # set_rng_state 在 module_binding 里归 behavior，这里与 get 配对一起验。
 
 def rng_binding(ctx):
+    """RNG 三件套（get / set / manual_seed）绑到门面。
+
+    manual_seed 与 get/set 同族：通信与训练路径都用它做全局播种，纳入门面后
+    播种行为进入绑定面（可观测）。未绑定时该断言为假——这是本条目的验收点。
+    """
     vc = ctx["vendor_cuda"]
     ok = (vc.get_rng_state is interface.get_rng_state
-          and vc.set_rng_state is interface.set_rng_state)
-    return ok, f"get/set_rng_state 绑到门面 -> {ok}"
+          and vc.set_rng_state is interface.set_rng_state
+          and vc.manual_seed is interface.manual_seed)
+    return ok, f"get/set_rng_state + manual_seed 绑到门面 -> {ok}"
 
 
 # ==========================================================================
 # 通用：绑定指向校验（按对象身份比对，适用于任何纯转发符号）
 # ==========================================================================
+
+def nccl_primitive_binding(ctx):
+    """NCCL 通信原语符号（`torch.cuda.nccl.version`）的两个验收点。
+
+    1) 绑到门面：该符号是**子模块内函数**（落点 `torch.cuda.nccl`），
+       证明 TT 的绑定通道不只覆盖 torch.cuda 顶层符号；
+    2) 行为不变：返回值仍是原生三元组——compat 只多加一条证据，不改返回值
+       （改了会打破框架的版本检查分支）。
+    """
+    vc = ctx["vendor_cuda"]
+    n = getattr(vc, "nccl", None)
+    if n is None:
+        return False, "torch.cuda.nccl 不存在"
+    fn = n.version
+    ok_bound = fn.__module__ == "ttorch.bridge.module_binding"
+    try:
+        v = fn()
+    except Exception as e:
+        return False, f"version() 调用失败 {type(e).__name__}: {e}"
+    ok_val = isinstance(v, tuple) and len(v) == 3
+    return ok_bound and ok_val, f"绑到门面={ok_bound}，返回值={v}（行为不变）"
+
 
 def binding_identity(attr):
     """绑定正确性：框架侧符号确实指向 TT 门面（对象身份比对）。
