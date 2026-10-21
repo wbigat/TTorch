@@ -144,6 +144,12 @@ def _admit_native_vs_orig(b: PerfBinding, orig):
     对账本身无法进行（签名/设备不匹配等）时**不阻断**绑定，只记 `unverified`
     留痕——不为取证而破坏已验证能工作的路径。
 
+    执行时机的**刻意选择**（review P2-2 备案）：本函数在 import hook 触发路径
+    上执行真实计算（orig/native 各跑一次 probe）。这是"接管前对账"语义本身
+    的要求——绑定发生在 import 完成瞬间，要拦住不等价的替换就必须此刻执行。
+    代价是每个目标模块一次 probe 开销（可控）；异常面有 try/except 兜底
+    （unverified 继续绑）。
+
     返回 True 表示允许接管。
     """
     from ttorch.provider import manager as _pm
@@ -258,6 +264,10 @@ def _print_summary():
     是常态、上游无兼容承诺。失效时现象是"没报错，但性能回到基线"——最难排查
     的一类故障。此前 skipped 只写进 provenance JSONL，终端只显示 cuda_compat
     的 policy 数，用户对失效毫无感知。
+
+    已知口径（review P2-5 备案）：摘要只在 install() 时打印一次——import hook
+    后续触发的绑定/skip 不再刷新（pending 数会陈旧）。激活期可见性已够用；
+    若之后需要运行期可见性，再在 _bind_one 里按事件打印，不在此预建。
     """
     bound = sum(1 for b in _BINDINGS
                 if b.dotted in _TRIED and b.dotted not in _SKIPPED)
@@ -302,14 +312,9 @@ def uninstall():
         module = sys.modules.get(b.module)
         if module is None:
             continue
-        orig = getattr(module, f"_origin_{b.attr}", None)
-        if orig is None:
-            continue
-        setattr(module, b.attr, orig)
-        try:
-            delattr(module, f"_origin_{b.attr}")
-        except AttributeError:
-            pass
+        _rebind.unbind(module, b.attr, owner="provider")
+    _rebind.clear(owner="provider")   # 快照基准同步清理：否则后续篡改检测
+    # 会以已卸载的绑定为基准误报，重复 activate 时也会错位。
     _BINDINGS.clear()
     _SKIPPED.clear()
     _TRIED.clear()
