@@ -41,6 +41,10 @@ register_binding(Entry(symbol=vendor_cuda.stream, decision=R,
 register_binding(Entry(symbol=vendor_cuda.set_rng_state, decision=R,
                impl=interface.set_rng_state, test=admission.rng_binding,
                intent="checkpoint resume 恢复 RNG；非法值经 adapter 翻译成统一错误"))
+register_binding(Entry(symbol=vendor_cuda.manual_seed, decision=R,
+               impl=interface.manual_seed, test=admission.rng_binding,
+               intent="全局 RNG 播种；与 get/set_rng_state 同族，真实 policy 已纳"
+                      "（megatron 通信/训练路径 4 处调用点）"))
 register_binding(Entry(symbol=vendor_cuda.empty_cache, decision=R,
                impl=interface.empty_cache, test=admission.empty_cache_binding,
                intent="allocator 提示；rollout/转换路径高频"))

@@ -14,7 +14,7 @@ __all__ = [
     "graph_capture", "profiler_start",
     # P0 扩展（对照 TT_Swift_Cuda_API_Inventory.md）：
     "is_available", "Stream", "current_stream", "stream",
-    "get_rng_state", "set_rng_state", "empty_cache", "mem_get_info",
+    "get_rng_state", "set_rng_state", "manual_seed", "empty_cache", "mem_get_info",
     "set_sync_debug_mode",  # 故意不纳入 policy：演示默认拒绝
 ]
 
@@ -126,6 +126,11 @@ def get_rng_state():
 def set_rng_state(state):
     """checkpoint resume：恢复 RNG 状态。"""
     _require().set_rng_state(state)
+
+
+def manual_seed(seed):
+    """全局 RNG 播种（通信/训练路径真实调用点，megatron 实测 4 处）。"""
+    return _require().manual_seed(seed)
 
 
 def empty_cache():

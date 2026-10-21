@@ -96,6 +96,10 @@ class CudaPlatform(PlatformBase):
         except CudaHwError as e:
             raise TTPlatformError("invalid_rng_state", str(e)) from e
 
+    def manual_seed(self, seed, device=None):
+        """全局 RNG 播种（与真实 policy 对齐：megatron 通信/训练路径调用点）。"""
+        return self.hw.manual_seed(seed)
+
     # --- stream（返回 mock 原生 stream 对象 MockStream，门面不包装） ---
     def Stream(self, **kwargs):  # noqa: N802  # 对齐 torch.cuda.Stream 符号名
         return self.hw.create_stream()  # mock 无厂商内部构造场景，kwargs 不适用
@@ -183,6 +187,10 @@ class XpuPlatform(PlatformBase):
             self.hw.setRngState(state)  # 非标接口名
         except XpuHwError as e:
             raise TTPlatformError("invalid_rng_state", str(e)) from e
+
+    def manual_seed(self, seed, device=None):
+        """全局 RNG 播种（非标接口名 manualSeed，同 setRngState 风格）。"""
+        return self.hw.manualSeed(seed)
 
     # --- stream ---
     def Stream(self, **kwargs):  # noqa: N802

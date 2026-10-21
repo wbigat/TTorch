@@ -26,7 +26,32 @@ detect 硬规则：
 
 ## 2. adapter 实现（PlatformBase 子类）
 
-- **契约即 `torch.cuda.*` 真实符号**（TORCH_API 15 个）：方法名/签名逐一对齐且为超集。
+- **契约即 `torch.cuda.*` 真实符号**（TORCH_API 17 个）：方法名/签名逐一对齐且为超集。
+
+### 2.1 契约必须三处同步（最易漏，2026-10-21 实测踩过）
+
+往 `TORCH_API` 加一个符号 = **同时改三处**，缺任一处都是契约漂移：
+
+| # | 位置 | 作用 |
+|---|------|------|
+| 1 | `platform_base.TORCH_API` 元组 | 门面转发白名单（`interface.__getattr__` 据此生成） |
+| 2 | **`PlatformBase` 基类的默认实现**（抛 unsupported） | 未实现的平台得到**统一**的 `TTPlatformError("unsupported")` 而非 `AttributeError` |
+| 3 | 各 adapter 子类实现 | 真实平台行为 |
+
+为什么第 2 处最容易漏：子类一实现，当前平台立刻能跑通——问题只在"别的平台没
+实现"时才暴露，症状是框架拿到 `AttributeError` 而不是约定的降级路径。**这是
+"不支持即不实现"原则的前提**：基类必须先给出 unsupported 兜底，"不实现"才
+等价于"明确不支持"。
+
+反之同样要查：子类新增的 public 方法若在基类没有对应（且不是 `EXTRA_FORWARD`
+这类可选扩展），说明契约登记漏了。
+
+自检（加完符号必跑，另见 §5）：
+
+```bash
+python3 -c "from ttorch.platform.platform_base import TORCH_API, PlatformBase; \
+print([n for n in TORCH_API if not hasattr(PlatformBase, n)] or '契约对齐 ✅')"
+```
 - 走 torch 设备模块范式（torch.cuda/xpu/npu 同名 API）就继承 `TorchDeviceModuleBase`：
   只需指定 `mod_path` + 实现 `sdk_version()`；所有 torch 调用经 `_orig(name)` 拿绑定前
   原实现（防"门面→adapter→门面"无限递归）。
@@ -55,5 +80,9 @@ mem 查询实时口径、current_device 返回值能回喂 set_device/张量构�
 ```bash
 python3 -c "import ttorch; ttorch.activate()"   # detect 命中 + conformance 全 PASS
 python3 -c "import ttorch; ttorch.activate(); print(ttorch.check_bindings()[0])"  # 绑定验收
-cd tt-bridge-demo && python3 demo_bridge.py     # mock 链路不被打坏
+cd examples/bridge-demo && python3 demo_bridge.py     # mock 链路不被打坏
+
+# 契约三处同步自检（加/改 TORCH_API 后必跑，应输出"契约对齐 ✅"）
+python3 -c "from ttorch.platform.platform_base import TORCH_API, PlatformBase; \
+print([n for n in TORCH_API if not hasattr(PlatformBase, n)] or '契约对齐 ✅')"
 ```

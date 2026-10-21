@@ -5,7 +5,7 @@
 auto_detect 结果在该 provider 内选实现，经三级门禁 -> selection -> 真实调用 ->
 回退 -> 统一 provenance（bridge 绑定 + provider 生效合并成一份报告）。
 
-运行：  cd tt-provider-demo && python demo.py
+运行：  cd examples/provider-demo && python demo.py
 """
 import os
 import sys

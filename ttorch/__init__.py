@@ -14,7 +14,7 @@ import 的模块，顺序本身无法补救——激活时机是硬约束，不�
 - 模块级性能实现（provider）：ttorch.provider（自动注册/生效/选择）
 - 观测/验证/溯源（witness）：ttorch.witness（执行数据采集 + bridge/provider 取证）
 - checkpoint（save/resume + schema 校验 + RNG）：ttorch.bridge.checkpoint
-- 打包/自动激活：ttorch._auto_init（.pth 钩子）
+- 打包/自动激活：ttorch.utils._auto_init（.pth 钩子）
 
 依赖方向（单向）：bootstrap / cuda_compat → platform；provider → platform；
 platform 不认识 bridge / provider。

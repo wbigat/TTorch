@@ -10,8 +10,7 @@ dist/
 *.whl
 
 # 运行产物：provenance 带时间戳，每次运行都变，不应进版本库
-tt-bridge-demo/provenance.jsonl
-tt-provider-demo/provenance.jsonl
+examples/*/provenance.jsonl
 
 # 注意：policy_snapshot.yaml **要**入库——它是 policy 的生成物快照，
 # CI 靠 diff 它来发现未评审的 policy 改动（docs/TT_Bridge_Deep_Dive.md §2.2）

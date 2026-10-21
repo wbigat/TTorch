@@ -9,6 +9,7 @@ t[..., rot_dim:] 直通；mscale != 1.0 时带缩放。
 """
 import torch
 
+from ttorch.provider import bind_targets
 from ttorch.provider.spec import Provider, ProviderImpl
 
 
@@ -50,8 +51,7 @@ class RoPEBshdProvider(Provider):
     semantic = "rope_bshd"
     slot = "compute"
     module_names = ()
-    bind_points = (("megatron.core.models.common.embeddings.rope_utils",
-                    "_apply_rotary_pos_emb_bshd"),)
+    bind_points = bind_targets.bind_points("megatron", "rope_bshd")
 
     def build_native(self):
         return NativeRoPEBshd()

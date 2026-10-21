@@ -1,1 +1,1 @@
-import ttorch._auto_init
+import ttorch.utils._auto_init

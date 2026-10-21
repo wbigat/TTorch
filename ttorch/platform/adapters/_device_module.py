@@ -65,7 +65,17 @@ class TorchDeviceModuleBase(PlatformBase):
         self.mod = resolve_device_module(self.mod_path)
 
     def _orig(self, name):
-        return getattr(self.mod, f"_origin_{name}", getattr(self.mod, name))
+        """取符号的**原生实现**（绑定前）：优先 TT 的 owner 留痕，未绑定则取当前值。
+
+        为什么必须走留痕而不是直接 getattr：绑定后 `torch.cuda.<name>` 已经是
+        TT 门面，直接取会形成"门面 → activation().<name>() → _orig → 门面"的
+        无限递归（2026-10-20 留痕改名后实测 RecursionError）。留痕名随
+        `_rebind.origin_attr` 的 owner 规则（bridge 是绑定方），不能写死
+        `_origin_`——那是改名前的旧前缀，也是与 provider 撞名的那个前缀。
+        """
+        from ttorch.utils import _rebind
+        return getattr(self.mod, _rebind.origin_attr("bridge", name),
+                       getattr(self.mod, name))
 
     # --- 平台自述 ---
     # sdk_version() 刻意不实现：版本来源是平台专属，见模块注释。
@@ -133,6 +143,18 @@ class TorchDeviceModuleBase(PlatformBase):
                 self._orig("set_rng_state")(t, device)
         except TTPlatformError:
             raise
+        except Exception as e:
+            raise TTPlatformError("invalid_rng_state", str(e)) from e
+
+    def manual_seed(self, seed, device=None):
+        """全局 RNG 播种（通信/训练路径真实调用点，megatron 实测 4 处）。
+
+        与 set_rng_state 同族：经门面接管后框架播种行为可观测（进 provenance 的
+        绑定面）。G13：device=None 省略实参，不位置透传。
+        """
+        fn = self._orig("manual_seed")
+        try:
+            fn(seed) if device is None else fn(seed, device)
         except Exception as e:
             raise TTPlatformError("invalid_rng_state", str(e)) from e
 

@@ -13,7 +13,7 @@ bypass / kill-switch 切换三种 RMSNorm 实现，隔离整网 RMSNorm 性能�
 数值一致性：三者都算 zero-centered-gamma RMSNorm x_normed*(1+w)（wrap_module 的
 zcg 修复让 B/C 传有效权重 1+w），同权重前向 loss 应一致 -> 证明是等价替换而非近似。
 
-运行：  cd tt-provider-demo && python demo_replace_torchxmlir.py
+运行：  cd examples/provider-demo && python demo_replace_torchxmlir.py
 """
 import sys
 import time

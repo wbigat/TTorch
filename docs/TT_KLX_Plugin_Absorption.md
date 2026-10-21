@@ -182,7 +182,7 @@ grad_weight = _backward_weight(ctx, grad_output, wgrad_compute) # L197 wgrad 与
 if handle is not None: handle.wait()                            # L198-199 汇合
 ```
 
-**这与我们 `tt-schedule-demo` 里的 `OverlapTpSchedule` 是同一个模式**，而且它比上游更好：上游靠 `CUDA_DEVICE_MAX_CONNECTIONS=1` 的**隐式 kernel 下发顺序**，这里改成**显式 handle 传递**（也正因此才需要 §2(a) 那个 `os.environ` hack 去骗过 Megatron 的检查）。
+**这与我们 `examples/schedule-demo` 里的 `OverlapTpSchedule` 是同一个模式**，而且它比上游更好：上游靠 `CUDA_DEVICE_MAX_CONNECTIONS=1` 的**隐式 kernel 下发顺序**，这里改成**显式 handle 传递**（也正因此才需要 §2(a) 那个 `os.environ` hack 去骗过 Megatron 的检查）。
 
 拆进 TT 的两个插槽：
 

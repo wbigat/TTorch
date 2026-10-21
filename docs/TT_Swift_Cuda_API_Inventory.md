@@ -179,7 +179,7 @@ P0 接口族在 mock demo 验证后，移植真实 torch 时又暴露出四个 m
 ### 真实 XPU 环境执行清单（real_sft_smoke.py）
 
 ```bash
-cd tt-bridge-demo
+cd examples/bridge-demo
 python real_sft_smoke.py                    # 自动检测 cuda / xpu-masquerade / xpu-native
 python real_sft_smoke.py --platform cpu     # 无卡机器 dev 验证
 # 判定：退出码 0 = admission 全 PASS + fp32/bf16 loss 收敛 + fp32 对 CPU 参考 rel_err<5e-3

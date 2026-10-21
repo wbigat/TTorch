@@ -10,7 +10,7 @@ xmegatron_ext）跑通完整 swift-megatron SFT —— 训练脚本一行不改�
 负号 19，均值 +2.4e-05）而非系统性 bias。
 
 开发方针是**穿透优先、不铺开面**：完备性现阶段放低，未纳入 policy 的 API
-直接报未实现，先把一条端到端链路打穿再扩面。当前 policy 15 个符号。
+直接报未实现，先把一条端到端链路打穿再扩面。当前 policy 18 个符号。
 
 **provider 已起步**：bridge 之外补齐了性能实现层与观测层——首个真实 provider
 （RMSNorm，KL3）跑通"自动注册→自动生效→自动选择"的整网使能（数值与厂商逐位一致），
@@ -28,14 +28,14 @@ Qwen3.5-0.8B SFT 整网 26s ≈ 厂商插件标杆 25s（gap 1.76x→1.04x）；
 ```mermaid
 flowchart TD
     %% ===== 进程入口（真实入口） =====
-    PTH["ttorch_auto_init.pth<br/>→ _auto_init.py（TT_PLUGIN_ENABLE 门控）"]
+    PTH["ttorch_auto_init.pth<br/>→ utils/_auto_init.py（TT_PLUGIN_ENABLE 门控）"]
     SCRIPT["训练脚本显式调 ttorch.activate()"]
 
     %% ===== 激活期（bootstrap.py 编排，一次性） =====
     subgraph ACT["激活期（bridge/bootstrap.py 编排，fail fast）"]
         direction TB
         A1["platform/manager.py auto_activate()<br/>catalog.detect → sdk 版本协商<br/>→ initialize → conformance.py 语义实测"]
-        A2["bridge/cuda_compat.py activate()<br/>module_binding.py 15 条 Entry 绑定<br/>+ sys.modules 扫尾 + verify_sweep()"]
+        A2["bridge/cuda_compat.py activate()<br/>module_binding.py 18 条 Entry 绑定<br/>+ sys.modules 扫尾 + verify_sweep()"]
         A3["provider/manager.py activate()<br/>impls.build_all() 注册 4 个语义<br/>+ bind_points 注册到 fn_binding"]
         A4["provider/fn_binding.py install()<br/>sys.meta_path 挂 import 钩子"]
         A1 --> A2 --> A3 --> A4
@@ -93,7 +93,6 @@ flowchart TD
 ttorch/              正式包（四层收束，顶层只做转发）
   __init__.py          统一入口：activate / device_spec / provider_wrap / check_bindings
                        / assert_bindings_intact / start_call_trace
-  _auto_init.py        .pth 钩子：环境变量控制的自动激活
   bridge/              CUDA 接口兼容（cuda_compat 符号决策）+ bootstrap（激活编排）
                        + checkpoint（save/resume + schema 校验 + RNG）
   platform/            Platform Manager：平台注册/检测/门禁/生命周期 + torch 接口暴露
@@ -102,11 +101,15 @@ ttorch/              正式包（四层收束，顶层只做转发）
                        绑定通道，dispatcher 分发）两种接入形态共享门禁/回退/开关
   witness/             观测/验证/溯源：统一 provenance + bridge API 验证 + 运行期中转
                        + provider 精度/性能验证原语
+  utils/               跨层共享的内部工具（**不算独立层**）：_rebind 符号替换动作的
+                       唯一实现（bridge 与 provider 两个 writer 共用）、
+                       _auto_init（.pth 自动激活钩子）
 tests/               测试与验收（分层说明见 tests/README.md）
 scripts/             工程工具（打包安装等）
-tt-bridge-demo/      mock 机制演示（假硬件走通 Bridge 设计意图，含 red 用例）
-tt-schedule-demo/    schedule provider 机制演示
-tt-provider-demo/    真实硬件（KL3）provider 机制演示（RMSNorm 门禁/选择/回退/整网使能）
+examples/            可运行案例（机制演示 + 端到端回归，见 examples/README.md）
+  bridge-demo/        mock 机制演示（假硬件走通 Bridge 设计意图，含 red 用例）
+  provider-demo/      真实硬件（KL3）provider 机制演示（门禁/选择/回退/整网使能）
+  schedule-demo/      schedule provider 机制演示（TP 通算 overlap）
 docs/                架构设计与真实环境踩坑记录（G 系列）
 ```
 
