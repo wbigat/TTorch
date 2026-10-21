@@ -21,7 +21,7 @@
 的维护成本高于它解决的问题（Rewrite 文档 §6 明确降级）。
 """
 
-__all__ = ["rebind", "snapshot", "origin_attr", "has_origin"]
+__all__ = ["rebind", "unbind", "clear", "snapshot", "origin_attr", "has_origin"]
 
 # 留痕属性前缀：带 owner，消灭撞名且"谁绑的"从属性名即可见
 _ORIGIN_PREFIX = "_tt_origin_"
@@ -63,6 +63,11 @@ def rebind(module, attr, new, *, owner, sweep_packages=()):
     """
     from ttorch.witness import provenance
 
+    # 重复绑定同一 owner（如重复 activate 未先 uninstall）：当前值已是上一轮的
+    # 门面，直接存成 origin 会"门面叠门面"丢失真原实现。先恢复到本 owner 留痕
+    # 里的原实现再绑——origin 始终是真实原实现。
+    if hasattr(module, origin_attr(owner, attr)):
+        unbind(module, attr, owner)
     original = getattr(module, attr)
     other = _find_other_owner(module, attr, owner)
     if other is not None:
@@ -107,6 +112,42 @@ def _sweep(module, attr, new, original, packages):
 def snapshot():
     """完整性检测的唯一基准：{(module_name, attr): (bound_obj, owner)}。"""
     return dict(_SNAPSHOT)
+
+
+def unbind(module, attr, owner):
+    """恢复一次 rebind：符号恢复为该 owner 留痕里的原实现，删留痕、删快照条目。
+
+    与 rebind 对称收敛：本模块自称"替换动作的唯一实现"，恢复动作也必须在
+    这里——"写"唯一、"恢复"散落的话，留痕名一旦演进，散落的恢复方就会读错
+    名字（2026-10-21 review P0-1：uninstall 读旧 `_origin_` 前缀，回滚静默
+    失效，恰好违背它自己 docstring 里写的动机）。
+
+    返回是否恢复成功（无本 owner 留痕则无事发生，返回 False）。
+    """
+    name = origin_attr(owner, attr)
+    orig = getattr(module, name, None)
+    if orig is None:
+        return False
+    setattr(module, attr, orig)
+    try:
+        delattr(module, name)
+    except AttributeError:
+        pass
+    _SNAPSHOT.pop((module.__name__, attr), None)
+    return True
+
+
+def clear(owner=None):
+    """清空完整性检测快照。指定 owner 时只清该 owner 的条目。
+
+    卸载后必须清——否则基准陈旧：第三方改写已卸载的符号会被误报"篡改"
+    （其实是 TT 自己放弃了接管），重复 activate 场景也会错位。
+    """
+    if owner is None:
+        _SNAPSHOT.clear()
+    else:
+        for k in [k for k, v in _SNAPSHOT.items() if v[1] == owner]:
+            _SNAPSHOT.pop(k, None)
 
 
 def has_origin(module, attr):

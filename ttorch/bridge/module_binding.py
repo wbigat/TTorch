@@ -182,4 +182,13 @@ def entries():
     startswith("torch.cuda") 天然把它们排除。
     """
     return [e for e in get_entries()
-            if (e.bind_module or e.symbol.__module__).startswith(_CUDA_NS)]
+            if _in_cuda_ns(e.bind_module or e.symbol.__module__)]
+
+
+def _in_cuda_ns(module_name):
+    """落点是否属于 torch.cuda 命名空间（精确匹配或子模块）。
+
+    精确判等 + `xxx.` 前缀：裸 `startswith("torch.cuda")` 会误匹配
+    `torch.cudafoo` 这类前缀同名的包（当前无实害，但语义必须收紧）。
+    """
+    return module_name == _CUDA_NS or module_name.startswith(_CUDA_NS + ".")
