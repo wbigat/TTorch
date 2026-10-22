@@ -94,6 +94,33 @@ def _exception_impl(dotted, intent):
     return impl
 
 
+def _denied_impl(dotted, feature, original):
+    """Denied 占位的替换对象。类型位符号（类）必须**保持 type 身份**——框架会把
+    它们用在类型注解里（实测 transformers `-> torch.cuda.CUDAGraph | None`，
+    注解在 import 期求值），若替换成函数则 `X | None` 全线 TypeError（同 Stream
+    教训）。故类占位为"实例化/调用才报错"的 type；函数符号用 exception 函数。
+    """
+    msg = (f"特性功能点[{feature}]入口：当前平台未验收/未实现（TT 显式占位）。"
+           f"为避免静默错误默认未接管；启用需先完成该功能点验收并转为 Managed")
+    if isinstance(original, type):
+        name = original.__name__
+
+        class _DeniedType:
+            _tt_denied = True  # 标记：供 conformance 等区分"被 TT 占位"vs"平台不支持"
+
+            def __init__(self, *a, **k):
+                raise TTCompatError(f"{dotted}: {msg}")
+
+            def __call__(self, *a, **k):  # graph 等上下文管理器类的调用形态
+                raise TTCompatError(f"{dotted}: {msg}")
+
+        _DeniedType.__name__ = name
+        _DeniedType.__qualname__ = name
+        _DeniedType.__module__ = original.__module__
+        return _DeniedType
+    return _exception_impl(dotted, msg)
+
+
 def _impl_for(e: Entry, original):
     if e.decision is Decision.REMAP:
         if e.impl_factory is not None:
@@ -106,7 +133,7 @@ def _impl_for(e: Entry, original):
     return _exception_impl(e.dotted, f"当前平台无等价实现且不可禁用。intent: {e.intent}")
 
 
-def activate(entries, default_deny=True, sweep_packages=None):
+def activate(entries, default_deny=True, sweep_packages=None, denied=None):
     """导入期一次性绑定。绑定后不可变，热路径零判断。
 
     sweep_packages：扫尾白名单（模块名前缀）。真实环境必须显式给出
@@ -116,11 +143,17 @@ def activate(entries, default_deny=True, sweep_packages=None):
     default_deny：对盘点面（源头模块 __all__）内未注册符号绑 exception。
     真实 torch.cuda 的 __all__ 含 torch 自身内部所需符号，真实环境
     应传 False——白名单管的是框架调用面，不接管 torch 自身内部。
+
+    denied：Denied 占位清单 [(dotted, feature_point)]（来自 surface.denied_items()）。
+    与 default_deny 不同——这些符号是盘点后**显式判定**为"特性功能点入口"的
+    （CUDA graph / 显存池 / 自定义分配器 / IPC），即使 default_deny=False 也要
+    绑显式异常：让它们静默穿透到厂商栈 = 特性语义未验收的静默错（昆仑芯
+    graph-safe 前科）。报错信息指向所属功能点，遇到该功能点时再放行补实现。
     """
     managed = set()
     for e in entries:
         module = importlib.import_module(e.bind_module or e.symbol.__module__)
-        attr = e.symbol.__name__
+        attr = e.attr_name or e.symbol.__name__  # 第三方包装会改 __name__，见 Entry.attr_name
         original = getattr(module, attr)
         n_swept = _rebind.rebind(module, attr, _impl_for(e, original),
                                  owner="bridge", sweep_packages=sweep_packages)
@@ -128,8 +161,25 @@ def activate(entries, default_deny=True, sweep_packages=None):
         provenance.record(provenance.LAYER_BRIDGE, "bind", e.dotted, e.decision.value,
                           target=e.target, intent=e.intent, swept_modules=n_swept)
 
+    # Denied 占位：特性功能点入口显式绑异常（独立于 default_deny，始终生效）
+    # 计数器命名 n_denied 而非 denied——避免遮蔽同名参数（清单）。
+    n_denied = 0
+    for dotted, feature in (denied or []):
+        if dotted in managed:
+            continue  # 已被 policy 纳管（surface 分类保证两两不交，此处防御）
+        mod_name, attr = dotted.rsplit(".", 1)
+        module = importlib.import_module(mod_name)
+        if not hasattr(module, attr):
+            continue  # 该 torch 版本无此符号
+        original = getattr(module, attr)
+        n_swept = _rebind.rebind(module, attr, _denied_impl(dotted, feature, original),
+            owner="bridge", sweep_packages=sweep_packages)
+        n_denied += 1
+        provenance.record(provenance.LAYER_BRIDGE, "bind", dotted, "denied",
+                          target=None, intent=f"特性功能点[{feature}]占位",
+                          swept_modules=n_swept)
+
     # 默认拒绝：盘点面内未注册的符号，绑 exception，白名单姿态
-    denied = 0
     if default_deny:
         for mod_name in {e.bind_module or e.symbol.__module__ for e in entries}:
             module = importlib.import_module(mod_name)
@@ -140,12 +190,12 @@ def activate(entries, default_deny=True, sweep_packages=None):
                 n_swept = _rebind.rebind(module, name, _exception_impl(
                     f"{mod_name}.{name}", "未纳入 policy（默认拒绝）：请先盘点、归类、补准入测试"),
                     owner="bridge", sweep_packages=sweep_packages)
-                denied += 1
+                n_denied += 1
                 provenance.record(provenance.LAYER_BRIDGE, "bind", f"{mod_name}.{name}",
                                   "default-deny", target=None,
                                   intent="未盘点符号，白名单姿态", swept_modules=n_swept)
 
-    print(f"[cuda_compat] activated: {len(entries)} policy symbols + {denied} default-deny")
+    print(f"[cuda_compat] activated: {len(entries)} policy symbols + {n_denied} denied")
 
 
 def coverage_report(entries, module_names):
@@ -171,8 +221,8 @@ def verify_sweep(entries, packages):
     返回陈旧引用列表（空 = 扫尾干净）。激活编排据此 fail fast——
     扫尾声称覆盖就必须验证到位，否则"接管"只是说法。
     """
-    bound = {e.symbol.__name__: getattr(
-        sys.modules[e.bind_module], e.symbol.__name__) for e in entries}
+    bound = {(e.attr_name or e.symbol.__name__): getattr(
+        sys.modules[e.bind_module], (e.attr_name or e.symbol.__name__)) for e in entries}
     stale = []
     for mod_name, mod in list(sys.modules.items()):
         if not any(mod_name == p or mod_name.startswith(p + ".") for p in packages):

@@ -159,6 +159,117 @@ register_binding(Entry(symbol=torch.cuda.can_device_access_peer, decision=R,
                test=admission.binding_identity("can_device_access_peer"),
                intent="两卡间能否 P2P（逐对回答，转发厂商原生实现）", bind_module=M))
 
+# --- 能力 / 身份查询（D4 契约面闭合第一轮；masquerade 伪装值，转发不改）---
+
+register_binding(Entry(symbol=torch.cuda.get_device_capability, decision=R,
+               impl=interface.get_device_capability,
+               test=admission.binding_identity("get_device_capability"),
+               intent="计算能力 (major,minor)；masquerade 伪装值供 inductor codegen",
+               bind_module=M))
+register_binding(Entry(symbol=torch.cuda.get_device_name, decision=R,
+               impl=interface.get_device_name,
+               test=admission.binding_identity("get_device_name"),
+               intent="设备名；inductor device_info 索引键（伪装名）", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.get_device_properties, decision=R,
+               impl=interface.get_device_properties,
+               test=admission.binding_identity("get_device_properties"),
+               intent="设备属性对象（name/major/minor/total_memory），原生对象流出 TT",
+               bind_module=M))
+register_binding(Entry(symbol=torch.cuda.is_bf16_supported, decision=R,
+               impl=interface.is_bf16_supported,
+               test=admission.binding_identity("is_bf16_supported"),
+               intent="bf16 能力查询；DeepSpeed 实测消费做 dtype 决策", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.utilization, decision=R,
+               impl=interface.utilization,
+               test=admission.binding_identity("utilization"),
+               intent="设备利用率 %（状态查询，masquerade 下厂商返回占位值）",
+               bind_module=M, attr_name="utilization"))
+               # attr_name 必给：symbrewrite 把它包装成 mock_torch_utilization，
+               # symbol.__name__ 已失真
+
+# --- device 初始化状态 + tf32 能力 + RNG 完整族（D4 第一轮基础接口）---
+
+register_binding(Entry(symbol=torch.cuda.init, decision=R,
+               impl=interface.init, test=admission.binding_identity("init"),
+               intent="惰性初始化设备上下文（幂等）", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.is_initialized, decision=R,
+               impl=interface.is_initialized,
+               test=admission.binding_identity("is_initialized"),
+               intent="设备初始化状态；dynamo/inductor 默认路径依赖，必须正确回答",
+               bind_module=M))
+register_binding(Entry(symbol=torch.cuda.is_tf32_supported, decision=R,
+               impl=interface.is_tf32_supported,
+               test=admission.binding_identity("is_tf32_supported"),
+               intent="tf32 能力查询；原生实现内部调 is_bf16_supported（G12 依赖）",
+               bind_module=M))
+register_binding(Entry(symbol=torch.cuda.seed, decision=R,
+               impl=interface.seed, test=admission.binding_identity("seed"),
+               intent="当前设备 RNG 重新播种", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.seed_all, decision=R,
+               impl=interface.seed_all, test=admission.binding_identity("seed_all"),
+               intent="所有设备 RNG 重新播种", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.initial_seed, decision=R,
+               impl=interface.initial_seed,
+               test=admission.binding_identity("initial_seed"),
+               intent="当前 RNG 种子", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.manual_seed_all, decision=R,
+               impl=interface.manual_seed_all,
+               test=admission.binding_identity("manual_seed_all"),
+               intent="所有设备同一种子播种（分布式对齐种子常用）", bind_module=M))
+register_binding(Entry(symbol=torch.cuda.get_rng_state_all, decision=R,
+               impl=interface.get_rng_state_all,
+               test=admission.binding_identity("get_rng_state_all"),
+               intent="所有设备 RNG 状态（原生 ByteTensor 列表，checkpoint save）",
+               bind_module=M))
+register_binding(Entry(symbol=torch.cuda.set_rng_state_all, decision=R,
+               impl=interface.set_rng_state_all,
+               test=admission.binding_identity("set_rng_state_all"),
+               intent="恢复所有设备 RNG 状态（checkpoint resume）", bind_module=M))
+
+# --- 显存口径查询族（同构批量注册；接管转发不改值，口径自洽验收见 conformance D7）。
+# 显式 attr_name=_name：不依赖 symbol.__name__（第三方包装会改写它）---
+_MEM_QUERY_SYMBOLS = ("memory_reserved", "memory_cached", "max_memory_allocated",
+                      "max_memory_cached", "max_memory_reserved", "memory_stats",
+                      "memory_summary", "memory_stats_as_nested_dict",
+                      "get_per_process_memory_fraction", "host_memory_stats",
+                      "host_memory_stats_as_nested_dict", "reset_peak_memory_stats",
+                      "reset_max_memory_allocated", "reset_max_memory_cached",
+                      "reset_accumulated_memory_stats",
+                      "reset_accumulated_host_memory_stats", "reset_peak_host_memory_stats")
+for _name in _MEM_QUERY_SYMBOLS:
+    register_binding(Entry(symbol=getattr(torch.cuda, _name), decision=R,
+                   impl=getattr(interface, _name),
+                   test=admission.binding_identity(_name),
+                   intent="显存口径查询（接管转发不改值，口径自洽验收见 D7）",
+                   bind_module=M, attr_name=_name))
+del _name
+
+# --- stream/device 变体 + 硬件身份 + debug（函数转发，同构批量）---
+_STREAM_MISC = (("default_stream", "设备默认 stream（原生对象）"),
+                ("get_stream_from_external", "包装外部创建的 stream"),
+                ("get_arch_list", "编译期架构列表（masquerade 伪装值，转发留证）"),
+                ("get_gencode_flags", "编译期 gencode 标志（伪装值，转发留证）"),
+                ("get_sync_debug_mode", "同步调试模式查询"),
+                ("set_sync_debug_mode", "同步调试模式设置（debug 特性入口）"))
+for _name, _intent in _STREAM_MISC:
+    register_binding(Entry(symbol=getattr(torch.cuda, _name), decision=R,
+                   impl=getattr(interface, _name),
+                   test=admission.binding_identity(_name),
+                   intent=_intent, bind_module=M, attr_name=_name))
+del _name, _intent
+
+# --- 类型位类符号（device/ExternalStream/StreamContext）：impl_factory 绑原生类 ---
+
+for _name, _intent in (
+        ("device", "设备上下文管理器类（类型位；框架 with torch.cuda.device(i) + 类型注解）"),
+        ("ExternalStream", "外部 stream 的类（类型位）"),
+        ("StreamContext", "stream 上下文管理器类（类型位，torch.cuda.stream 的返回类型）")):
+    register_binding(Entry(symbol=getattr(torch.cuda, _name), decision=R,
+                   impl_factory=_native_type_class,
+                   test=admission.type_position_preserved(_name),
+                   intent=_intent, bind_module=M, attr_name=_name))
+del _name, _intent
+
 # --- NCCL 通信原语（子模块符号：框架绕过 c10d 直调的实例）---
 
 register_binding(Entry(symbol=torch.cuda.nccl.version, decision=R,

@@ -68,7 +68,7 @@ class PlatformManager:
     # ------------------------------------------------------------------
     # 激活
     # ------------------------------------------------------------------
-    def auto_activate(self):
+    def auto_activate(self, skip_conformance=False):
         """正常路径：自动分析当前环境，激活唯一匹配的 platform。
 
         对每个 auto_detect 的已注册 spec 跑 detect() 存在性探测，证据逐条
@@ -79,6 +79,12 @@ class PlatformManager:
         masquerade 降级：命中者声明 masquerades_cuda 时，"cuda" 的命中
         降级为"冒充证据"（打印，不参与冲突判定）——冒充 CUDA 的栈会让
         torch.cuda.is_available() 报 True，没有这层会把冒充者当真 NVIDIA。
+
+        skip_conformance：跳过 conformance 门禁（D1 轻档）。conformance 会执行
+        **真实设备操作**（64 MiB 分配、建 stream、改写全局 RNG、graph 捕获），
+        派生进程（DataLoader worker / spawn 辅助进程）不承载训练计算，跑它纯属
+        开销与风险（显存竞争、OOM、厂商 runtime 重复初始化）。符号绑定
+        （轻档仍做）的正确性由训练主体进程在同一符号面上验证过。
         """
         hits = {}  # name -> evidence
         for spec in self.registry.auto_detectable():
@@ -96,7 +102,8 @@ class PlatformManager:
                       f"（cuda 是 {name} 伪装的身份，非独立硬件）")
         matched = [n for n in hits if n not in demoted]
         if len(matched) == 1:
-            return self._activate(matched[0], how="auto-detect")
+            return self._activate(matched[0], how="auto-detect",
+                                  skip_conformance=skip_conformance)
         if not matched:
             raise RuntimeError(
                 f"未检测到任何已注册 platform，已探测: {self.registry.names()}")
@@ -104,11 +111,12 @@ class PlatformManager:
             f"检测到多个 platform: {matched}——进程级单 platform，拒绝猜测；"
             f"调试可用 select(name) 显式 override")
 
-    def select(self, name):
+    def select(self, name, skip_conformance=False):
         """显式 override：仅调试/测试逃生通道，正常路径走 auto_activate()。"""
-        return self._activate(name, how="manual-override")
+        return self._activate(name, how="manual-override",
+                              skip_conformance=skip_conformance)
 
-    def _activate(self, name, how):
+    def _activate(self, name, how, skip_conformance=False):
         """激活流水线：装配 -> 版本协商 -> initialize -> caps 校验 -> conformance 门禁。"""
         spec = self.registry.get(name)
         # 装配：spec.load() 取实现（惰性导入的唯一落点），与 spec 关联成 handle
@@ -125,15 +133,19 @@ class PlatformManager:
         candidate.initialize()
 
         from ttorch.platform import conformance  # 延迟 import 避免环
-        results = conformance.run(candidate)
-        failed = [r for r in results if not r.ok]
-        for r in results:
-            print(f"[conformance] {'PASS' if r.ok else 'FAIL'} {r.name}: {r.detail}")
-        if failed:
-            candidate.finalize()
-            raise TTPlatformError(
-                "conformance",
-                f"{name} 未通过 conformance 门禁，拒绝激活: {[r.name for r in failed]}")
+        if skip_conformance:
+            print(f"[platform] conformance: SKIP（轻档：派生进程不承载训练计算，"
+                  f"避免真实设备操作的开销与显存竞争）")
+        else:
+            results = conformance.run(candidate)
+            failed = [r for r in results if not r.ok]
+            for r in results:
+                print(f"[conformance] {'PASS' if r.ok else 'FAIL'} {r.name}: {r.detail}")
+            if failed:
+                candidate.finalize()
+                raise TTPlatformError(
+                    "conformance",
+                    f"{name} 未通过 conformance 门禁，拒绝激活: {[r.name for r in failed]}")
 
         old = self._activation
         self._activation = candidate
@@ -207,14 +219,14 @@ def unregister(name):
     return _instance.unregister(name)
 
 
-def auto_activate():
-    """自动检测并激活唯一匹配的 platform（含 conformance 门禁）。"""
-    return _instance.auto_activate()
+def auto_activate(skip_conformance=False):
+    """自动检测并激活唯一匹配的 platform（默认含 conformance 门禁）。"""
+    return _instance.auto_activate(skip_conformance=skip_conformance)
 
 
-def select(name):
+def select(name, skip_conformance=False):
     """显式指定激活哪个 platform（调试/测试逃生通道）。"""
-    return _instance.select(name)
+    return _instance.select(name, skip_conformance=skip_conformance)
 
 
 def activation():

@@ -222,3 +222,17 @@ def binding_identity(attr):
         return ok, f"{attr} 绑到门面 -> {ok}"
     check.__name__ = f"binding_identity_{attr}"
     return check
+
+
+def type_position_preserved(attr):
+    """类型位断言：绑定后仍是 type（类型注解求值 / isinstance 判定依赖）。
+
+    同 Stream/Event 教训——device / ExternalStream / StreamContext 这些类符号若
+    被绑成转发函数，框架的 `X | None` 返回注解在 import 期求值会全线 TypeError。
+    用于 impl_factory 绑平台原生类的条目。
+    """
+    def check(ctx):
+        ok = isinstance(getattr(ctx["vendor_cuda"], attr, None), type)
+        return ok, f"{attr} 绑定后仍是类型 -> {ok}"
+    check.__name__ = f"type_position_preserved_{attr}"
+    return check

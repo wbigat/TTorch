@@ -93,6 +93,48 @@ class TorchDeviceModuleBase(PlatformBase):
                 "unsupported", f"{self.mod_path} 无 can_device_access_peer")
         return bool(self._orig("can_device_access_peer")(device, peer_device))
 
+    # --- 能力 / 身份查询（masquerade 下转发厂商伪装值，不改；G13 None 省略实参） ---
+    def get_device_capability(self, device=None):
+        fn = self._orig("get_device_capability")
+        major, minor = fn() if device is None else fn(device)
+        return (int(major), int(minor))
+
+    def get_device_name(self, device=None):
+        fn = self._orig("get_device_name")
+        return fn() if device is None else fn(device)
+
+    def get_device_properties(self, device):
+        return self._orig("get_device_properties")(device)
+
+    def is_bf16_supported(self, including_emulation=True):
+        # G12：torch 原生 is_tf32_supported 内部调它且传 including_emulation
+        return bool(self._orig("is_bf16_supported")(including_emulation))
+
+    def utilization(self, device=None):
+        fn = self._orig("utilization")
+        return int(fn() if device is None else fn(device))
+
+    def is_tf32_supported(self):
+        return bool(self._orig("is_tf32_supported")())
+
+    def get_arch_list(self):
+        return self._orig("get_arch_list")()
+
+    def get_gencode_flags(self):
+        return self._orig("get_gencode_flags")()
+
+    def get_sync_debug_mode(self):
+        return self._orig("get_sync_debug_mode")()
+
+    def set_sync_debug_mode(self, debug_mode):
+        self._orig("set_sync_debug_mode")(debug_mode)
+
+    def init(self):
+        self._orig("init")()
+
+    def is_initialized(self):
+        return bool(self._orig("is_initialized")())
+
     # --- 设备 ---
     def set_device(self, device):
         try:
@@ -122,6 +164,70 @@ class TorchDeviceModuleBase(PlatformBase):
         fn = self._orig("mem_get_info")  # G13：None 省略实参，见 synchronize
         free, total = fn() if device is None else fn(device)
         return (int(free), int(total))
+
+    def _q(self, name, device):
+        """(device=None) 显存口径查询的统一转发（G13 None 省略实参）。
+
+        这批 17 个查询签名、语义同构（动态只读），用一处转发避免重复；
+        口径正确性由 conformance D7 验收，不在转发层处理。
+        """
+        fn = self._orig(name)
+        return fn() if device is None else fn(device)
+
+    def memory_reserved(self, device=None):
+        return self._q("memory_reserved", device)
+
+    def memory_cached(self, device=None):
+        return self._q("memory_cached", device)
+
+    def max_memory_allocated(self, device=None):
+        return self._q("max_memory_allocated", device)
+
+    def max_memory_cached(self, device=None):
+        return self._q("max_memory_cached", device)
+
+    def max_memory_reserved(self, device=None):
+        return self._q("max_memory_reserved", device)
+
+    def memory_stats(self, device=None):
+        return self._q("memory_stats", device)
+
+    def memory_stats_as_nested_dict(self, device=None):
+        return self._q("memory_stats_as_nested_dict", device)
+
+    def get_per_process_memory_fraction(self, device=None):
+        return self._q("get_per_process_memory_fraction", device)
+
+    def host_memory_stats(self, device=None):
+        return self._q("host_memory_stats", device)
+
+    def host_memory_stats_as_nested_dict(self, device=None):
+        return self._q("host_memory_stats_as_nested_dict", device)
+
+    def reset_peak_memory_stats(self, device=None):
+        self._q("reset_peak_memory_stats", device)
+
+    def reset_max_memory_allocated(self, device=None):
+        self._q("reset_max_memory_allocated", device)
+
+    def reset_max_memory_cached(self, device=None):
+        self._q("reset_max_memory_cached", device)
+
+    def reset_accumulated_memory_stats(self, device=None):
+        self._q("reset_accumulated_memory_stats", device)
+
+    def reset_accumulated_host_memory_stats(self, device=None):
+        self._q("reset_accumulated_host_memory_stats", device)
+
+    def reset_peak_host_memory_stats(self, device=None):
+        self._q("reset_peak_host_memory_stats", device)
+
+    def memory_summary(self, device=None, abbreviated=False):
+        # 唯一带额外参数的（abbreviated），不并入 _q
+        fn = self._orig("memory_summary")
+        if device is None:
+            return fn(abbreviated=abbreviated)
+        return fn(device, abbreviated=abbreviated)
 
     # --- RNG（torch 原生 ByteTensor 契约，见 _rng.rng_to_state 的 G15 说明）---
     def get_rng_state(self, device=None):
@@ -158,6 +264,28 @@ class TorchDeviceModuleBase(PlatformBase):
         except Exception as e:
             raise TTPlatformError("invalid_rng_state", str(e)) from e
 
+    # --- RNG 完整族（全设备变体） ---
+    def seed(self, device=None):
+        fn = self._orig("seed")  # G13：None 省略实参
+        fn() if device is None else fn(device)
+
+    def seed_all(self):
+        self._orig("seed_all")()
+
+    def initial_seed(self, device=None):
+        fn = self._orig("initial_seed")  # G13
+        return fn() if device is None else fn(device)
+
+    def manual_seed_all(self, seed):
+        self._orig("manual_seed_all")(seed)
+
+    def get_rng_state_all(self):
+        # 原生 ByteTensor 列表（G15），门面不包装，直接流出
+        return self._orig("get_rng_state_all")()
+
+    def set_rng_state_all(self, new_states):
+        self._orig("set_rng_state_all")(new_states)
+
     # --- stream（返回该栈的原生 Stream 对象，门面不包装） ---
     def Stream(self, **kwargs):  # noqa: N802  # 对齐 torch.cuda.Stream 符号名
         """原生 Stream 构造：kwargs 原样透传。
@@ -181,3 +309,10 @@ class TorchDeviceModuleBase(PlatformBase):
         处理与 allocator / graph 捕获的交互，自造一个只会丢语义。
         """
         return self._orig("stream")(stream)
+
+    def default_stream(self, device=None):
+        return self._q("default_stream", device)
+
+    def get_stream_from_external(self, data_ptr, device=None):
+        fn = self._orig("get_stream_from_external")  # G13：device=None 省略实参
+        return fn(data_ptr) if device is None else fn(data_ptr, device)

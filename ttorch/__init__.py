@@ -22,19 +22,24 @@ platform 不认识 bridge / provider。
 from ttorch.bridge import bootstrap as _bootstrap
 from ttorch.platform.platform_handle import TTPlatformError  # noqa: F401  # 再导出
 
-__all__ = ["activate", "active", "is_active", "device_spec", "finalize",
-           "provider_wrap", "check_bindings", "assert_bindings_intact",
+__all__ = ["activate", "active", "is_active", "assert_healthy", "device_spec",
+           "finalize", "provider_wrap", "check_bindings", "assert_bindings_intact",
            "start_call_trace", "call_trace_report", "TTPlatformError",
            "FRAMEWORK_PACKAGES"]
 
 
-def activate(platform="auto", sweep_packages=None):
+def activate(platform="auto", sweep_packages=None, skip_conformance=False):
     """激活 TT（platform 检测 + cuda-compat 绑定 + provider 自动注册）。
 
     Bridge 实现见 bridge.bootstrap.activate()；随后 provider 层自动注册全部
     已知 provider 并接线平台探测（见 provider.manager.activate()）。幂等。
+
+    skip_conformance：跳过 conformance 门禁（D1 轻档）。仅由 `_auto_init`
+    对**派生进程**（DataLoader worker / spawn 辅助进程）置 True——它们不承载
+    训练计算，跑真实设备操作只有开销与显存竞争风险。手工调用保持默认 False。
     """
-    act = _bootstrap.activate(platform=platform, sweep_packages=sweep_packages)
+    act = _bootstrap.activate(platform=platform, sweep_packages=sweep_packages,
+                              skip_conformance=skip_conformance)
     # provider 自动注册 + 接线（平台已激活）。惰性 import 保持 import ttorch 轻。
     from ttorch.provider import manager as _provider_mgr
     _provider_mgr.activate()
@@ -43,7 +48,28 @@ def activate(platform="auto", sweep_packages=None):
     # （性能替换的执行归 provider，bridge 只管功能域的 torch.cuda 收束）。
     from ttorch.provider import fn_binding
     fn_binding.install()
+    # 激活完成仪式（打进程标记 + 挂 fork 钩子）：必须放这里而非 .pth——
+    # 显式 activate() 的进程也要让其后代能判"派生"（D1）、fork 事件流重置
+    # （D11），详见 utils/_auto_init.mark_activated 的注释。
+    from ttorch.utils import _auto_init
+    _auto_init.mark_activated()
     return act
+
+
+def assert_healthy():
+    """健康断言：本进程 TT 是否"没有失败过"（激活失败已回滚则抛错）。
+
+    `.pth` 路径吞异常让进程继续（保护 pip/conda 与辅助进程），代价是"失败过"
+    这件事会丢失——本函数是把它找回来的入口。与 `is_active()` 分工：
+
+      is_active()      答"TT 有没有接管"
+      assert_healthy() 答"TT 有没有失败过"
+
+    半激活/降级时期望的组合是 `is_active() == False and assert_healthy() 抛错`——
+    此时系统是**一致的纯厂商栈**，是否继续由调用方决定（这是 TT 的降级语义，
+    不是错误状态）。实现见 bridge.bootstrap.assert_healthy()。
+    """
+    _bootstrap.assert_healthy()
 
 
 def provider_wrap(model):

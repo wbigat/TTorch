@@ -56,6 +56,29 @@ TORCH_API = (
     "get_rng_state", "set_rng_state", "manual_seed",
     "Stream", "current_stream", "set_stream", "stream", "Event",
     "is_available", "device_count", "can_device_access_peer",
+    # 能力/身份查询（D4 契约面闭合第一轮；masquerade 下这些返回厂商**伪装值**——
+    # 如 capability=(8,6)/name="GPU"，是厂商栈为让 inductor 按 NVIDIA 路径 codegen
+    # 的刻意选择。接管**不改值**（转发），价值是纳管可见 + 口径验收；伪装信号的
+    # pin/留证治理属 D5，不在本层）
+    "get_device_capability", "get_device_name", "get_device_properties",
+    "is_bf16_supported", "utilization",
+    # device 初始化状态 + tf32 能力 + RNG 完整族（D4 第一轮基础接口）
+    "init", "is_initialized", "is_tf32_supported",
+    "seed", "seed_all", "initial_seed", "manual_seed_all",
+    "get_rng_state_all", "set_rng_state_all",
+    # stream/device 变体 + 硬件身份 + debug（消除 surface 声称与实际注册的漂移）
+    "default_stream", "get_stream_from_external",
+    "device", "ExternalStream", "StreamContext",
+    "get_arch_list", "get_gencode_flags", "get_sync_debug_mode", "set_sync_debug_mode",
+    # 显存口径查询族（D4 收尾；接管转发不改值，口径自洽性验收见 conformance D7。
+    # memory_usage/device_memory_used 是 NVML 监控非口径查询，归 Denied 不在此列）
+    "memory_reserved", "memory_cached", "max_memory_allocated", "max_memory_cached",
+    "max_memory_reserved", "memory_stats", "memory_summary",
+    "memory_stats_as_nested_dict", "get_per_process_memory_fraction",
+    "host_memory_stats", "host_memory_stats_as_nested_dict",
+    "reset_peak_memory_stats", "reset_max_memory_allocated", "reset_max_memory_cached",
+    "reset_accumulated_memory_stats", "reset_accumulated_host_memory_stats",
+    "reset_peak_host_memory_stats",
 )
 
 
@@ -142,6 +165,59 @@ class PlatformBase(ABC):
         """
         raise _unsupported(self, "mem_get_info")
 
+    # --- 显存口径查询族（动态只读不缓存；口径自洽性验收见 conformance D7）---
+    def memory_reserved(self, device=None):
+        """allocator 预留总字节（含 cache；无标杆——口径画像而非准确性判定）。"""
+        raise _unsupported(self, "memory_reserved")
+    def memory_cached(self, device=None):
+        """memory_reserved 的 deprecated 别名。"""
+        raise _unsupported(self, "memory_cached")
+    def max_memory_allocated(self, device=None):
+        """峰值已分配字节（reset_peak_memory_stats 重置窗口）。"""
+        raise _unsupported(self, "max_memory_allocated")
+    def max_memory_cached(self, device=None):
+        """峰值预留字节。"""
+        raise _unsupported(self, "max_memory_cached")
+    def max_memory_reserved(self, device=None):
+        """峰值预留字节（同 max_memory_cached 语义）。"""
+        raise _unsupported(self, "max_memory_reserved")
+    def memory_stats(self, device=None):
+        """allocator 细分统计 dict（口径画像的丰富数据源）。"""
+        raise _unsupported(self, "memory_stats")
+    def memory_summary(self, device=None, abbreviated=False):
+        """人类可读显存摘要 str。"""
+        raise _unsupported(self, "memory_summary")
+    def memory_stats_as_nested_dict(self, device=None):
+        """memory_stats 的嵌套 dict 形态。"""
+        raise _unsupported(self, "memory_stats_as_nested_dict")
+    def get_per_process_memory_fraction(self, device=None):
+        """进程显存占比上限配置（float）。"""
+        raise _unsupported(self, "get_per_process_memory_fraction")
+    def host_memory_stats(self, device=None):
+        """主机（pinned）内存统计 dict。"""
+        raise _unsupported(self, "host_memory_stats")
+    def host_memory_stats_as_nested_dict(self, device=None):
+        """host_memory_stats 的嵌套形态。"""
+        raise _unsupported(self, "host_memory_stats_as_nested_dict")
+    def reset_peak_memory_stats(self, device=None):
+        """重置峰值统计窗口。"""
+        raise _unsupported(self, "reset_peak_memory_stats")
+    def reset_max_memory_allocated(self, device=None):
+        """重置峰值 allocated。"""
+        raise _unsupported(self, "reset_max_memory_allocated")
+    def reset_max_memory_cached(self, device=None):
+        """重置峰值 cached。"""
+        raise _unsupported(self, "reset_max_memory_cached")
+    def reset_accumulated_memory_stats(self, device=None):
+        """重置累计统计。"""
+        raise _unsupported(self, "reset_accumulated_memory_stats")
+    def reset_accumulated_host_memory_stats(self, device=None):
+        """重置 host 累计统计。"""
+        raise _unsupported(self, "reset_accumulated_host_memory_stats")
+    def reset_peak_host_memory_stats(self, device=None):
+        """重置 host 峰值统计。"""
+        raise _unsupported(self, "reset_peak_host_memory_stats")
+
     # --- RNG（checkpoint save / resume） ---
     def get_rng_state(self, device=None):
         """对齐 torch.cuda.get_rng_state(device)。契约见 set_rng_state。"""
@@ -171,6 +247,39 @@ class PlatformBase(ABC):
         （G13），不能位置透传 None——厂商栈不一定接受 None。
         """
         raise _unsupported(self, "manual_seed")
+
+    # --- RNG 完整族（全设备变体；训练播种/确定性高频调用） ---
+    def seed(self, device=None):
+        """对齐 torch.cuda.seed(device=None)：给当前/指定设备 RNG 重新播种（随机种子）。"""
+        raise _unsupported(self, "seed")
+
+    def seed_all(self):
+        """对齐 torch.cuda.seed_all()：给**所有**设备 RNG 重新播种。"""
+        raise _unsupported(self, "seed_all")
+
+    def initial_seed(self, device=None):
+        """对齐 torch.cuda.initial_seed(device=None) -> int：当前 RNG 种子。"""
+        raise _unsupported(self, "initial_seed")
+
+    def manual_seed_all(self, seed):
+        """对齐 torch.cuda.manual_seed_all(seed)：所有设备用同一种子播种。
+
+        分布式训练常用（各 rank 对齐种子）；G13：seed 是必填位置参，原样透传。
+        """
+        raise _unsupported(self, "manual_seed_all")
+
+    def get_rng_state_all(self):
+        """对齐 torch.cuda.get_rng_state_all() -> list[ByteTensor]：所有设备 RNG 状态。
+
+        返回**平台原生 ByteTensor 列表**（G15 同族：对象流出 TT 边界被框架原生
+        消费，checkpoint save 路径），类型必须与被替换符号一致，门面不包装。
+        """
+        raise _unsupported(self, "get_rng_state_all")
+
+    def set_rng_state_all(self, new_states):
+        """对齐 torch.cuda.set_rng_state_all(new_states)：恢复所有设备 RNG 状态
+        （checkpoint resume 路径）。"""
+        raise _unsupported(self, "set_rng_state_all")
 
     # --- stream ---
     def Stream(self, **kwargs):  # noqa: N802  # 刻意对齐 torch.cuda.Stream 符号名
@@ -219,6 +328,33 @@ class PlatformBase(ABC):
         """
         raise _unsupported(self, "stream")
 
+    def default_stream(self, device=None):
+        """对齐 torch.cuda.default_stream(device=None)：设备默认 stream（原生对象）。"""
+        raise _unsupported(self, "default_stream")
+
+    def get_stream_from_external(self, data_ptr, device=None):
+        """对齐 torch.cuda.get_stream_from_external(data_ptr, device=None)：
+        包装外部创建的 stream（如厂商运行时回传），返回原生 Stream 对象。"""
+        raise _unsupported(self, "get_stream_from_external")
+
+    def device(self, device):  # noqa: N802  # 对齐 torch.cuda.device 符号名
+        """对齐 torch.cuda.device(device)：类型位符号（设备上下文管理器类）。
+
+        同 Stream/Event：bridge 侧用 impl_factory 绑平台原生**类对象**（框架写
+        `with torch.cuda.device(i)` 之外还会做类型注解/isinstance），本方法仅契约
+        自洽。
+        """
+        raise _unsupported(self, "device")
+
+    def ExternalStream(self, **kwargs):  # noqa: N802
+        """对齐 torch.cuda.ExternalStream：类型位符号（外部 stream 的类）。"""
+        raise _unsupported(self, "ExternalStream")
+
+    def StreamContext(self, stream):  # noqa: N802
+        """对齐 torch.cuda.StreamContext：类型位符号（stream 上下文管理器类，
+        torch.cuda.stream 的返回类型）。"""
+        raise _unsupported(self, "StreamContext")
+
     # --- 硬件存在性 / 规模查询 ---
     # 曾经是 capability 表里的 probed 档（device_available/device_count/p2p），
     # 由门面读缓存作答。2026-10-14 改回普通接口：查询本身廉价，不值得为它建
@@ -236,6 +372,86 @@ class PlatformBase(ABC):
         """对齐 torch.cuda.can_device_access_peer(device, peer_device)：
         两张卡之间能否 P2P 访问（逐对回答，不是全局静态事实）。"""
         raise _unsupported(self, "can_device_access_peer")
+
+    # --- 能力 / 身份查询（masquerade 下返回厂商伪装值，接管转发不改值，见 TORCH_API）---
+    def get_device_capability(self, device=None):
+        """对齐 torch.cuda.get_device_capability(device=None) -> (major, minor)。
+
+        masquerade 平台返回的是厂商**伪装**的计算能力（如 (8,6)），供
+        inductor/triton codegen 消费——实现类原样转发厂商值，不得"纠正"成
+        真实硬件架构（那会打破编译路径）。G13：device=None 省略实参。
+        """
+        raise _unsupported(self, "get_device_capability")
+
+    def get_device_name(self, device=None):
+        """对齐 torch.cuda.get_device_name(device=None) -> str（设备名，可为伪装名）。"""
+        raise _unsupported(self, "get_device_name")
+
+    def get_device_properties(self, device):
+        """对齐 torch.cuda.get_device_properties(device) -> 设备属性对象。
+
+        返回平台**原生**属性对象（含 name/major/minor/total_memory 等字段），
+        门面不包装——框架会读其字段做内存/能力决策（G15 同族：对象会流出 TT
+        边界被框架原生代码消费）。
+        """
+        raise _unsupported(self, "get_device_properties")
+
+    def is_bf16_supported(self, including_emulation=True):
+        """对齐 torch.cuda.is_bf16_supported(including_emulation=True) -> bool。
+
+        dtype 能力查询（框架据此选 dtype——DeepSpeed cuda_accelerator 实测消费点）。
+        G12 签名必须含 including_emulation：torch 原生 is_tf32_supported() 内部
+        调 `is_bf16_supported(including_emulation=False)`（torch/cuda/__init__.py），
+        签名缺它会让该原生函数在接管后 TypeError（2026-10-22 实测捕获）。
+        """
+        raise _unsupported(self, "is_bf16_supported")
+
+    def utilization(self, device=None):
+        """对齐 torch.cuda.utilization(device=None) -> int（设备利用率 %）。"""
+        raise _unsupported(self, "utilization")
+
+    def is_tf32_supported(self):
+        """对齐 torch.cuda.is_tf32_supported() -> bool（tf32 能力查询）。
+
+        注意：torch 原生实现内部调 `is_bf16_supported(including_emulation=False)`
+        ——接管后该内部调用落到门面，bf16 的签名超集（G12）是其前提。
+        """
+        raise _unsupported(self, "is_tf32_supported")
+
+    def get_arch_list(self):
+        """对齐 torch.cuda.get_arch_list() -> list[str]：编译期支持的架构列表。
+
+        masquerade 下穿透返回 **NVIDIA sm_***（torch 编译期 CUDA 架构，非真实
+        硬件）——伪装信号，接管转发不改值（厂商刻意伪装供 inductor codegen），
+        纳管价值是可见 + 口径画像留证。
+        """
+        raise _unsupported(self, "get_arch_list")
+
+    def get_gencode_flags(self):
+        """对齐 torch.cuda.get_gencode_flags() -> str：编译期 gencode 标志
+        （同 get_arch_list，masquerade 伪装值，转发留证）。"""
+        raise _unsupported(self, "get_gencode_flags")
+
+    def get_sync_debug_mode(self):
+        """对齐 torch.cuda.get_sync_debug_mode() -> int：同步调试模式。"""
+        raise _unsupported(self, "get_sync_debug_mode")
+
+    def set_sync_debug_mode(self, debug_mode):
+        """对齐 torch.cuda.set_sync_debug_mode(debug_mode)：设置同步调试模式
+        （0=default/1=warn/2=error，debug 特性入口）。"""
+        raise _unsupported(self, "set_sync_debug_mode")
+
+    def init(self):
+        """对齐 torch.cuda.init()：惰性初始化设备上下文（幂等 no-op 语义）。"""
+        raise _unsupported(self, "init")
+
+    def is_initialized(self):
+        """对齐 torch.cuda.is_initialized() -> bool：设备是否已初始化。
+
+        torch 内部 dynamo/inductor 据此判断 CUDA 就绪状态（默认路径），
+        必须正确回答，不能 Denied。
+        """
+        raise _unsupported(self, "is_initialized")
 
     # ==================================================================
     # 平台自述（非 torch 接口；TT 要求实现类提供的元信息与生命周期）
