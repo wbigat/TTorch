@@ -33,6 +33,39 @@ _KIND_PRIORITY = {"reference": 0, "fused_jit": 1, "fused_aot_abo": 2,
 _RTOL = 5e-3
 _ATOL = 5e-3
 
+# --- D14：provider_wrap 的时机契约（必须在并行包装之前调用）---
+# `wrap_module` 的 `_self_check` 会**跑一次真实前向**（2026-10-23 起不再改模块
+# dtype——dtype 自适应阈值取代了 to(float32) 侵入性转换，见 spec._self_check）。
+# 在并行包装**之后**调用会与并行语义冲突：ZeRO-3 参数被 partition（forward 外
+# weight 是占位，跑前向读到空 tensor）、FSDP FlatParameter 的前向会触发 gather、
+# checkpoint wrapper 的 forward 语义不再是单次前向。真实链路当前走函数级通道
+# （fn_binding）未暴露，模块级通道接入并行框架是必踩的坑——把隐式约束变成
+# **显式拒绝**（不尝试兼容）。
+_PARALLEL_WRAPPER_CLASSES = frozenset({
+    "FullyShardedDataParallel", "FSDP", "DistributedDataParallel",
+    "DeepSpeedEngine", "CheckpointWrapper",
+})
+# 参数上的分片/占位标记
+_SHARDED_PARAM_ATTRS = ("_is_sharded", "ds_status", "_flat_param")
+
+
+def parallel_wrapper_violation(model):
+    """D14：模型是否已被并行包装——`wrap_model` 的前置检查。
+
+    返回 (证据, 原因) 或 None（未命中，可继续 wrap）。
+    """
+    for module in model.modules():
+        cls = type(module).__name__
+        if cls in _PARALLEL_WRAPPER_CLASSES:
+            return (cls, "类名命中并行包装")
+    named_params = getattr(model, "named_parameters", None)
+    if named_params is not None:
+        for _, param in named_params():
+            for attr in _SHARDED_PARAM_ATTRS:
+                if hasattr(param, attr):
+                    return (f"param.{attr}", "参数带分片/占位标记")
+    return None
+
 
 __all__ = [
     "ProviderManager",
@@ -157,7 +190,20 @@ class ProviderManager:
 
         匹配规则：模块类名 endswith 某 provider 的 module_names。weight 在
         调用期现读（见 Provider.wrap_module），故 .to(device)/训练更新后仍正确。
+
+        **延迟自检（D14 时机契约消解，2026-10-23）**：替换是零侵入的（挂成员 +
+        改 forward，不跑前向、不改 dtype），故可在并行包装（FSDP/DDP/ZeRO）
+        **之前或之后**调用——精度兜底延迟到首次 __call__（经 __call__ 流程，
+        all-gather 后 weight 完整）。检测到并行包装时记 provenance（供排障），
+        不再拒绝——此前 wrap 期自检的侵入性才是冲突源，非 forward 替换本身。
         """
+        violation = parallel_wrapper_violation(model)
+        if violation:
+            # 替换在并行包装后安全（延迟自检兜底），仅记录供排障，不再拒绝。
+            provenance.record(provenance.LAYER_PROVIDER, "wrap",
+                              type(model).__name__, "wrap_after_parallel",
+                              detail=f"检测到并行包装（{violation[0]}，{violation[1]}），"
+                                     f"精度兜底延迟到首次 __call__")
         providers = [p for p in self.registry.all() if p.module_names]
         n = 0
         wrapped = []
@@ -172,7 +218,9 @@ class ProviderManager:
                     except TypeError:
                         break  # 无 weight Parameter 等，跳过该模块
                     if new_forward is None:
-                        break  # 数值自检未过：不接管（provenance 已记），模块保持原样
+                        continue  # 本 provider 语义与模块不符（self_check 精度兜底未过）：
+                                  # 试下一个 provider——一对一语义分流，不同变体的
+                                  # provider（如 ZcgRMSNormProvider）可能匹配该模块。
                     module.forward = new_forward
                     module._tt_provider_wrapped = True
                     wrapped.append(f"{cls_name}->{p.semantic}")
@@ -313,20 +361,39 @@ class ProviderManager:
         return [s(v) for v in args] + [f"{k}={s(v)}" for k, v in kw.items()]
 
     def _call_sig(self, args, kw):
-        """负载签名：张量的 (ndim, 特征维, dtype, device) + 非张量参数值（eps 等）。
+        """负载签名：张量的 (ndim, 特征维, dtype, device_type) + 非张量参数值。
 
         门禁与绑定缓存按它分键——门禁结论只对测量过的负载成立。特征维
         （最后一维）是 kernel 正确性差异的实际载体（实测案例：D=256→512
         静默算错）；序列/批次维的变化只影响工作量不影响语义——变长训练
         （padding_free）里每个新长度都重跑门禁的开销不可接受，故归并。
+
+        device 只取 **type**（"cuda"/"xpu"/"cpu"）不带卡序号（D2-A，
+        2026-10-22）：卡序号（cuda:0 / cuda:1）对 kernel 选择**无语义价值**
+        ——同一型号卡上同一语义的正确实现是同一个；但它会让 rank0 的签名是
+        `cuda:0`、rank1 是 `cuda:1`，缓存键天然不同，各 rank 独立跑门禁、
+        独立决定 chosen——这是跨 rank 选择分叉的**结构性放大器**。收敛为
+        type 后，同构集群各 rank 从同一缓存键出发。
+
+        残留风险（如实记录，按"不过度设计"原则接受）：各 rank 仍是 per-process
+        自治门禁，计时抖动 / 门禁异常静默回退理论上仍可致分叉。跨 rank 对账
+        （首 step 后 all_gather 比对 chosen、分歧全体回退 native）已评估为
+        方案 B——当前未采纳：无实际收益预期且引入集合通信依赖，若未来实测
+        出现分叉再议（见 docs/TT_Convergence_Fix_Options.md §1）。
         """
         parts = []
         for v in list(args) + [kw[k] for k in sorted(kw)]:
             if isinstance(v, torch.Tensor):
                 parts.append((v.ndim, v.shape[-1] if v.ndim else 0,
-                              str(v.dtype), str(v.device)))
-            else:
+                              str(v.dtype), v.device.type))
+            elif v is None or isinstance(v, (bool, int, float, str)):
                 parts.append(repr(v))
+            else:
+                # 对象参数按**类型名**归并，不用 repr：对象 repr 含内存地址
+                # （<Foo object at 0x...>），会让签名跨 rank 不同、且同 rank 每次
+                # 调用都不同——缓存永不命中 + 每次重跑门禁。这是与 device 序号
+                # 同类的分叉源（2026-10-22 专家审视发现）。
+                parts.append(f"<{type(v).__name__}>")
         return tuple(parts)
 
     def call(self, semantic, *args, slot="compute", **kw):

@@ -60,6 +60,10 @@ class Entry:
         # 定义在 torch.cuda.memory/streams/random 等子模块再 re-export，
         # 框架访问的是 torch.cuda.X——必须显式 bind_module="torch.cuda"，
         # 否则只改了子模块，框架侧属性仍指原实现（mock 单模块察觉不到此坑）
+    attr_name: Optional[str] = None        # 落点属性名（缺省=symbol.__name__）。
+        # 第三方栈（symbrewrite）会在 import 期包装符号并改写其 __name__
+        # （实测 torch.cuda.utilization -> mock_torch_utilization），导致 dotted
+        # 与 activate 的落点推导双双失效。凡被包装的符号必须显式给 attr_name。
 
     def __post_init__(self):
         # 形态一致性检查（对象引用已由 import 期保证存在，这里只查组合逻辑）
@@ -82,7 +86,8 @@ class Entry:
         报错信息、cuda_compat 的 trace/coverage_report、YAML 快照的 symbol
         列、default-deny 覆盖面的 key。
         """
-        return f"{self.bind_module or self.symbol.__module__}.{self.symbol.__name__}"
+        return (f"{self.bind_module or self.symbol.__module__}."
+                f"{self.attr_name or self.symbol.__name__}")
 
     @property
     def target(self) -> Optional[str]:

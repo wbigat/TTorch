@@ -271,6 +271,7 @@ Platform Manager 管理**所有 platform 类型的逻辑注册**（register 只�
 
 - 每个 adapter 实现 `detect()` 存在性探测（查驱动/SO/设备节点，**只看不初始化**），返回 `(present, evidence)`；
 - `auto_activate()` 对全部候选逐一探测并**逐条打印证据**，恰好一个命中 → 激活；零命中 → fail fast 并列出探测报告；**多命中 → fail fast 拒绝猜测**（进程级单 platform 假设被破坏，必须人工介入）；
+- **detect 异常隔离（D12，2026-10-23）**：单个平台 detect 抛异常**不阻断**其他平台探测——try/except 隔离 + 记 provenance `detect/error` 事件持久留痕 + 跳过该平台。这保证 `select` 逃生通道可达（select 不经 detect；auto_activate 不再崩在 detect——此前一个无关平台的 detect 异常会让整个激活崩、逃生通道不可达）；
 - `select(name)` 保留为调试/测试的显式 override 通道，打印 `via=manual-override`；
 - 测试夹具/变体 adapter 置 `auto_detect = False`，不参与自动检测（demo 的 `NaiveXpuPlatform` 即如此）。
 
@@ -283,6 +284,20 @@ device count、stream/event、async comm、IPC/P2P、allocator 特性、dtype �
 **算子覆盖度是最关键的一项**——它直接决定 `fail_fast` 的判定：某个必需算子没有实现，就该明确报错而不是训练中途崩。
 
 ### 4.2a 接口的"不支持"与可选能力的实测（2026-10-14 重写，取代 capability schema）
+
+**接口只有两档**（2026-10-22 决策，**无基类 no-op 档**）：
+
+| 档 | 表达 | 语义 |
+|---|---|---|
+| **MANDATORY** | `@abstractmethod` | 通用接口，新硬件**必须实现**（没有它进程无法工作） |
+| **OPTIONAL-RAISE** | 默认 raise `TTPlatformError("unsupported")` | 某些 case 必要的功能，**遇到才实现**；未实现时调用方绕行 |
+
+**接口语义 vs 硬件能力分离**：基类表达接口语义（该做什么），平台 adapter 表达
+硬件能力（本硬件能做到什么）。某硬件做不到某接口，由**该硬件 adapter 自己覆写**
+（no-op/降级 + 留证），**基类不默认 no-op**——"某接口不做事也对"是错误表述：
+接口被调用就有预期效果（如 `empty_cache` = sync + 清理 reserved 内存），不做事
+即没达成预期；某硬件做不到是该硬件的行为，非接口本身的行为（详见 Gap 文档 D13
+决策修正）。
 
 不再有一张平台自报的 capability 表（原 `CAP_SCHEMA` 的 probed/declared/identity
 分档已删除）。取而代之的是两条更简单的规则：

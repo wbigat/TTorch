@@ -55,25 +55,45 @@ class ProviderModuleForward:
     可 pickle/deepcopy；持有 module 形成循环引用，pickle memo 机制可处理。
 
     weight/eps 调用期现读（不经构造期固化），.to(device)/训练更新后仍正确。
+
+    **延迟自检（2026-10-23，D14 时机契约消解）**：wrap 期只挂成员 + 替换 forward
+    （零前向、零 dtype 改动——零侵入，故可在并行包装**之后**安全调用）；精度
+    兜底延迟到**首次 __call__**——此时经 __call__ 流程，FSDP/DDP 的 all-gather
+    hook 已执行、weight 完整。自检未过则恢复原生 forward 回退（功能不降级）。
     """
 
-    def __init__(self, module, semantic, slot, zcg):
+    def __init__(self, module, semantic, slot, provider):
         self._module = module
-        self._orig_forward = module.forward  # bypass 回退 / A-B 对比基线
+        self._orig_forward = module.forward  # bypass 回退 / A-B 对比基线 / 延迟自检基准
         self._semantic = semantic
         self._slot = slot
-        self._zcg = zcg
+        self._provider = provider  # 延迟自检用（首次 __call__ 调其 _self_check）
+        self._checked = None       # None=待自检; True=通过; False=已回退原生
 
     def __call__(self, x, *args, **kw):
         from ttorch.provider import manager as _pm  # 延迟 import 避免环
-        if _pm.instance().is_bypassed():  # 全局旁路：走原始实现（baseline）
+        m = _pm.instance()
+        if m.is_bypassed():  # 全局旁路：走原始实现（baseline）
+            return self._orig_forward(x, *args, **kw)
+        if self._checked is None:
+            # 延迟自检：首次真实调用时做（真实输入 x，经 __call__ weight 完整）。
+            eps0 = getattr(self._module, "variance_epsilon",
+                           getattr(self._module, "eps", 1e-6))
+            self._checked = self._provider._self_check(
+                self._module, eps0, x=x, ref_forward=self._orig_forward)
+            if not self._checked:
+                # 自检未过：恢复原生 forward，本模块不接管（功能不降级）。
+                self._module.forward = self._orig_forward
+                return self._orig_forward(x, *args, **kw)
+        if not self._checked:
             return self._orig_forward(x, *args, **kw)
         module = self._module
+        # 传原始 weight——scale 语义由 provider 的 native/impl 内部固定
+        # （标准 provider 用 w 直乘；zcg provider 内部做 1+w）。一对一，
+        # 不在此处按 flag 折 scale。
         w = module.weight
-        if self._zcg:
-            w = 1 + w  # 折成有效 scale；+1 可微，梯度正确回传 weight
         eps = getattr(module, "variance_epsilon", getattr(module, "eps", 1e-6))
-        return _pm.call(self._semantic, x, w, eps, slot=self._slot)
+        return m.call(self._semantic, x, w, eps, slot=self._slot)
 
 
 class Provider(ABC):
@@ -88,6 +108,9 @@ class Provider(ABC):
     semantic = ""              # 模块语义，如 "rmsnorm" / "rope_bshd"
     slot = "compute"           # compute（schedule 插槽本期挂起）
     module_names: tuple = ()   # 模块级接入：nn.Module 类名（endswith 匹配），自动发现用
+    zero_centered_gamma = False  # 本 provider 处理的 RMSNorm 变体：False=w 直乘（标准），
+        # True=1+w（zero_centered_gamma，zcg）。一对一——每种变体一个 provider，
+        # wrap_module 据此 flag 做轻量分流（精度兜底在首次 __call__ 延迟复检）。
     bind_points: tuple = ()    # 函数级接入：((模块路径, 符号名), ...)——框架内部的
         # 函数符号（如 megatron 的 swiglu）。绑定后符号 = dispatcher，调用经
         # manager.call 分发——与模块级共享门禁/回退/开关/provenance。
@@ -134,83 +157,89 @@ class Provider(ABC):
         weight/eps 在调用期现读（不经构造期固化），保证 .to(device)/训练更新
         后仍正确。
 
-        返回 None = 接管前数值自检未过（_self_check），模块保持原样——
-        证据先于声明，对不齐就不接管（功能不降级）。抛 TypeError = 模块形态
-        不符该语义（无 weight Parameter）。
+        返回 None = 本 provider 变体与模块不符（由对应变体 provider 接管）。
+        抛 TypeError = 模块形态不符该语义（无 weight Parameter）。
+
+        **延迟自检（2026-10-23，D14 时机消解）**：wrap 期**零侵入**——不跑前向、
+        不改 dtype，只挂成员 + 替换 forward（故可在并行包装**之后**安全调用）。
+        精度兜底延迟到首次 __call__（经 __call__ 流程，FSDP/DDP all-gather 后
+        weight 完整），未过则恢复原生 forward（见 ProviderModuleForward）。
         """
         import torch
         if not isinstance(getattr(module, "weight", None), torch.nn.Parameter):
             raise TypeError(f"{type(module).__name__} 无可包装的 weight Parameter")
-        eps = getattr(module, "variance_epsilon", getattr(module, "eps", 1e-6))
-        # zero_centered_gamma 变体（如 Qwen3.5）：有效 scale 是 (1+weight) 而非 weight。
-        # 若不处理，直乘 weight 与厂商 RMSNormFunction 数值不一致（实测 err 达 5.16）。
-        # flag 嗅探只作先验——自检按实测对齐结果定有效语义（见 _self_check）。
-        zcg = getattr(module, "zero_centered_gamma", False)
-        ok, zcg = self._self_check(module, eps, zcg)
-        if not ok:
+        # 轻量分流（flag 先验，不跑前向）：本 provider 的变体语义与模块的
+        # zero_centered_gamma flag 不符则不接管（由对应变体 provider 接管）。
+        # flag 可能丢/伪造——精度兜底在首次 __call__ 延迟复检（纠正 flag 错误）。
+        if getattr(module, "zero_centered_gamma", False) != self.zero_centered_gamma:
             return None
-        return ProviderModuleForward(module, self.semantic, self.slot, zcg)
+        return ProviderModuleForward(module, self.semantic, self.slot, self)
 
-    def _self_check(self, module, eps, zcg, admit_tol=1e-3):
-        """接管前两判据（分离）：变体识别 + 正确性准入。
+    def _self_check(self, module, eps, x=None, ref_forward=None, admit_tol=None):
+        """精度兜底：本 provider 固定语义的实现 vs 模块参考 forward 一致性。
 
-        1) 变体识别（选择题，无阈值）：候选 scale 语义（w 直乘 / 1+w）各跑一次，
-           取误差最小者为有效语义——flag 嗅探只作先验排序，不作结论（厂商符号
-           替换可能丢/伪造 flag；Gemma 式 (1+w) 硬编码无 flag）。
-        2) 正确性准入（判断题）：最小误差必须低于 admit_tol 才接管——识别出的
-           语义与模块真实实现仍可能不是同一数学对象（实测：rel=4% 的模块曾被
-           宽松阈值放过，违反 5e-3 全局口径），两判据必须独立。
+        **定位（2026-10-23 修正）**：provider ↔ 社区标准 module **一对一**——语义
+        在 provider 设计时确定（本 provider 的 native/impl 固定一种 scale 语义），
+        self_check **不做变体选择**，只验证"本 provider 实现 vs 模块真实 forward"
+        的精度一致性：一致才接管，不一致拒绝（兜底）。语义不匹配的模块由对应
+        变体的独立 provider 接管（zcg 由 ZcgRMSNormProvider，见 rmsnorm/zcg_base.py）。
+        此前把"变体识别（w vs 1+w 选择题）"塞进自检，是把本应在 provider 设计时
+        定的语义选择错误下沉到运行时——已去除。
 
-        轨道用 fp32（模块临时 upcast + fp32 输入，dtype 往返无损）：bf16 下
-        同语义实现差（1-2 ulp ≈ 6e-3）与语义偏差（4e-2）只差一个数量级，阈值
-        怎么拍都误伤；fp32 下同语义差 5e-7 级、语义差不变，拉开 5 个数量级。
-        厂商 kernel 已实测支持 fp32 输入。
+        **dtype 自适应阈值（取代 to(float32) 侵入性转换）**：固定绝对阈值 + 噪声
+        随 dtype 变化是此前"bf16 阈值失效"的根因——修正阈值逻辑（随 dtype 自适应）
+        而非侵入性改模块 dtype。实测（32 组采样）：bf16 同语义实现差上限 7.7e-3、
+        语义偏差 4e-2，bf16 阈值取 2e-2 即可分；fp32 同语义差 ~0，阈值 1e-3。
+        在模块实际 dtype 下自检——零侵入、更贴近生产负载。
 
-        返回 (ok, effective_zcg)。成本 = 每模块至多两次小输入前向（fp32）。
+        **预留扩展点（2026-10-23）**：fx graph SSA 结构对比将作为 module 等价性
+        check 的一环（functorch make_fx 转译 module 与 provider 实现的计算图做 SSA
+        直接对比——非侵入、图结构级等价证据），与数值精度兜底互补。当前先预留位置。
+
+        **延迟模式（2026-10-23，D14 时机消解）**：传入 x/ref_forward 时为延迟自检
+        （首次 __call__，真实输入，经 __call__ 流程——FSDP/DDP 的 all-gather hook
+        已执行、weight 完整，并行包装后安全）；不传 x 则用合成输入（独立验证）。
+        ref_forward 用于延迟自检时传 orig_forward，避免递归调已替换的 module.forward。
+
+        返回 ok（bool）。成本 = 每模块一次小输入前向（生产 dtype）。
         """
         import torch
         from ttorch.witness import provenance
         w = module.weight
-        orig_dtype = w.dtype
+        dtype = w.dtype
+        if admit_tol is None:
+            # 阈值随 dtype 自适应（失效根因：固定阈值 + 噪声随 dtype 变）：
+            # fp32 同语义差 ~0 → 1e-3；bf16/fp16 同语义差 ~7.7e-3 → 2e-2
+            # （与语义偏差 4e-2 拉开约 2 倍 margin）。
+            admit_tol = 1e-3 if dtype == torch.float32 else 2e-2
+        if x is None:
+            # 独立验证（无真实输入）：合成输入
+            try:
+                gen = torch.Generator(device=w.device).manual_seed(0)
+            except Exception:
+                gen = None  # 部分设备栈不支持 Generator 构造；随机输入无需定种子
+            x = torch.randn(4, w.numel(), dtype=dtype, device=w.device, generator=gen)
+        # 延迟自检时 ref_forward=orig_forward（避免递归调已替换的 module.forward）
+        ref_fn = ref_forward if ref_forward is not None else module.forward
         try:
-            gen = torch.Generator(device=w.device).manual_seed(0)
-        except Exception:
-            gen = None  # 部分设备栈不支持 Generator 构造；随机输入无需定种子
-        x = torch.randn(4, w.numel(), dtype=torch.float32, device=w.device,
-                        generator=gen)
-        module.to(torch.float32)
-        try:
-            ref = module.forward(x)
+            ref = ref_fn(x)               # 模块参考实现（原生/被接管对象）
+            out = self.native(x, w, eps)  # 本 provider 固定语义的参考实现
             scale = ref.abs().max().item() + 1e-12
-            candidates = [(True, 1 + w.float()), (False, w.float())] if zcg \
-                else [(False, w.float()), (True, 1 + w.float())]
-            best = None
-            for cand_zcg, eff_w in candidates:
-                out = self.native(x, eff_w, eps)
-                rel = (out - ref).abs().max().item() / scale
-                if best is None or rel < best[1]:
-                    best = (cand_zcg, rel)
+            rel = (out - ref).abs().max().item() / scale
         except Exception as e:
-            # 自检是 provider 内部机制，其失败（如模块不支持 fp32 输入）必须收敛为
-            # "不接管"——不许穿透 wrap_model（不变式 1：只降性能不降功能）。
+            # 自检失败（如模块不支持该 dtype 输入）必须收敛为"不接管"——
+            # 不许穿透 wrap_model（不变式 1：只降性能不降功能）。
             provenance.record(provenance.LAYER_PROVIDER, "wrap",
                               type(module).__name__, "rejected",
                               semantic=self.semantic, reason="self_check_error",
                               error=f"{type(e).__name__}: {e}")
-            return False, zcg
-        finally:
-            module.to(orig_dtype)  # fp32→bf16 回到原值（bf16 值域 ⊂ fp32）
-        ok = best[1] < admit_tol
+            return False
+        ok = rel < admit_tol
         if not ok:
+            # 精度不一致（兜底生效）：本 provider 语义与模块真实实现不匹配——
+            # 拒绝接管。可能是变体不符（应由对应变体的独立 provider 接管）或实现偏差。
             provenance.record(provenance.LAYER_PROVIDER, "wrap",
                               type(module).__name__, "rejected",
                               semantic=self.semantic, reason="self_check",
-                              rel_err=round(best[1], 6))
-        elif best[0] != zcg:
-            # flag 与实测不一致（厂商替换丢 flag 等）：按实测语义接管，留证
-            provenance.record(provenance.LAYER_PROVIDER, "wrap",
-                              type(module).__name__, "self_check",
-                              semantic=self.semantic,
-                              detail=f"flag zcg={zcg} 与实测不符，按实测 zcg={best[0]} 接管",
-                              rel_err=round(best[1], 6))
-        return ok, best[0]
+                              rel_err=round(rel, 6))
+        return ok

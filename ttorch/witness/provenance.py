@@ -18,6 +18,9 @@ provider 的门禁/选择/调用事件，两份 schema 各自为政，排障要�
            enabled/disabled（switch）
   evidence 层特有字段（bridge: target/intent/swept_modules；provider:
            probe_us/ref_us/speedup/max_abs_err/fallback_actual/rejected/...）
+  pid/rank 产生该事件的**进程来源**（2026-10-21，D11）。多进程下 N 份记录格式
+           相同、无法区分来源——跨 rank 对账与 fork 继承分析都因此无从下手。
+           rank 读 RANK/LOCAL_RANK（缺省 None = 非分布式环境，与 rank 0 区分）。
 
 关于"统一 vs 分离"的取舍：信封字段（seq/ts/layer/event/subject/outcome）归一，
 层差异收进 evidence——两层确有真实差异（bridge 无运行期 per-call、provider 无
@@ -28,6 +31,7 @@ swept 概念），强压完全一致反而失真，故信封归一 + evidence �
 `export_jsonl()` 读——不暴露可变 list，杜绝外部 append/clear 破坏不变式。
 """
 import json
+import os
 import time
 
 _RECORDS = []
@@ -35,15 +39,37 @@ _seq = 0
 
 LAYER_BRIDGE = "bridge"
 LAYER_PROVIDER = "provider"
+LAYER_PLATFORM = "platform"   # conformance 等 platform 层的观测（如 D7 口径画像）
+
+
+def _current_rank():
+    """当前进程的分布式 rank（读框架注入的 RANK/LOCAL_RANK），非分布式返回 None。
+
+    刻意区分 None 与 0："不在分布式环境"和"是 rank 0"不是一回事，
+    聚合对账时需要能分辨。
+    """
+    for var in ("RANK", "LOCAL_RANK"):
+        v = os.getenv(var)
+        if v is not None and v != "":
+            try:
+                return int(v)
+            except ValueError:
+                continue
+    return None
 
 
 def record(layer, event, subject, outcome, **evidence):
-    """追加一条统一信封事件。layer 取 LAYER_BRIDGE / LAYER_PROVIDER。"""
+    """追加一条统一信封事件。layer 取 LAYER_BRIDGE / LAYER_PROVIDER。
+
+    信封自带 pid/rank（D11）：多进程训练（torchrun 多 rank、DataLoader worker、
+    fork 派生）产出 N 份格式相同的记录，若无来源字段则聚合时对不上是谁产生的。
+    """
     global _seq
     _seq += 1
     _RECORDS.append({"seq": _seq, "ts": round(time.time(), 6),
                      "layer": layer, "event": event, "subject": subject,
-                     "outcome": outcome, "evidence": evidence})
+                     "outcome": outcome, "pid": os.getpid(),
+                     "rank": _current_rank(), "evidence": evidence})
 
 
 def records(layer=None):
@@ -53,11 +79,46 @@ def records(layer=None):
     return tuple(r for r in _RECORDS if r["layer"] == layer)
 
 
-def export_jsonl(path, layer=None):
-    """导出 JSONL（默认全量，可按层过滤）。生成物，供 diff/审计。"""
+def default_export_path(base="provenance.jsonl"):
+    """默认导出文件名：带 pid/rank 后缀，避免多 rank 进程互相覆盖（D11）。"""
+    stem, _, ext = base.rpartition(".")
+    rank = _current_rank()
+    suffix = f".r{rank}" if rank is not None else ""
+    return f"{stem}{suffix}.{os.getpid()}.{ext or 'jsonl'}"
+
+
+def export_jsonl(path=None, layer=None):
+    """导出 JSONL（默认全量，可按层过滤）。生成物，供 diff/审计。
+
+    path 缺省时用 `default_export_path()`——多进程下固定文件名会被最后一个
+    写完的进程覆盖，跨 rank 对账拿到的只有一份。
+    """
+    path = path or default_export_path()
     with open(path, "w") as f:
         for r in records(layer):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return path
+
+
+def fork_reset(parent_pid):
+    """fork 派生进程调用：丢弃继承来的父进程记录，本进程从干净状态开始。
+
+    为什么必须显式重置（D11）：fork 会连 `_RECORDS` 和 `_seq` 一起继承——
+    父子记录混杂在同一份事件流里，且 `seq` 从继承值继续递增，多个 worker
+    聚合时 **seq 重复、无法排序**。派生进程（DataLoader worker 等）自己的
+    事件流里本来也不该出现父进程的绑定记录（那不是它产生的）。
+
+    重置后留一条 `fork/inherited` 事件指明来源（parent_pid），保证
+    "一份 JSONL = 一个进程的事件流"，且来源仍可追溯。
+    """
+    global _seq
+    parent = parent_pid
+    _RECORDS.clear()
+    _seq = 0
+    record(LAYER_BRIDGE, "fork", "process", "inherited",
+           parent_pid=parent,
+           detail="fork 派生进程：已丢弃继承的父进程记录，本进程事件流从 "
+                  "seq=1 重新计数（父进程事件见其自身的 JSONL）")
 
 
 def session():
@@ -124,6 +185,11 @@ def report():
         if layer == LAYER_BRIDGE:
             lines.append(f"[bridge] {r['subject']:<38} {r['outcome']:<14}"
                          f" -> {ev.get('target')}")
+        elif layer == LAYER_PLATFORM:
+            # D7 口径画像（caliber 事件）：让口径差异在报告中可见——文档 D7 要求
+            # "即使不强制 FAIL，也让口径差异可见"，此前只进 JSONL 不进报告
+            detail = " ".join(f"{k}={v}" for k, v in ev.items() if v is not None)
+            lines.append(f"[caliber] {r['subject']}: {r['outcome']}  ({detail})")
         elif r["event"] == "gate":
             mark = "PASS" if r["outcome"] == "pass" else "FAIL"
             extra = " ".join(f"{k}={ev[k]}" for k in

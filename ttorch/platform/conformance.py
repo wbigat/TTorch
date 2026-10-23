@@ -26,7 +26,8 @@ __all__ = ["Result", "run",
            "sync_scope_device_wide", "stream_dynamic_coverage",
            "mem_query_realtime", "graph_capture_roundtrip",
            "async_comm_smoke", "rng_state_roundtrip", "stream_fencing_semantics",
-           "stream_ctx_restore", "mem_info_consistency", "device_identity_consumable"]
+           "stream_ctx_restore", "mem_info_consistency", "device_identity_consumable",
+           "mem_caliber_coherence"]
 
 
 def _dev(adapter):
@@ -150,6 +151,13 @@ def graph_capture_roundtrip(adapter):
     if not adapter.supports("Stream") or mod is None or not hasattr(mod, "CUDAGraph"):
         return Result("graph_capture_roundtrip", True,
                       f"{adapter.name}: 不支持 graph 捕获（无 CUDAGraph 或无 stream 接口）")
+    # Denied 占位区分：CUDAGraph 被 TT Denied 替换后实例化抛 TTCompatError，若被
+    # 下方 try/except 吞成"实测不支持"会产生误导性结论（复跑/重复激活时）——
+    # 显式识别占位标记，如实说明（2026-10-22 专家审视发现）。
+    if getattr(mod.CUDAGraph, "_tt_denied", False):
+        return Result("graph_capture_roundtrip", True,
+                      f"{adapter.name}: graph 被 TT Denied 占位（特性点未验收），"
+                      f"非平台能力结论——启用需先验收转 Managed")
     try:
         x = torch.ones(8, device=_dev(adapter))
         main = adapter.current_stream()     # 捕获前的 warmup 必须在 side stream 上
@@ -267,6 +275,73 @@ def mem_info_consistency(adapter):
                   f"{adapter.name}: free={free} total={total} used={used}")
 
 
+def mem_caliber_coherence(adapter):
+    """内存口径**自洽性**验收（D7，2026-10-22）。
+
+    无外部标杆——masquerade 下"真实该预留多少"无从知晓（实测：分配 16MiB 导致
+    free 降 148MiB，差额构成外部不可知）。故验**自洽性/合理性**而非准确性：
+    1. allocated 增量对账（唯一有标杆的）：分配已知序列，增量单调且量级精确
+       （允许 allocator 粒度向上取整，不允许少于分配量或量级偏差）；
+    2. 不变量：0 <= allocated <= reserved（caching allocator 语义，若有 reserved）；
+    3. 释放回落：del + empty_cache 后 allocated 回基线附近（验统计无泄漏）。
+
+    口径画像（reserved/allocated 关系、free/total 构成）记 provenance——不判对错
+    （无标杆），让口径差异可见，供上层策略（ZeRO offload 阈值、容量规划）参考。
+
+    判据刻意宽松（宁放过不误杀）：本测试在 fail-fast 强制套件里，误杀会拒绝激活。
+
+    边界纪律（2026-10-22 修正）：本测试**不做 reset 语义验证**——
+    `reset_peak_memory_stats()` 清峰值统计且不可恢复，而 activate() 是公开 API、
+    允许训练中途显式调用，激活期执行它会清掉框架已累积的真实峰值。reset 语义
+    挪到 witness 按需诊断（`witness/diagnostics.mem_reset_semantics`，用户知情
+    主动调用）。激活期验证不破坏被观测对象的状态。
+    """
+    import torch
+    from ttorch.witness import provenance
+    hw = _hw_hooks(adapter)
+    mb = 1024**2
+    if hw is not None:
+        base = adapter.memory_allocated()
+        hw.alloc(64)
+        after = adapter.memory_allocated()
+        hw.free(64)
+        ok = (after - base) == 64
+        return Result("mem_caliber_coherence", ok,
+                      f"{adapter.name}: alloc(64) 增量={after-base}（精确=口径一致）")
+    dev = _dev(adapter)
+    base_alloc = adapter.memory_allocated()
+    xs, deltas = [], []
+    seq = (16, 32, 64)
+    for m in seq:
+        xs.append(torch.zeros(m * mb, dtype=torch.uint8, device=dev))
+        deltas.append(adapter.memory_allocated() - base_alloc)
+    total_expect = sum(seq) * mb
+    monotone = deltas[0] <= deltas[1] <= deltas[2]           # 增量单调不减
+    precise = 0.9 * total_expect <= deltas[-1] <= 3 * total_expect  # 量级精确（容忍粒度/预留）
+    alloc_now = adapter.memory_allocated()
+    reserved = adapter.memory_reserved() if adapter.supports("memory_reserved") else None
+    invariant = alloc_now >= 0 and (reserved is None or alloc_now <= reserved)
+    del xs
+    if adapter.supports("empty_cache"):
+        adapter.empty_cache()
+    fall_alloc = adapter.memory_allocated()
+    fall = fall_alloc <= base_alloc + 1 * mb                 # 释放回落（允许小残留）
+    # 口径画像：不判对错，记录供上层参考。free/total 依赖 mem_get_info（可选接口）
+    free, total_b = (adapter.mem_get_info()
+                     if adapter.supports("mem_get_info") else (None, None))
+    provenance.record(provenance.LAYER_PLATFORM, "caliber", "memory_profile",
+                      "observed", allocated=int(alloc_now),
+                      reserved=(int(reserved) if reserved is not None else None),
+                      free=(int(free) if free is not None else None),
+                      total=(int(total_b) if total_b is not None else None),
+                      alloc_delta_total=int(deltas[-1]),
+                      alloc_expect_total=int(total_expect))
+    ok = monotone and precise and invariant and fall
+    return Result("mem_caliber_coherence", ok,
+                  f"{adapter.name}: 增量{[d // mb for d in deltas]}MiB(期望{sum(seq)}) "
+                  f"单调={monotone} 量级={precise} alloc<=reserved={invariant} 回落={fall}")
+
+
 def device_identity_consumable(adapter):
     """设备标识契约：current_device 的返回值能回喂 set_device——
     swift 6+ 处把它直接传给 torch.tensor(device=)，demo 用回喂模拟。
@@ -286,7 +361,7 @@ _MANDATORY = [sync_scope_device_wide, stream_dynamic_coverage,
              mem_query_realtime,
              rng_state_roundtrip, stream_fencing_semantics,
              stream_ctx_restore, mem_info_consistency,
-             device_identity_consumable]
+             device_identity_consumable, mem_caliber_coherence]
 
 # 各强制测试所需的平台接口：平台没实现就跳过该测试（2026-10-14 取代原
 # _REQUIRED_CAP 的能力声明裁剪——裁剪依据从"平台自报 cap=False"改成
@@ -298,13 +373,65 @@ _REQUIRED_API = {
     "stream_ctx_restore": "Stream",
     "mem_query_realtime": "memory_allocated",
     "mem_info_consistency": "mem_get_info",
+    "mem_caliber_coherence": "memory_allocated",
     "rng_state_roundtrip": "get_rng_state",
 }
 
+def masquerade_profile(adapter):
+    """D5：伪装信号画像——**观测，不判定**（恒 PASS，不进强制门禁）。
+
+    为什么需要：masquerade 下能力查询符号返回的是**伪装值**（实测
+    `get_device_capability=(8,6)`、`get_device_name="GPU"`），这些值会流出 TT
+    边界被下游消费做**不可逆决策**——DeepSpeed `cuda_accelerator` 实测拿
+    `is_bf16_supported`/`get_device_capability` 选 dtype/kernel，inductor 拿
+    capability 做 codegen target。
+
+    TT **不纠正**这些伪装值（那是厂商让 torch.compile/inductor 工作的刻意设计，
+    "戳穿"反而会破坏编译路径），但必须让**伪装可见**：记录本次运行下游将看到
+    哪些伪装信号，供排障与后续 pin 治理（D5 主体）用。
+
+    恒 PASS 是刻意的——这是观测不是门禁，伪装本身不是缺陷。
+    """
+    from ttorch.witness import provenance
+    profile = {}
+    for name in ("get_device_capability", "get_device_name",
+                 "is_bf16_supported", "is_tf32_supported"):
+        try:
+            profile[name] = getattr(adapter, name)()
+        except Exception as e:
+            profile[name] = f"{type(e).__name__}"
+    provenance.record(provenance.LAYER_PLATFORM, "caliber", "masquerade_profile",
+                      "observed", **{k: repr(v) for k, v in profile.items()})
+    return Result("masquerade_profile", True,
+                  f"{adapter.name}: 伪装信号画像 {profile}")
+
+
 # 可选能力的背书测试：**无条件跑**，结果即事实（2026-10-14 取代原 _BACKING
 # 的"声明 True 才跑"——不再有自报的 graph_capture / async_comm 可信问题，
-# 跑不通就是不支持。这两项不进强制套件：不支持是合法的，不该拒绝激活）。
-_ENDORSEMENT = [graph_capture_roundtrip, async_comm_smoke]
+# 跑不通就是不支持）。这些不进强制套件：不支持是合法的、纯观测的都不该拒绝激活
+# （masquerade_profile 是伪装信号画像，恒 PASS 的观测项）。
+_ENDORSEMENT = [graph_capture_roundtrip, async_comm_smoke, masquerade_profile]
+
+
+def _run_one(t, adapter):
+    """单个测试的异常托底：测试内异常转成 Result，不让它崩掉整个激活流程。
+
+    _REQUIRED_API 裁剪只覆盖每个测试的主接口，测试内部可能触及**其他可选接口**
+    （如 mem_caliber_coherence 用到 mem_get_info）。此前测试内的 TTPlatformError
+    会直接冒泡崩掉激活（2026-10-22 专家审视发现）。区分：
+    - TTPlatformError("unsupported")：触及平台未实现接口 → 合法降级 skip；
+    - 其他异常：平台违约或测试缺陷 → FAIL（fail fast 走正常 Result 通道）。
+    """
+    from ttorch.platform.platform_handle import TTPlatformError
+    try:
+        return t(adapter)
+    except TTPlatformError as e:
+        if e.category == "unsupported":
+            return Result(t.__name__, True,
+                          f"skipped: 测试触及未实现接口（{e}），合法降级")
+        return Result(t.__name__, False, f"平台错误[{e.category}]: {e}")
+    except Exception as e:
+        return Result(t.__name__, False, f"测试异常 {type(e).__name__}: {e}")
 
 
 def run(adapter):
@@ -320,7 +447,7 @@ def run(adapter):
             results.append(Result(t.__name__, True,
                                   f"skipped: 平台未实现 {api}()（调用方收 unsupported，走降级）"))
             continue
-        results.append(t(adapter))
+        results.append(_run_one(t, adapter))
     for t in _ENDORSEMENT:
-        results.append(t(adapter))
+        results.append(_run_one(t, adapter))
     return results

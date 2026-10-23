@@ -21,7 +21,8 @@
 的维护成本高于它解决的问题（Rewrite 文档 §6 明确降级）。
 """
 
-__all__ = ["rebind", "unbind", "clear", "snapshot", "origin_attr", "has_origin"]
+__all__ = ["rebind", "unbind", "rollback", "clear", "snapshot",
+           "origin_attr", "has_origin"]
 
 # 留痕属性前缀：带 owner，消灭撞名且"谁绑的"从属性名即可见
 _ORIGIN_PREFIX = "_tt_origin_"
@@ -29,6 +30,12 @@ _ORIGIN_PREFIX = "_tt_origin_"
 # 全部 writer 的绑定快照 {(module_name, attr): (bound_obj, owner)}
 # ——完整性检测的唯一基准（替代 cuda_compat 局部的 _POST_BIND）
 _SNAPSHOT = {}
+
+# 被扫尾改写的模块 {(module_name, attr)}——**回滚必须覆盖它们**。
+# 为什么单独记：_SNAPSHOT 只记源头模块（如 torch.cuda），而扫尾改的是第三方/
+# 框架包里的 from-import 陈旧引用（owner="sweep"）。只回滚源头会让这些模块
+# 里的引用仍指向已"卸载"的门面——比不回滚更隐蔽（2026-10-21 实测确认）。
+_SWEEP_LOG = set()
 
 
 def origin_attr(owner, attr):
@@ -103,6 +110,7 @@ def _sweep(module, attr, new, original, packages):
             if getattr(m, attr, None) is original:
                 setattr(m, origin_attr("sweep", attr), original)
                 setattr(m, attr, new)
+                _SWEEP_LOG.add((name, attr))
                 swept += 1
         except Exception:
             continue
@@ -135,6 +143,47 @@ def unbind(module, attr, owner):
         pass
     _SNAPSHOT.pop((module.__name__, attr), None)
     return True
+
+
+def _rollback_sweep():
+    """恢复被扫尾改写的模块（用它们自己的 `sweep` 留痕）。返回恢复数。"""
+    import sys
+    restored = 0
+    for name, attr in list(_SWEEP_LOG):
+        m = sys.modules.get(name)
+        if m is None:
+            continue
+        if unbind(m, attr, "sweep"):
+            restored += 1
+        _SWEEP_LOG.discard((name, attr))
+    return restored
+
+
+def rollback(owner=None):
+    """完整回滚一次激活的替换动作：扫尾模块 → 源头符号 → 快照。
+
+    **顺序不能反**：必须先恢复扫尾模块。若先恢复源头，第三方模块里的引用
+    仍指向门面，而该门面已经"卸载"——系统既不是纯厂商栈也不是完整 TT 栈，
+    比不回滚更隐蔽（2026-10-21 实测：`fakefw2.synchronize` 残留）。
+
+    owner 指定时只回滚该 writer 的源头条目（扫尾是源头的附属动作，不区分
+    owner）。返回 (n_source, n_sweep)。
+
+    不可回滚的部分（已核实无害，见 bootstrap 注释）：厂商模块 import、
+    conformance 的设备副作用、provenance 事件流、platform 激活态。
+    """
+    n_sweep = _rollback_sweep()
+    n_source = 0
+    import sys
+    for (mod_name, attr), (_obj, o) in list(_SNAPSHOT.items()):
+        if owner is not None and o != owner:
+            continue
+        m = sys.modules.get(mod_name)
+        if m is None:
+            continue
+        if unbind(m, attr, o):
+            n_source += 1
+    return n_source, n_sweep
 
 
 def clear(owner=None):
