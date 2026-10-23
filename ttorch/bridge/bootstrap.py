@@ -138,6 +138,22 @@ def activate(platform="auto", sweep_packages=None, skip_conformance=False):
     # 仍误报失败（2026-10-22 审视发现的恢复语义缺陷）。
     _LAST_FAILURE = None
     print(f"[tt] {_ACTIVATION}")
+
+    # D10：收束画像——让"哪些硬件交互不在 TT 观测范围内"本身可观测。
+    # TT 的核心主张是"只保证跑没跑对可被观测"，故观测盲区必须可见。
+    from ttorch.witness import provenance
+    profile = surface.coverage_profile()
+    unconverged = surface.unconverged_components()
+    print(f"[tt] 收束画像: 符号面 {profile['managed']}纳管/"
+          f"{profile['denied']}占位/{profile['exempt']}豁免"
+          f"（闭合={profile['closed']}）")
+    if unconverged:
+        print(f"[tt] 在场不可收束组件（其硬件交互不经 TT）: "
+              + ", ".join(c for c, _ in unconverged))
+    provenance.record(provenance.LAYER_BRIDGE, "coverage", "profile", "done",
+                      coverage=profile["coverage"], managed=profile["managed"],
+                      denied=profile["denied"], exempt=profile["exempt"],
+                      unconverged=[c for c, _ in unconverged])
     return _ACTIVATION
 
 

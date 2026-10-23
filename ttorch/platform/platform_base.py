@@ -150,8 +150,15 @@ class PlatformBase(ABC):
         raise _unsupported(self, "synchronize")
 
     # --- 显存 ---
+    # D13 两档（**无基类 no-op 档**，2026-10-22 决策）：MANDATORY(@abstractmethod) /
+    # OPTIONAL-RAISE(默认 raise)。接口语义与硬件能力分离——某硬件做不到某接口，
+    # 由该硬件 adapter 覆写（no-op/降级 + 留证），基类不默认 no-op（详见 Gap D13）。
     def empty_cache(self):
-        """对齐 torch.cuda.empty_cache()：allocator 提示，尽力语义（可 no-op）。"""
+        """对齐 torch.cuda.empty_cache()：sync + 释放 reserved 缓存（有预期效果）。
+
+        默认 raise：接口语义是清理，未实现即能力缺失报错；某硬件做不到时由该
+        硬件 adapter 覆写 no-op + 留证（masquerade adapter 已如此），非基类默认。
+        """
         raise _unsupported(self, "empty_cache")
 
     def memory_allocated(self, device=None):
@@ -442,7 +449,7 @@ class PlatformBase(ABC):
         raise _unsupported(self, "set_sync_debug_mode")
 
     def init(self):
-        """对齐 torch.cuda.init()：惰性初始化设备上下文（幂等 no-op 语义）。"""
+        """对齐 torch.cuda.init()：惰性初始化设备上下文（幂等，重复调用无副作用）。"""
         raise _unsupported(self, "init")
 
     def is_initialized(self):
@@ -458,7 +465,14 @@ class PlatformBase(ABC):
     # ==================================================================
 
     sdk_range = ("0.0", "999")  # 声明支持的 SDK 版本范围 (min, max)，左闭右开
-
+    # D6：当前**只实测支持 torch 2.9.x**（窗口左闭右开，2026-10-22 决策）。
+    # 与 sdk_range 的区别——sdk 版本不匹配是硬约束（实现依赖厂商 SDK 版本），
+    # torch 版本只是"实测覆盖"提示：TT 有 admission/conformance 作为真闸门，
+    # 超出窗口只告警不阻断（签名契约 G12/G13/G15 由它们实测兜住）。
+    # 跨版本策略：后续优先做**跨版本并集接口**处理，对只出现在某些版本的接口
+    # 加版本管理——不为每个版本单独做一份支持（避免 N 份实现的维护爆炸）。
+    torch_range = ("2.9", "2.10")
+    # D5：平台声明的**环境变量 pin**（平台知识的一部分）——{name: value}。
     def sdk_version(self):
         """当前环境的 SDK 版本（激活期与 sdk_range 协商）。每个平台必须实现。"""
         raise NotImplementedError

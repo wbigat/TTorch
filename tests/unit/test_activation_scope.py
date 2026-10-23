@@ -85,6 +85,12 @@ def test_bootstrap_rollback_on_bind_failure():
     """绑定中途失败 → 符号面还原 + _ACTIVATION 置 None + 留 rollback 证据。"""
     import torch
 
+    # Bug1 修复：无卡环境本用例必失败——bootstrap 完整激活依赖真实 platform
+    # （detect 无命中会在 platform 阶段就抛，走不到本用例要测的"绑定失败"）。
+    # 此用例本质是端到端激活测试，跳过无卡环境。
+    if not torch.cuda.is_available():
+        pytest.skip("无加速设备：完整激活需要真实 platform")
+
     import ttorch
     import ttorch.bridge.bootstrap as bootstrap
     import ttorch.bridge.cuda_compat as cuda_compat
@@ -246,3 +252,22 @@ def test_scope_classification_explicit_signals(monkeypatch):
     monkeypatch.delenv(_auto_init._ACTIVATED_PID_ENV, raising=False)
     kind, _ = _auto_init._classify_process()
     assert kind == "primary", "无标记 → 首次激活进程"
+
+
+def test_d10_convergence_profile_observability():
+    """D10：收束画像——符号面三态可见 + 在场不可收束组件可检测。"""
+    import sys
+    from ttorch.bridge import surface
+    profile = surface.coverage_profile()
+    assert profile["closed"] is True
+    assert profile["managed"] > 0 and profile["denied"] > 0 and profile["exempt"] > 0
+    assert profile["managed"] + profile["denied"] + profile["exempt"] == 122
+    # 不可收束组件检测：模拟组件在场，应被捕获且带原因
+    sys.modules.setdefault("transformer_engine", None)
+    try:
+        unconverged = surface.unconverged_components()
+        names = [c for c, _ in unconverged]
+        assert "transformer_engine" in names, "在场不可收束组件应被检测到"
+        assert all(isinstance(r, str) and r for _, r in unconverged), "每个组件须带原因"
+    finally:
+        sys.modules.pop("transformer_engine", None)

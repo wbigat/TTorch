@@ -30,6 +30,19 @@ def _enabled():
 _ACTIVATED_PID_ENV = "TT_ACTIVATED_PID"
 
 
+def _reset_inherited_stream(reason=""):
+    """fork 派生的共同处理：重置事件流 + 打印继承态提示。
+
+    供 `_on_fork_child`（fork 钩子，刻意轻量）与 `_init` 的 inherited 路径复用——
+    两处此前各自重复 `fork_reset` + 打印（Bug3 修复：消除冗余）。
+    """
+    from ttorch.witness import provenance
+    provenance.fork_reset(os.getenv(_ACTIVATED_PID_ENV))
+    print(f"[ttorch] fork 派生进程（{reason or 'via fork hook'}）：沿用父进程激活态"
+          f"（事件流已按进程重置）。注意 PyTorch 禁止在 fork 子进程重新初始化 CUDA，"
+          f"worker 内请勿使用 CUDA。", file=sys.stderr)
+
+
 def _on_fork_child():
     """fork 后的子进程回调（D1 + D11）：标注继承态并重置事件流。
 
@@ -42,11 +55,7 @@ def _on_fork_child():
     回调刻意保持简单（fork 后进程环境受限，不碰锁/不 import 重模块）。
     """
     try:
-        from ttorch.witness import provenance
-        provenance.fork_reset(os.getenv(_ACTIVATED_PID_ENV))
-        print("[ttorch] fork 派生进程：沿用父进程激活态（事件流已按进程重置）。"
-              "注意 PyTorch 禁止在 fork 子进程重新初始化 CUDA，"
-              "worker 内请勿使用 CUDA。", file=sys.stderr)
+        _reset_inherited_stream()
     except Exception:  # noqa: BLE001  fork 回调不得抛（会让子进程直接失败）
         pass
 
@@ -140,17 +149,13 @@ def _init():
     kind, reason = _classify_process()
 
     if kind == "inherited":
-        # fork 派生：状态已继承，不再做任何绑定。留证据并提示 PyTorch 的
-        # fork-CUDA 限制——若框架在此类 worker 里做 GPU 预处理会踩
+        # fork 派生：状态已继承，不再做任何绑定。事件流重置 + 提示走共享逻辑
+        # （_reset_inherited_stream，Bug3 消除与 _on_fork_child 的冗余）。
+        # fork-CUDA 限制：框架在此类 worker 做 GPU 预处理会踩
         # "Cannot re-initialize CUDA in forked subprocess"。
-        # 事件流也必须重置：继承来的记录是父进程的，seq 会从父进程值继续递增
-        # （多 worker 聚合时 seq 重复，D11）。
-        from ttorch.witness import provenance
-        provenance.fork_reset(os.getenv(_ACTIVATED_PID_ENV))
+        # 事件流必须重置：继承来的记录是父进程的，seq 会重复（D11）。
+        _reset_inherited_stream(reason)
         _record_scope(kind, reason, skip_conformance=None)
-        print(f"[ttorch] 本进程为 fork 派生（{reason}）：沿用父进程激活态。"
-              f"注意 PyTorch 禁止在 fork 子进程重新初始化 CUDA，"
-              f"worker 内请勿使用 CUDA。", file=sys.stderr)
         return True
 
     try:

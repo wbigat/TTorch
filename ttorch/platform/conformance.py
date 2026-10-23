@@ -377,10 +377,40 @@ _REQUIRED_API = {
     "rng_state_roundtrip": "get_rng_state",
 }
 
+def masquerade_profile(adapter):
+    """D5：伪装信号画像——**观测，不判定**（恒 PASS，不进强制门禁）。
+
+    为什么需要：masquerade 下能力查询符号返回的是**伪装值**（实测
+    `get_device_capability=(8,6)`、`get_device_name="GPU"`），这些值会流出 TT
+    边界被下游消费做**不可逆决策**——DeepSpeed `cuda_accelerator` 实测拿
+    `is_bf16_supported`/`get_device_capability` 选 dtype/kernel，inductor 拿
+    capability 做 codegen target。
+
+    TT **不纠正**这些伪装值（那是厂商让 torch.compile/inductor 工作的刻意设计，
+    "戳穿"反而会破坏编译路径），但必须让**伪装可见**：记录本次运行下游将看到
+    哪些伪装信号，供排障与后续 pin 治理（D5 主体）用。
+
+    恒 PASS 是刻意的——这是观测不是门禁，伪装本身不是缺陷。
+    """
+    from ttorch.witness import provenance
+    profile = {}
+    for name in ("get_device_capability", "get_device_name",
+                 "is_bf16_supported", "is_tf32_supported"):
+        try:
+            profile[name] = getattr(adapter, name)()
+        except Exception as e:
+            profile[name] = f"{type(e).__name__}"
+    provenance.record(provenance.LAYER_PLATFORM, "caliber", "masquerade_profile",
+                      "observed", **{k: repr(v) for k, v in profile.items()})
+    return Result("masquerade_profile", True,
+                  f"{adapter.name}: 伪装信号画像 {profile}")
+
+
 # 可选能力的背书测试：**无条件跑**，结果即事实（2026-10-14 取代原 _BACKING
 # 的"声明 True 才跑"——不再有自报的 graph_capture / async_comm 可信问题，
-# 跑不通就是不支持。这两项不进强制套件：不支持是合法的，不该拒绝激活）。
-_ENDORSEMENT = [graph_capture_roundtrip, async_comm_smoke]
+# 跑不通就是不支持）。这些不进强制套件：不支持是合法的、纯观测的都不该拒绝激活
+# （masquerade_profile 是伪装信号画像，恒 PASS 的观测项）。
+_ENDORSEMENT = [graph_capture_roundtrip, async_comm_smoke, masquerade_profile]
 
 
 def _run_one(t, adapter):

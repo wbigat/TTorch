@@ -31,7 +31,23 @@
 >   （allocated 增量对账 + alloc≤reserved 不变量 + 释放回落）+ 口径画像进
 >   provenance 与 report（可见）。reset 语义挪 `witness/diagnostics.mem_reset_semantics`
 >   按需诊断——避免激活期 `reset_peak_memory_stats` 清峰值统计的不可逆副作用。
-> - ⏳ D5 / D6 / D8 / D9 / D10 / D12 / D13 / D14 待决策（解法见配套文档）
+> - ✅ **D5 定性修正为非缺陷**（2026-10-23 用户观点）："伪装信号外溢"定性不成立——
+>   masquerade 伪装 + 下游库接管是**厂商栈的正确职责**（KL3 栈已接管 triton/
+>   deepspeed/transformers 等下游库），`is_available`/`get_device_capability` 等接口
+>   本就是每个硬件要回答的，伪装回答是刻意提供的 CUDA 兼容身份，让 CUDA 生态正常
+>   运作，**不存在外溢/负面影响**。治理代码（env_pins）已回退；保留
+>   `masquerade_profile` 观测画像——用途是后续检测"是否有读取伪装值但未被 cover
+>   的 case"（观测而非治理）。详见 D5 节修正实录。
+> - ✅ **D6 已落地**（`torch_range` 收窄为 `("2.9","2.10")`，warn 不 block；跨版本走
+>   并集接口 + 版本管理，不做逐版本分支）
+> - ✅ **D10 已修复**（收束画像：符号面三态 + 在场不可收束组件检测，激活末尾接入
+>   + provenance 留证）
+> - ✅ **D13 已落地**（接口两档：abstract + raise unimplemented，**无基类 no-op 档**；
+>   no-op 归平台 adapter 实现选择）
+> - ✅ **D8 / D9 / D12 / D14 已闭环**：D8 热路径税基线（`measure_forward_tax`，实测
+>   税率 1.74x）+ D9 对账边界输入（`_probe_variants` 特征维×2/÷2 + 批次维空/单，
+>   KLX 空张量教训）+ D12 detect 异常隔离（try/except）+ D14 延迟自检（wrap 期
+>   零侵入，自检延迟到首次 `__call__`，并行包装后可替换）——均加单测闭环。
 
 ---
 
@@ -150,6 +166,12 @@ FlagOS 的 `cur_platform` 是模块级单例 `[他方]`。两者都只解决**�
 - `_auto_init` 激活后在环境里打一个标记（如 `TT_ACTIVATED_PID=<pid>`），子进程发现 `os.getpid() != 该值` 即判为派生进程 → 走轻档；
 - 轻档/重档的选择逐条进 provenance（谁、为什么走了哪档）。
 
+> **修复实录（2026-10-22，已落地）**：两档激活 + 进程分类（`_auto_init._classify_process`
+> → primary/derived/inherited）+ fork 钩子（`os.register_at_fork`，fork 派生进程不执行
+> .pth 只能靠它触发）；显式 activate 路径收口打标记（`mark_activated`）。实测：父进程
+> primary 重档 / spawn derived 轻档 / fork inherited 跳过。单测 test_activation_scope.py
+> + 4 卡 DP 回归（rank 重档、worker 轻档）。
+
 ---
 
 ### D3 · 半激活态可达且进程继续 【P0】
@@ -201,6 +223,12 @@ except Exception as e:  # noqa: BLE001
 2. `_auto_init` 失败后写一个进程级中毒标记，并让 `ttorch.is_active()` 之外多一个 `assert_healthy()`：
    有标记时抛错并指明「TT 激活失败且符号可能部分改写，请勿在此进程训练」。
 
+> **修复实录（2026-10-22，已落地）**：`_rebind.rollback()`（先恢复扫尾模块、再恢复
+> 源头符号、再清快照——顺序不可反）+ bootstrap 激活主流程 try/except（失败回滚 +
+> 重 raise）+ 中毒标记一套（mark_failed/is_healthy/assert_healthy）+ 成功路径清标记
+> （否则"失败→重试成功"误报）。单测 test_activation_scope.py（绑定失败回滚 +
+> `_ACTIVATION` 复位 + rollback 证据 + 中毒标记）。
+
 ---
 
 ### D14 · `provider_wrap` 的时机契约未定义（与并行包装的时序冲突）【P1】
@@ -240,6 +268,40 @@ finally:
 检测 model 树上是否存在 FSDP/DDP/DeepSpeedEngine/CheckpointWrapper 类名，
 或参数上是否带 `_is_sharded`/`ds_status`/`_flat_param` 标记 → 命中则抛错并指明
 「`provider_wrap` 必须在并行包装之前调用」。docstring 的约束同步写进 README 的接入顺序说明。
+
+> **修复实录（2026-10-22/23，已落地）**：
+> - **时机契约显式拒绝**：`parallel_wrapper_violation(model)` 检测并行包装（类名
+>   FSDP/DDP/DeepSpeedEngine/CheckpointWrapper + 参数标记 `_is_sharded`/`ds_status`/
+>   `_flat_param`），`wrap_model` 入口命中即 raise「必须在并行包装之前」。
+> - **self_check 去侵入性（2026-10-23）**：原 `_self_check` 用 `module.to(float32)`
+>   把自检搬到 fp32，理由"bf16 阈值失效"——其**根因是固定绝对阈值 + 噪声随 dtype
+>   变化**。正确做法是修正阈值逻辑而非侵入性绕过：改为**阈值随 dtype 自适应**
+>   （bf16 取 2e-2、fp32 取 1e-3），在模块实际 dtype 下自检，**不再改模块 dtype**。
+>   实测支撑：bf16 同语义差上限 7.7e-3（32 组采样）、语义偏差 4e-2，2e-2 阈值
+>   可分；变体识别（w vs 1+w 差 ~0.98）bf16 下本就可靠。侵入性从"改 dtype + 跑
+>   前向"减为"只跑前向"——时机契约仍需（ZeRO-3 占位参数跑前向仍冲突），但
+>   FSDP dtype 破坏这一冲突消除。
+> - **self_check 定位修正（2026-10-23，架构澄清）**：原 self_check 夹带**变体识别**
+>   （w vs 1+w 选择题）+ `ProviderModuleForward` 用 zcg 标志折 scale——这是"一个
+>   provider 运行时适配两种变体"，把本应在 provider 设计时定的语义选择错误下沉到
+>   运行时。按"**provider ↔ 社区标准 module 一对一**"修正：
+>   - provider 一对一固定语义：`RMSNormProvider`（w 直乘）/ `ZcgRMSNormProvider`
+>     （1+w，`rmsnorm/zcg_base.py` 骨架，当前只 native）分离；
+>   - self_check **纯精度兜底**：验证本 provider 固定语义 vs 模块 forward 一致性，
+>     不做变体选择；不一致拒绝（语义不匹配由对应变体 provider 接管）；
+>   - wrap_model 分流：self_check 未过从 `break` 改 `continue`（试下一个 provider）；
+>   - `ProviderModuleForward` 去 zcg（传原始 weight，语义由 provider 内部固定）。
+>   实测一对一分流：标准模块→rmsnorm、zcg 模块→rmsnorm_zcg、混合模型精度 rel=0。
+> - **延迟自检消解时机契约（2026-10-23，最终方案）**：认知修正——并行包装后替换
+>   forward **本身安全**（FSDP/DDP 的 all-gather 在 `__call__` 的 forward_pre_hook
+>   层，替换的 forward 在其后执行、weight 完整；实测 DDP/FSDP 包装后替换正常）。
+>   D14 的冲突源是 **wrap 期自检的侵入性**（直接调 `module.forward` 不经 `__call__`，
+>   此时 weight 未 all-gather），**非 forward 替换本身**。故改为：wrap 期零侵入
+>   （挂成员 + 改 forward，不跑前向、不改 dtype），精度兜底延迟到**首次 __call__**
+>   （经 __call__，weight 完整），未过则恢复原生 forward。`parallel_wrapper_violation`
+>   从 raise 改为 provenance 记录。wrap_module 加 `zero_centered_gamma` flag 轻量
+>   分流保持一对一，自检延迟复检纠正 flag 错误。实测：DDP/FSDP 包装后接管正常、
+>   延迟自检走 provider、zcg 分流正确、自检未过回退原生，全部通过。
 
 ---
 
@@ -324,6 +386,11 @@ fork 子进程继承 19 条父进程记录后各自演化，聚合时无法区�
 
 **最小落地建议**（2 行）：`record()` 的信封增 `pid`（`os.getpid()`）与 `rank`（读 `RANK`/`LOCAL_RANK`，缺省 None）。
 `export_jsonl` 的默认路径带 pid/rank 后缀，避免多 rank 互相覆盖。
+
+> **修复实录（2026-10-22，已落地）**：`record()` 信封增 pid + rank（缺省 None 区分
+> 非分布式与 rank 0）+ `default_export_path`（带 rank/pid 后缀避免多 rank 覆盖）+
+> `fork_reset`（fork 派生进程丢弃继承的父进程记录、seq 从 1 重计数、留 fork/inherited
+> 事件）。单测覆盖 pid/rank 信封 + fork_reset + 导出路径。
 
 ---
 
@@ -439,7 +506,7 @@ DeepInfer 的实证案例原文注释：
 凡读 `torch.cuda.*` 做决策的代码都是 TT 的事实影响范围，而 TT 只接管了其中一部分（18/145，见 D4），
 对接管之外的消费方连**清单**都没有。
 
-**最小落地建议**（DeepInfer 笔记 §8.1 已给出完整方案，TT 零落地，约 30 行）：
+**最小落地建议**（DeepInfer 笔记 §8.1 完整方案；**已评估暂不落地**——观察项阶段不做，未来触发条件满足时参考，约 30 行）：
 1. **机制化**：`PlatformSpec` 增 `env_pins: dict[str, str]` 字段（如 KL3 上 `{"TILELANG_DEFAULT_TARGET": ...}`），
    `activate()` 时统一 `os.environ.setdefault` 注入，**逐条进 provenance**（谁设的、key、value、为什么）——
    pin 表成为平台知识的一部分，而不是散在 adapter `__init__` 里的裸 `os.environ`；
@@ -450,6 +517,40 @@ DeepInfer 的实证案例原文注释：
 4. **决策优先级准则**（直接采用笔记结论）：
    **① B 的官方显式配置 > ② B 的探测函数 pin > ③ A 的返回值修正** —— 副作用面递增，③ 是最后手段
    且必须全量盘点 A 的消费方（即 D4 要建的那张面盘点表）。
+
+> **修正实录（2026-10-22，实证后重新定位：从 P1 降级为观察项）**：
+> 经三层递进实证 + 用户连续追问校正，本节原判断"伪装信号外溢 → 下游不可逆决策
+> 错误"在 KL3 现实里**不成立**，D5 降级为观察项：
+>
+> 1. **capability 是 NVIDIA 版本概念**——用它做功能区分在 XPU 上语义不成立。
+>    实证：真实架构 `major=0/minor=0/name=KL3`，伪装值 (8,6)/"GPU" 是厂商精心选的
+>    "CUDA 兼容身份"（sm_86：开 flash-attn、不开 TMA），非真实硬件能力；
+> 2. **有转译层兜底**——分支执行不直接跑 NVIDIA 路径：CUDA 语义被厂商栈转译到
+>    XPU（`xpu_fla` patch triton jit→noop、`driver.active→mock(cuda)`、
+>    SYMBOL_REWRITE torch/deepspeed/transformers）。伪装值与转译层覆盖范围是厂商
+>    **对齐**的（成套设计），正常分支都能被正确转译；
+> 3. **三类下游实证归类**：
+>    - 转译层已覆盖（triton/deepspeed/transformers）→ 兜底无害；
+>    - 未覆盖但已适配（flash_attn/apex/xformers）→ 读伪装值做**性能调优**
+>      （如 flash_attn 的 block size 选择），不影响正确性，且厂商已移植能用；
+>    - 未适配（全新框架）→ 反正挂掉，与伪装值无关。
+>
+> **结论**：D5 的"不可逆正确性错误"是理论风险而非现实缺陷。**治理代码已全部
+> 回退**（`env_pins`/`_apply_env_pins` 已删——观察项留治理代码会误导人以为在
+> 治理，且无现实案例驱动属过度设计）；**仅保留** `conformance.masquerade_profile`
+> （只读观测画像，不改行为，低成本可见性排障有用）。**不再做** env_pins / pin 后
+> 验证 / 时机断言。**触发条件**：若未来出现"读伪装值做**正确性**决策 + 未被转译层
+> 覆盖 + 已适配 XPU"的真实库，再回来按需治理（env_pins 机制那时再加）。
+>
+> **定性再校正（2026-10-23，用户观点：D5 非缺陷）**：更根本的点——**"外溢"这个
+> 定性本身不成立**。masquerade 伪装 + 下游库接管是**厂商栈的正确职责**，KL3 栈已
+> 主动接管下游库（triton jit→noop、`driver.active→mock(cuda)`、SYMBOL_REWRITE
+> torch/deepspeed/transformers、xpu_fla 重定向）。`is_available`/`get_device_capability`
+> 等接口本就是**每个硬件要回答的**，KL3 的伪装回答是刻意提供的 CUDA 兼容身份，让
+> CUDA 生态正常运作——**不存在"外溢"，也没有额外负面影响**。D5 不是缺陷。
+> `masquerade_profile` **保留**（2026-10-23 用户定）：作为纯观测画像，用途是后续
+> 检测"是否有读取伪装值但未被转译层 cover 的 case"（若出现则是新风险信号）——
+> 是观测而非治理。
 
 ---
 
@@ -492,6 +593,15 @@ class TorchCudaPlatform(TorchDeviceModuleBase):
 - warn 文案要可执行：「torch X.Y 超出实测窗口 [a,b)，TORCH_API 的签名契约（G12/G13/G15 类）未在此版本验证，
   请跑 `check_bindings()` 确认」；
 - `TORCH_API` 旁注明「实测通过的 torch 版本」，与 `bind_targets.py` 的 `version_window` 同形态（字符串即可，不建版本引擎）。
+
+> **修复实录（2026-10-22，已落地）**：采纳落地建议但**收窄窗口**——
+> `PlatformBase.torch_range = ("2.9", "2.10")`（当前只实测支持 torch 2.9.x），
+> 激活期 `_warn_torch_range` 比对，**warn 不 block**（真闸门是 admission/
+> conformance，版本只是实测覆盖提示；超窗告警文案指向 `check_bindings()`）。
+>
+> **跨版本策略（决策）**：后续优先做**跨版本并集接口**处理，对只出现在某些
+> 版本的接口加**版本管理**——**不为每个版本单独做一份支持**（避免 N 份实现的
+> 维护爆炸）。版本窗口定位是"实测覆盖提示"，不是能力矩阵。
 
 ---
 
@@ -581,6 +691,36 @@ def empty_cache(self):
    注意 `@abstractmethod` 的真实失败点是**实例化期**（不是编译期），别让它产生「静态过了就安全」的错觉——
    abstract 保证接口存在，conformance 保证语义正确，两者不可替代。
 
+> **决策修正（2026-10-22）：不需要第三档 no-op，两档即可**。本节原判断"缺 no-op
+> 降级档"被推翻。
+>
+> **接口档位设计原则（用户决策，逐条整理）**：
+> 1. **每个接口理论上都是被需要的**（会被调用）——档位区分的不是"需不需要"，
+>    而是"**实现时机**与**未实现时的语义**"；
+> 2. **MANDATORY（`@abstractmethod`）**：通用接口，新硬件**必须实现**——没有它
+>    进程无法工作（`current_device`/`set_device`/`synchronize`/`is_available`/
+>    `device_count`），abstract 约束的就是这层；
+> 3. **OPTIONAL-RAISE（默认 raise unimplemented）**：某些 case 下必要的功能，
+>    **遇到时才去实现**——未实现即能力缺失报错，调用方据此绕行（`if supports():`
+>    或 try/except）；
+> 4. **无基类 no-op 档**："某接口不做事也对"是**错误表述**——接口被调用就有
+>    预期效果（`empty_cache` = sync + 清理 reserved 内存），不做事就是没达成
+>    预期。**某硬件的某接口做不到，是该硬件的行为，不是接口本身的行为**，
+>    不该放基类。
+>
+> **正确分层（接口语义 vs 硬件能力分离）**：
+> - 基类表达**接口语义**（该做什么）：未实现即 raise；
+> - 平台 adapter 表达**硬件能力**（本硬件能做到什么）：做不到则**自己覆写**
+>   no-op/降级 + 留证——masquerade adapter 本就是这模式（厂商栈无 `empty_cache`
+>   时自己静默转发，见 `_device_module.py`）。DeepSpeed 先例同理：`empty_cache()
+>   =return` 在**平台类 `cpu_accelerator`**，基类 `abstract_accelerator` 用
+>   `@abstractmethod` 约束必需能力、**并不默认 no-op**。
+>
+> **已回退的 no-op 冗余**：基类 `NOOP_DEFAULT` 哨兵 + `empty_cache` no-op 默认
+> → 改回 raise；`init` docstring"幂等 no-op 语义"→"幂等，重复调用无副作用"
+> （避免与 no-op 档混淆）。三档表修正为**两档**。新硬件接入：能做到的正常实现，
+> 做不到的由该硬件 adapter 显式覆写并留证。
+
 ---
 
 ## 5. D 类：可观测性与验证覆盖
@@ -611,6 +751,16 @@ x = torch.randn(4, w.numel(), dtype=torch.float32, ...)   # 固定形状
 `probe_input` 增一个可选的边界输入集（典型 + 空张量 + 单元素 + 该语义已知的敏感维度），
 对账与自检遍历该集合、取最差值判定。成本是启动期多几次小前向（`_self_check` 当前成本注释为
 「每模块至多两次小输入前向」，扩到 4-5 次仍在同一量级）。
+
+> **修复实录（2026-10-23，分层澄清后落地）**：D9 的关键是**分层**——provider 的
+> 兜底校验（`_admit_native_vs_orig` 对账 / `_self_check` / 门禁 `verify_impl`）用
+> **单点、轻量**（只确认"这次接管安全"，不可能全面）；**更全的边界/泛化校验归
+> witness 层**——新增 `witness/diagnostics.verify_provider_generalization`，用边界
+> 输入集（特征维×2/÷2 + 批次维空/单，KLX 空张量教训）全面校验问题多的 case，
+> **手动或 e2e 测试触发**（不放激活期/热路径）。边界变体生成从 fn_binding 兜底
+> 对账移到 witness 层（`_edge_input_variants`），兜底对账恢复单点。空张量校验
+> 特判"不崩+形状一致"（无数值可比）。单测 `test_provider_admit.py`（边界变体 +
+> native 空张量正确 + 泛化校验 5 边界全过）。
 
 ---
 
@@ -647,6 +797,20 @@ TT 的核心价值主张原文是：
 3. **未纳管但被实际调用的符号**：可用一次性的 `torch.cuda.__getattr__` 代理或 `sys.addaudithook` 采样
    （只在诊断模式开启，避免热路径成本）。
 
+> **修复实录（2026-10-22，已落地）**：
+> - `surface.coverage_profile()`：符号面三态画像（纳管/占位/豁免 + 闭合 + 调用观测）；
+> - `surface.unconverged_components()`：在场不可收束组件检测（`sys.modules` 检测
+>   transformer_engine/apex/flash_attn/deepspeed/triton/tilelang，注明"硬件交互不经 TT"）；
+> - bootstrap 激活末尾接入：打印收束画像 + 不可收束组件清单 + 记 provenance
+>   `coverage` 事件（含 unconverged 清单）；
+> - 实测激活输出：`符号面 57纳管/22占位/43豁免（闭合=True）` + `在场 5 组件`；
+> - 单测 `test_d10_convergence_profile_observability`。
+>
+> **诚实边界**：call_trace 只统计**经门面**的调用，未纳管符号的绕过调用在架构上
+> 无法观测（除非包装全部符号——"完整模拟 torch.cuda"的非目标）。本修复让"面"的
+> 状态与在场盲区组件可见，不假装能观测绕过路径的调用次数。第 ③ 条（未纳管但被
+> 调用符号的诊断采样）暂未做——热路径成本，诊断模式再议。
+
 ---
 
 ### D8 · 热路径税无量化基线 【P2 · 方法论缺口，非性能问题】
@@ -680,6 +844,14 @@ TT 的核心价值主张原文是：
 ① 门面转发开销（本文数据可作首个基线值）；② `_call_sig` + dispatcher 分发开销 vs 小 shape kernel 耗时占比。
 若将来某项超阈值，再考虑优化手段（如 FlagOS 式的模块级 `cur_platform` 缓存 `[他方]`）——**现在不要优化**。
 
+> **修复实录（2026-10-23，已闭环）**：两条 micro-bench 基线落地（`witness/diagnostics`）：
+> - ① `measure_forward_tax`：门面转发三层开销（本体/handle/门面），实测税率 1.74x；
+> - ② `measure_dispatch_tax`：provider 函数级通道分发开销（`dispatcher.call` 含
+>   `_call_sig` 构造 + 门禁缓存查找 + 分发）vs 小 shape kernel——实测（D=256
+>   rmsnorm）call 77.7us vs kernel 68us，**分发税 14%**，印证"小 shape 算子 Python
+>   开销与 kernel 同量级"的警惕。两条均**只作基线（防劣化），不优化**。
+> 单测 `test_d8_measure_forward_tax` + `test_d8_measure_dispatch_tax`。
+
 ---
 
 ## 6. E 类：健壮性与扩展性
@@ -709,6 +881,13 @@ for spec in self.registry.auto_detectable():
 
 **最小落地建议**（约 5 行）：detect 调用包 try/except，异常记为 `(False, f"detect 异常: {type(e).__name__}: {e}")`
 并照常打印——探测失败不该阻断其他平台的探测，且异常信息本身就是有价值的证据。
+
+> **修复实录（2026-10-23，已落地）**：detect 调用包 try/except——异常**记 provenance
+> `detect/error` 事件**（持久留痕，不只控制台一闪而过——事后可查"这次激活哪些平台
+> 探测失败了"）+ 打印 + 跳过该平台（continue），不阻断其他平台探测。**select 逃生
+> 通道可达**（select 不经 detect，auto_activate 不再崩在 detect）。单测
+> `test_d12_detect_exception_isolation`（mock 异常 spec + absent spec，确认异常隔离
+> 不穿透、其他平台照常探测、provenance 留痕）。
 
 ---
 

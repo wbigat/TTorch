@@ -25,6 +25,7 @@ PlatformHandle 对外承担——manager 是管理者，不重新暴露平台接
 """
 from ttorch.platform.platform_handle import PlatformHandle, TTPlatformError
 from ttorch.platform.registry import PlatformRegistry
+from ttorch.witness import provenance
 
 __all__ = [
     # 类（可独立实例化）
@@ -47,6 +48,24 @@ def _ver_tuple(s):
         return tuple(int(x) for x in core.split("."))
     except ValueError as e:
         raise TTPlatformError("sdk_version", f"无法解析版本号: {s!r}") from e
+
+
+def _warn_torch_range(name, candidate):
+    """D6：torch **自身**版本窗口检查——**warn 不 block**。
+
+    与 sdk 协商的本质区别：sdk 版本不匹配意味着实现依赖的厂商库版本不对，是硬
+    约束（raise）；torch 版本只说明"此版本是否在实测覆盖范围内"。TT 有
+    admission/conformance 作为**真闸门**——签名契约（G12/G13/G15）会实测验证，
+    超出窗口不代表不可用，故只告警（同 KLX/xExt：版本漂移只告警不阻断）。
+    告警文案要可执行（指明跑 check_bindings() 确认），而非笼统提示。
+    """
+    import torch
+    lo, hi = _ver_tuple(candidate.torch_range[0]), _ver_tuple(candidate.torch_range[1])
+    cur = _ver_tuple(torch.__version__)  # _ver_tuple 已剥 "+cu129" 等 local 后缀
+    if not lo <= cur < hi:
+        print(f"[platform] WARN torch 版本: {torch.__version__} 不在 {name} 实测窗口 "
+              f"[{candidate.torch_range[0]}, {candidate.torch_range[1]}) 内——"
+              f"G12/G13/G15 类签名契约未在此版本验证，请跑 check_bindings() 确认")
 
 
 class PlatformManager:
@@ -88,7 +107,20 @@ class PlatformManager:
         """
         hits = {}  # name -> evidence
         for spec in self.registry.auto_detectable():
-            ok, evidence = spec.detect()  # 只看不初始化
+            # D12：探测异常隔离——单个平台的 detect 抛异常不应让整个探测链崩掉。
+            # 真实环境里厂商包未装/版本不兼容/符号缺失都可能让 detect 抛受控以外
+            # 的异常，此前会直接失败且看不出是哪个平台的问题。现在失败即跳过该
+            # 平台并打印留证，其余平台照常探测；若最终无命中，由下方统一报错。
+            try:
+                ok, evidence = spec.detect()  # 只看不初始化
+            except Exception as e:
+                print(f"[platform] detect {spec.name}: SKIP 探测异常 "
+                      f"{type(e).__name__}: {e}")
+                # 持久留痕（证据先于声明）：detect 失败是激活期重要事件——事后可查
+                # "这次激活哪些平台探测失败了"，不只控制台一闪而过。
+                provenance.record(provenance.LAYER_PLATFORM, "detect", spec.name,
+                                  "error", error=f"{type(e).__name__}: {e}")
+                continue
             print(f"[platform] detect {spec.name}: "
                   f"{'present' if ok else 'absent'} ({evidence})")
             if ok:
@@ -129,6 +161,8 @@ class PlatformManager:
                 "sdk_version",
                 f"{name} 实现支持 SDK [{candidate.sdk_range[0]}, {candidate.sdk_range[1]})，"
                 f"检测到 {candidate.sdk_version()}")
+
+        _warn_torch_range(name, candidate)
 
         candidate.initialize()
 

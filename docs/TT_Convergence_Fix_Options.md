@@ -14,19 +14,19 @@
 | # | 缺陷 | 核实结论 | 关键证据（本机） |
 |---|---|---|---|
 | D1 | 辅助进程重跑激活流水线 | **属实（已修）** | spawn 重跑 conformance；fork 继承。已按两档+分类修复 |
-| D2 | 跨 rank 选择无一致性约束 | **属实** | rank0 签名 `cuda:0` / rank1 `cuda:1` → **缓存键天然不同** |
+| D2 | 跨 rank 选择无一致性约束 | **属实（已修-A）** | device 收敛为 `device.type`，卡序号不入键 → 各 rank 同一缓存键 |
 | D3 | 半激活态可达且进程继续 | **属实（已修）** | 第 3 条绑定失败 → `is_active=False` 但 6 符号已改写。已回滚修复 |
-| D4 | 契约面无闭合判据 | **属实** | 142 公开符号 / 纳管 18 = **12.7%**；12 个高危符号**全部**未纳管 |
-| D5 | 伪装信号外溢无治理 | **属实** | DeepSpeed `cuda_accelerator.py:204/215` 直接消费 `is_bf16_supported`/`get_device_capability`；TT 无 pin 机制 |
-| D6 | 缺 torch 版本窗口 | **属实** | `TORCH_RANGE` 不存在；本机 torch=2.9.0+cu129 |
-| D7 | 状态查询口径未验 | **属实** | `mem_query_realtime` 判据为量级（0.9×）；`mem_info_consistency` 容忍 1 GiB |
-| D8 | 热路径税无基线 | **属实**（非性能问题） | 实测 handle→门面净增 **426 ns**（CPU 环境文献值 139 ns，量级一致） |
-| D9 | 对账输入单点 | **属实** | `_admit_native_vs_orig` 调 `probe_input` 1 次；`_self_check` 固定 `randn(4, ...)` |
-| D10 | 收束覆盖率不可见 | **属实** | 无收束画像接口；call_trace 只统计经门面的调用 |
+| D4 | 契约面无闭合判据 | **属实（已修）** | surface 三态分类 + Denied 占位 + Managed 接管，122 符号闭合判据 |
+| D5 | 伪装信号外溢无治理 | **修正（非缺陷）** | KL3 栈已接管下游库，伪装值是刻意的 CUDA 兼容身份，不存在外溢/负面影响；masquerade_profile 留观测（检测未 cover 的读取 case） |
+| D6 | 缺 torch 版本窗口 | **属实（已修）** | `torch_range=("2.9","2.10")`，warn 不 block |
+| D7 | 状态查询口径未验 | **属实（已闭环）** | `mem_query_realtime` 口径 + `mem_reset_semantics` 峰值/reset + 单测 |
+| D8 | 热路径税无基线 | **属实（已闭环）** | `measure_forward_tax`（门面转发 1.74x）+ `measure_dispatch_tax`（分发税 14%）双基线 + 单测 |
+| D9 | 对账输入单点 | **属实（已修，分层）** | 兜底对账恢复单点（轻量）；witness 泛化校验 `verify_provider_generalization`（边界集，手动/e2e 触发）+ 单测 |
+| D10 | 收束覆盖率不可见 | **属实（已修）** | `coverage_profile` + `unconverged_components` 收束画像，激活末尾接入 |
 | D11 | provenance 无 pid/rank | **属实（已修）** | 已加 pid/rank + fork_reset |
-| D12 | detect 无异常隔离 | **属实** | `PlatformManager.auto_activate` 源码**无 try** |
-| D13 | 缺 no-op 降级档 | **属实** | `PlatformBase.empty_cache` docstring 写"可 no-op"，实现却 `raise` |
-| D14 | wrap_model 无并行包装检测 | **属实** | `wrap_model` 源码无 DataParallel/DistributedDataParallel 判据 |
+| D12 | detect 无异常隔离 | **属实（已修）** | detect 包 try/except 隔离 + 单测 |
+| D13 | 接口档位语义 | **修正（不需 no-op 档）** | 基类 `empty_cache` 改回 raise；no-op 归平台 adapter 实现选择（DeepSpeed 先例原引用误读已纠正） |
+| D14 | wrap_model 时机契约 | **已修（延迟自检）** | 自检延迟到首次 __call__，并行包装后可替换 |
 
 ---
 
@@ -117,6 +117,28 @@
 3. **时机断言**：pin 必须早于下游库 import（TT 的 `.pth` 天然满足），但应显式检查 `sys.modules` 若已有 tilelang/triton 则告警；
 4. **学习 torch_xmlir 的"代码级 patch target"**（备选）：对可控的下游库，直接 patch 其 target 决策比 env pin 更稳——但这是厂商栈的职责，TT 作为第二层**优先用 pin，不重复 patch**。
 
+> **处置结论（2026-10-22，实证后修正：降级为观察项，不再代码治理）**：
+> 三层实证修正了本节的风险假设（详见 Gap 文档 D5 节修正实录）——伪装值是厂商
+> 精心选择的"CUDA 兼容身份"（platform 屏蔽差异的正确成果），转译层兜底分支执行，
+> 已适配下游读伪装值仅做性能调优（flash_attn block size），未适配的反正挂掉：
+> "不可逆正确性错误"无现实案例。
+> **代码处置（2026-10-22 二次修正）**：D5 既是观察项，**治理代码全部回退**——
+> `PlatformBase.env_pins` + `_apply_env_pins` 已删（观察项留治理代码会误导人
+> 以为在治理，且无现实案例驱动属过度设计）。
+> **保留**：`masquerade_profile`——它是 conformance 的**只读观测画像**（读伪装值
+> 记 provenance，不改任何行为），属可见性而非治理，不误导。
+> **不再做**：pin 后验证 / 时机断言 / env_pins（均无现实案例驱动）。
+> **触发条件**：出现"读伪装值做正确性决策 + 未被转译层覆盖 + 已适配 XPU"的
+> 真实库时再治理（env_pins 机制那时按需再加）。
+>
+> **定性再校正（2026-10-23，用户观点：D5 非缺陷）**：进一步——"外溢"定性本身
+> 不成立。masquerade 伪装 + 下游库接管是**厂商栈的正确职责**（KL3 栈已接管
+> triton/deepspeed/transformers 等下游库），`is_available`/`get_device_capability`
+> 等接口本就是每个硬件要回答的，伪装回答是刻意的 CUDA 兼容身份，让 CUDA 生态
+> 正常运作——**不存在外溢/负面影响**。D5 不是缺陷。masquerade_profile 保留为
+> 观测画像（检测是否有读取伪装值但未被 cover 的 case，观测而非治理）。
+> 详见 Gap 文档 D5 节定性再校正。
+
 ---
 
 ## 4. D6 · torch 版本窗口【P1】
@@ -129,6 +151,13 @@
 - FlagOS：签名兼容测试兜底。
 
 **TT 可选方案**（~15 行）：`TORCH_RANGE = ("2.6", "2.13")`（按实测校准），激活期比对，**warn 不 block**（理由同 KLX：TT 有 admission/conformance 作为真闸门）。warn 文案要可执行——"torch X.Y 超出实测窗口，G12/G13/G15 类签名契约未在此版本验证，请跑 `check_bindings()` 确认"。形态与 `bind_targets.version_window` 同款（字符串，不建版本引擎）。
+
+> **处置结论（2026-10-22，已落地 + 收窄窗口）**：
+> - `PlatformBase.torch_range = ("2.9", "2.10")`（**当前只实测支持 torch 2.9.x**），
+>   `_warn_torch_range` 激活期比对，**warn 不 block**；
+> - **跨版本策略（决策）**：后续优先做**跨版本并集接口**处理，对只出现在某些版本
+>   的接口加版本管理——**不为每个版本单独做一份支持**（区别于 symbrewrite 的
+>   "版本即代码分支"：那会维护爆炸）。版本窗口定位是"实测覆盖提示"，非能力矩阵。
 
 ---
 
@@ -163,6 +192,21 @@
 - FlagOS：全 abstract（无 no-op 档）。
 
 **TT 可选方案**（~20 行）：三档化——MANDATORY（`current_device/set_device/synchronize/is_available/device_count`）、OPTIONAL-RAISE（现状）、**OPTIONAL-NOOP（`empty_cache` 等，配 `_tt_noop_default` 哨兵）**。唯一要动的是 `supports()` 的派生逻辑需区分两档默认。MANDATORY 集合保持极小（abstract 化会让部分实现的 adapter 实例化即炸）。
+
+> **处置结论（2026-10-22 决策修正：不需要 no-op 档，两档即可）**：
+> 重新研读发现上面社区先例**引用误读**——DeepSpeed 的 `empty_cache()=return`
+> no-op 在**平台类 `cpu_accelerator`**（CPU 硬件做不到清理，该平台自己 no-op），
+> 基类 `abstract_accelerator` 用 `@abstractmethod` 约束必需能力、**并不默认 no-op**。
+> 这正是正确分层：**接口语义（基类）vs 硬件能力（平台 adapter）分离**。
+> - 基类 `empty_cache` 默认 **raise**（接口语义是清理，未实现即能力缺失报错）；
+> - 某硬件做不到 → **该硬件 adapter 覆写 no-op + 留证**（masquerade adapter 已是
+>   此模式：厂商栈无 `empty_cache` 时自己静默转发）；
+> - **已回退**基类 `NOOP_DEFAULT` 哨兵 + `empty_cache` no-op 默认 → 改回 raise。
+> 三档表修正为**两档**（MANDATORY / OPTIONAL-RAISE），**no-op 归平台 adapter 的
+> 实现选择，不是基类档位**。新硬件接入：能做到的正常实现，做不到的由该硬件
+> adapter 显式覆写（no-op 或降级）并留证。两档的完整语义定义与判别准则
+> （"每个接口都需要 / abstract 约束必须实现 / raise 是遇到才实现 / 无基类 no-op"）
+> 见 Gap 文档 D13 决策修正。
 
 ---
 

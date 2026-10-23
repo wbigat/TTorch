@@ -105,19 +105,31 @@ def _denied_impl(dotted, feature, original):
     if isinstance(original, type):
         name = original.__name__
 
-        class _DeniedType:
-            _tt_denied = True  # 标记：供 conformance 等区分"被 TT 占位"vs"平台不支持"
+        def _make_denied(base):
+            class _DeniedType(base):
+                # 继承原始类（Bug2 修复）：保持 issubclass/isinstance 关系——框架
+                # 可能做 `issubclass(x, torch.cuda.CUDAGraph)` 或类型检查，不继承
+                # 会让这些判定失真。实例化/调用仍报错（真正的使用才拦截），
+                # 类型注解求值（`X | None`）与 isinstance/issubclass 都正常。
+                _tt_denied = True  # 标记：供 conformance 等区分"被 TT 占位"vs"平台不支持"
 
-            def __init__(self, *a, **k):
-                raise TTCompatError(f"{dotted}: {msg}")
+                def __init__(self, *a, **k):
+                    raise TTCompatError(f"{dotted}: {msg}")
 
-            def __call__(self, *a, **k):  # graph 等上下文管理器类的调用形态
-                raise TTCompatError(f"{dotted}: {msg}")
+                def __call__(self, *a, **k):  # graph 等上下文管理器类的调用形态
+                    raise TTCompatError(f"{dotted}: {msg}")
+            return _DeniedType
 
-        _DeniedType.__name__ = name
-        _DeniedType.__qualname__ = name
-        _DeniedType.__module__ = original.__module__
-        return _DeniedType
+        try:
+            cls = _make_denied(original)
+        except TypeError:
+            # 个别原始类禁止继承（某些 pybind11 类型有 __init_subclass__ 限制）——
+            # 退化为不继承（仍是 type，注解可求值，只是丢 issubclass 关系）
+            cls = _make_denied(object)
+        cls.__name__ = name
+        cls.__qualname__ = name
+        cls.__module__ = original.__module__
+        return cls
     return _exception_impl(dotted, msg)
 
 

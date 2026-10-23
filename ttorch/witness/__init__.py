@@ -27,7 +27,9 @@ from ttorch.witness.provenance import (  # noqa: F401
 from ttorch.witness.bindings import check_bindings, assert_bindings_intact  # noqa: F401
 from ttorch.witness.call_trace import start_call_trace, call_trace_report  # noqa: F401
 from ttorch.witness.verify import verify_impl, measure_throughput_us  # noqa: F401
-from ttorch.witness.diagnostics import mem_reset_semantics  # noqa: F401
+from ttorch.witness.diagnostics import (  # noqa: F401
+    mem_reset_semantics, measure_forward_tax, verify_provider_generalization,
+    measure_dispatch_tax)
 
 __all__ = [
     "provenance",
@@ -36,5 +38,6 @@ __all__ = [
     "check_bindings", "assert_bindings_intact",
     "start_call_trace", "call_trace_report",
     "verify_impl", "measure_throughput_us",
-    "mem_reset_semantics",
+    "mem_reset_semantics", "measure_forward_tax", "verify_provider_generalization",
+    "measure_dispatch_tax",
 ]

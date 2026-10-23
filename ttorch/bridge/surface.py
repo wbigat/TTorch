@@ -210,6 +210,65 @@ def summary():
     }
 
 
+def coverage_profile(trace_rows=None):
+    """D10：收束覆盖率画像——契约面的收束状态 + 实际调用观测（合成可见性）。
+
+    `trace_rows`：`witness.call_trace.call_trace_report()` 的 rows（每行
+    (符号, 次数, ...)），或 None（只出静态画像）。
+
+    为什么需要它：此前"收束覆盖率不可见"——只有纳管清单，没有"实际被调用了
+    哪些、哪些是收束盲区"。本函数把三态分类与实际调用合起来：
+    - covered：被调用**且纳管**（真实收束）；
+    - managed_unused：纳管但本次运行未被调用（可能框架未走该路径）；
+    - exempt/denied：刻意穿透/显式占位（有据的决策，不是盲区）。
+
+    **诚实的边界**：call_trace 只统计**经门面**的调用，故未纳管符号的绕过调用
+    在架构上无法观测（除非包装全部符号——那是"完整模拟 torch.cuda"的非目标）。
+    本函数让"面"的状态与使用可见，不假装能观测绕过路径的调用次数。
+    """
+    closed, rows, _, drift = audit_surface()
+    managed = {n for n, st, _ in rows if st == Surface.MANAGED}
+    denied = {n for n, st, _ in rows if st == Surface.DENIED}
+    exempt = {n for n, st, _ in rows if st == Surface.EXEMPT}
+    called = {r[0]: (r[1] if len(r) > 1 else 0) for r in (trace_rows or [])}
+    covered = sorted(n for n in called if n in managed)
+    return {
+        "closed": closed, "drift": drift,
+        "managed": len(managed), "denied": len(denied), "exempt": len(exempt),
+        "called_total": len(called),
+        "covered": covered,                                   # 被调用且纳管
+        "managed_unused": sorted(n for n in managed if n not in called),
+        "coverage": (f"{len(covered)}/{len(called)}"
+                     if called else "n/a（无调用观测）"),
+        "exempt_sample": sorted(exempt)[:12],
+    }
+
+
+# 不可收束组件（C++ 扩展 / codegen）：硬件交互**不经 TT 门面**的第三方库。
+# B4 职责边界已明确"C++ 扩展不是兼容问题，是替换或拒绝的二选一"（TT 不负责管），
+# 但"在场与否"必须可观测——它们的 CUDA 调用是绕过 TT 的盲区（D10）。
+_UNCONVERGED_COMPONENTS = {
+    "transformer_engine": "TE C++ 扩展（直接 CUDA kernel，不经门面）",
+    "apex": "apex C++ 扩展（直接 CUDA kernel）",
+    "flash_attn": "flash-attn C++ 扩展（直接 CUDA kernel）",
+    "deepspeed": "DeepSpeed ops（C++ 扩展，如 fused_adam）",
+    "triton": "triton codegen（运行期编译 kernel）",
+    "tilelang": "tilelang codegen（运行期编译 kernel）",
+}
+
+
+def unconverged_components():
+    """D10：在场的不可收束组件清单（硬件交互绕过 TT 的第三方库）。
+
+    检测 `sys.modules`——已 import 的组件其硬件交互不经 TT 门面（收束盲区）。
+    返回 [(组件, 原因)]。只检测在场与否，**不试图接管**（B4 职责边界）。
+    "在场"不等于"本次实际用于硬件交互"——是保守提示，供排障时定位盲区。
+    """
+    import sys
+    return [(mod, reason) for mod, reason in _UNCONVERGED_COMPONENTS.items()
+            if mod in sys.modules]
+
+
 if __name__ == "__main__":
     import json
     s = summary()

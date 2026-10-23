@@ -152,6 +152,7 @@ def _admit_native_vs_orig(b: PerfBinding, orig):
 
     返回 True 表示允许接管。
     """
+    import torch as _torch
     from ttorch.provider import manager as _pm
     from ttorch.platform import manager as _pfm
 
@@ -161,6 +162,9 @@ def _admit_native_vs_orig(b: PerfBinding, orig):
     try:
         dev = _pfm.activation().device_spec()
         args, kw = provider.probe_input(device=dev)
+        # 兜底对账用单点（轻量，不可能全面——D9 分层澄清 2026-10-23）：本对账只负责
+        # "接管安全"的快速确认；边界/泛化校验挪 witness 层，针对问题多的 case 按需
+        # 或 e2e 触发（见 witness/diagnostics.verify_provider_generalization）。
         ref = orig(*args, **kw)
         out = provider.native(*args, **kw)
         scale = float(ref.float().abs().max()) + 1e-12

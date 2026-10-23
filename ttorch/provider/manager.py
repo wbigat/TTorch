@@ -33,6 +33,39 @@ _KIND_PRIORITY = {"reference": 0, "fused_jit": 1, "fused_aot_abo": 2,
 _RTOL = 5e-3
 _ATOL = 5e-3
 
+# --- D14：provider_wrap 的时机契约（必须在并行包装之前调用）---
+# `wrap_module` 的 `_self_check` 会**跑一次真实前向**（2026-10-23 起不再改模块
+# dtype——dtype 自适应阈值取代了 to(float32) 侵入性转换，见 spec._self_check）。
+# 在并行包装**之后**调用会与并行语义冲突：ZeRO-3 参数被 partition（forward 外
+# weight 是占位，跑前向读到空 tensor）、FSDP FlatParameter 的前向会触发 gather、
+# checkpoint wrapper 的 forward 语义不再是单次前向。真实链路当前走函数级通道
+# （fn_binding）未暴露，模块级通道接入并行框架是必踩的坑——把隐式约束变成
+# **显式拒绝**（不尝试兼容）。
+_PARALLEL_WRAPPER_CLASSES = frozenset({
+    "FullyShardedDataParallel", "FSDP", "DistributedDataParallel",
+    "DeepSpeedEngine", "CheckpointWrapper",
+})
+# 参数上的分片/占位标记
+_SHARDED_PARAM_ATTRS = ("_is_sharded", "ds_status", "_flat_param")
+
+
+def parallel_wrapper_violation(model):
+    """D14：模型是否已被并行包装——`wrap_model` 的前置检查。
+
+    返回 (证据, 原因) 或 None（未命中，可继续 wrap）。
+    """
+    for module in model.modules():
+        cls = type(module).__name__
+        if cls in _PARALLEL_WRAPPER_CLASSES:
+            return (cls, "类名命中并行包装")
+    named_params = getattr(model, "named_parameters", None)
+    if named_params is not None:
+        for _, param in named_params():
+            for attr in _SHARDED_PARAM_ATTRS:
+                if hasattr(param, attr):
+                    return (f"param.{attr}", "参数带分片/占位标记")
+    return None
+
 
 __all__ = [
     "ProviderManager",
@@ -157,7 +190,20 @@ class ProviderManager:
 
         匹配规则：模块类名 endswith 某 provider 的 module_names。weight 在
         调用期现读（见 Provider.wrap_module），故 .to(device)/训练更新后仍正确。
+
+        **延迟自检（D14 时机契约消解，2026-10-23）**：替换是零侵入的（挂成员 +
+        改 forward，不跑前向、不改 dtype），故可在并行包装（FSDP/DDP/ZeRO）
+        **之前或之后**调用——精度兜底延迟到首次 __call__（经 __call__ 流程，
+        all-gather 后 weight 完整）。检测到并行包装时记 provenance（供排障），
+        不再拒绝——此前 wrap 期自检的侵入性才是冲突源，非 forward 替换本身。
         """
+        violation = parallel_wrapper_violation(model)
+        if violation:
+            # 替换在并行包装后安全（延迟自检兜底），仅记录供排障，不再拒绝。
+            provenance.record(provenance.LAYER_PROVIDER, "wrap",
+                              type(model).__name__, "wrap_after_parallel",
+                              detail=f"检测到并行包装（{violation[0]}，{violation[1]}），"
+                                     f"精度兜底延迟到首次 __call__")
         providers = [p for p in self.registry.all() if p.module_names]
         n = 0
         wrapped = []
@@ -172,7 +218,9 @@ class ProviderManager:
                     except TypeError:
                         break  # 无 weight Parameter 等，跳过该模块
                     if new_forward is None:
-                        break  # 数值自检未过：不接管（provenance 已记），模块保持原样
+                        continue  # 本 provider 语义与模块不符（self_check 精度兜底未过）：
+                                  # 试下一个 provider——一对一语义分流，不同变体的
+                                  # provider（如 ZcgRMSNormProvider）可能匹配该模块。
                     module.forward = new_forward
                     module._tt_provider_wrapped = True
                     wrapped.append(f"{cls_name}->{p.semantic}")
