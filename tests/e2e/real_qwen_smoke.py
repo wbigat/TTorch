@@ -113,7 +113,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--ckpt", default="/tmp/tt_qwen_ckpt.pt")
     ap.add_argument("--no-provider", action="store_true",
-                    help="禁用 provider 自动使能（默认开启：RMSNorm 路由到厂商融合）")
+                    help="禁用 provider 使能（默认开启：provider_wrap 把 RMSNorm "
+                         "路由到厂商融合）")
     args = ap.parse_args()
 
     print(f"[env] torch={torch.__version__}")
@@ -173,14 +174,20 @@ def main():
         tt.finalize()
         return 0
 
-    print(f"\n== 3. 加载真实 Qwen（device={dev} dtype={dtype}）==")
+    # 厂商 patch 清场已由 activate() 按环境变量 TT_RESTORE_VENDOR 统一执行
+    # （perf/all；不设则 xmlir patch 在场）——此处只读口径供判定/展示。
+    _restore_scope = os.environ.get("TT_RESTORE_VENDOR", "none")
+
+    print(f"\n== 3. 加载真实 Qwen（device={dev} dtype={dtype}"
+          f"{'' if _restore_scope == 'none' else f'，清场={_restore_scope}'}）==")
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=dtype, attn_implementation="eager").to(dev)
     print(f"  {type(model).__name__} 参数量="
           f"{sum(p.numel() for p in model.parameters()) / 1e9:.3f}B")
 
-    # provider 自动使能：把模型的 RMSNorm 模块路由到 provider（自动发现+选择厂商
-    # 融合）。A-B 计时不更新权重（只前向+反向），不污染后续训练轨迹。
+    # provider 使能（手动主路径）：发现并 patch 模型的 RMSNorm 模块——时机自由
+    # （D14 延迟自检后并行包装前后均可）。A-B 计时不更新权重（只前向+反向），
+    # 不污染后续训练轨迹。
     if not args.no_provider:
         n_wrapped = tt.provider_wrap(model)
         from ttorch.provider import manager as _pm
@@ -190,7 +197,7 @@ def main():
         _pm.set_bypass(False)  # vendor：provider 路由到 torch.ops.custom_ops AOT kernel
         _time_fwd_bwd(model, batches, dev, 3)  # warmup（首次前向触发自动选择+门禁）
         t_vendor = _time_fwd_bwd(model, batches, dev, 6)
-        print(f"  provider 自动使能: patch {n_wrapped} 个 RMSNorm 模块；"
+        print(f"  provider 使能: patch {n_wrapped} 个 RMSNorm 模块；"
               f"整网前向+反向 {t_base*1e3:.1f} -> {t_vendor*1e3:.1f} ms "
               f"({t_base/t_vendor:.2f}x)")
     try:

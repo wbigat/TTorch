@@ -1,8 +1,10 @@
 """RMSNorm provider 的整网自动使能 + 性能验证（KL3 / xpu-masquerade，Qwen2 SFT）。
 
-全程走自动化路径，演示"自动注册 -> 自动生效 -> 自动选择"：
+全程走自动化路径，演示"自动注册 -> 手动 wrap -> 自动选择"：
   tt.activate()            自动注册全部 provider + 接线平台（无需手动 register）
-  tt.provider_wrap(model)  自动发现模型里的 RMSNorm 模块并 patch（自动生效）
+  tt.provider_wrap(model)  自动发现模型里的 RMSNorm 模块并 patch（手动主路径，
+                           时机自由；swift/megatron 框架路径可用
+                           TT_PROVIDER_AUTO_WRAP=1 的建模入口自动包装替代）
   首次前向                 按 auto_detect 的平台自动选 impl（自动选择，惰性门禁）
 
 性能对比（同权重、同数据）：
@@ -11,7 +13,9 @@
   kill switch   关掉厂商 impl -> provider 内回退 native
 
 运行：  cd examples/provider-demo && python demo_e2e.py
+        TT_RESTORE_VENDOR=perf python demo_e2e.py   # 先关厂商性能 patch 再测（真实收益口径）
 """
+import os
 import sys
 import time
 
@@ -51,15 +55,17 @@ def main():
         checks.append(ok)
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"：{detail}" if detail else ""))
 
-    # 自动注册（tt.activate 内）+ 接线
+    # 自动注册（tt.activate 内）+ 接线；厂商性能 patch 清场由 activate 按
+    # TT_RESTORE_VENDOR 环境变量统一执行（perf/all；不设=xmlir 基线）。
+    _restore_scope = os.environ.get("TT_RESTORE_VENDOR", "none")
     tt.activate()
     print(f"== 0. 平台激活 + provider 自动注册 ==\n  platform={tt.active().device_name}")
 
     model = _build_model()
-    # 自动生效：发现 + patch 全部 RMSNorm 模块
+    # 手动主路径：发现并 patch 全部 RMSNorm 模块（时机自由，D14 后任意时机安全）
     n_wrapped = tt.provider_wrap(model)
     print(f"  provider_wrap: patch {n_wrapped} 个 RMSNorm 模块（自动发现）")
-    check("自动 wrap 发现并 patch 了 RMSNorm 模块", n_wrapped > 0, f"{n_wrapped} 个")
+    check("provider_wrap 发现并 patch 了 RMSNorm 模块", n_wrapped > 0, f"{n_wrapped} 个")
 
     torch.manual_seed(0)
     B, L, V = 4, 512, model.config.vocab_size
@@ -102,14 +108,19 @@ def main():
     check("自动选择绑定到厂商融合",
           any(k.startswith("rmsnorm/compute") and "vendor-fused:rmsnorm" in v
               for k, v in bindings_vendor.items()))
-    # 口径修正（2026-10-15）：KL3 上 torch_xmlir 已把 RMSNorm 换成厂商融合实现，
-    # baseline（bypass）本身就是融合态；TT vendor 是同源 kernel + 一层分发——
-    # 结构性持平（~1x），"必须有提升"在该平台不成立。提升预期只适用于厂商未
-    # 覆盖的硬件/算子（docs/TT_KLX_Plugin_Absorption.md）。等价口径对齐
-    # demo_replace_torchxmlir（0.85~1.15x），此处收得更紧（同源 kernel）。
-    check("整网端到端等价（vendor ≈ baseline，0.95~1.05x；厂商已融合平台上预期持平）",
-          0.95 < speedup < 1.05,
-          f"{t_base*1e3:.3f} -> {t_vendor*1e3:.3f} ms ({speedup:.3f}x)")
+    # 口径（2026-10-26 随清场切换）：不清场时 KL3 上 torch_xmlir 已把 RMSNorm
+    # 换成厂商融合实现，baseline（bypass）本身就是融合态；TT vendor 是同源
+    # kernel + 一层分发——结构性持平（~1x）。清场（TT_RESTORE_VENDOR=perf/all）
+    # 后 baseline 回到未融合分解，vendor 必须有真实收益（>1.05x）——这才是
+    # "性能优化归 TT" 口径下的验收。
+    if _restore_scope != "none":
+        check("整网端到端有真实收益（清场口径：baseline=未融合分解，>1.05x）",
+              speedup > 1.05,
+              f"{t_base*1e3:.3f} -> {t_vendor*1e3:.3f} ms ({speedup:.3f}x)")
+    else:
+        check("整网端到端等价（vendor ≈ baseline，0.95~1.05x；厂商已融合平台上预期持平）",
+              0.95 < speedup < 1.05,
+              f"{t_base*1e3:.3f} -> {t_vendor*1e3:.3f} ms ({speedup:.3f}x)")
     check("替换后前向 loss 与 baseline 一致（bf16 数值对齐）",
           abs(loss_b0 - loss_v0) < 0.01, f"baseline={loss_b0:.5f} vendor={loss_v0:.5f}")
     check("kill switch 回退 native 整网可用", t_native > 0)

@@ -118,6 +118,30 @@ def register_binding(b: PerfBinding):
     return b
 
 
+def bind_loaded(b: PerfBinding):
+    """目标模块已在场时立即绑定（activate 之后才注册的补绑路径——import hook
+    只兜未来加载的模块）。返回 True=已绑 / False=未绑（模块未到场或被 skip）。"""
+    if b.module not in sys.modules:
+        return False
+    _bind_one(b)
+    return b.dotted not in _SKIPPED
+
+
+def unregister(dotted):
+    """按 dotted 移除一条绑定：已绑的恢复（unbind），并清注册/状态（auto_wrap
+    .disable() 用；区别于 uninstall()——那是全量拆卸，不清 _BINDINGS 注册关系
+    以外的选择性恢复）。"""
+    b = next((x for x in _BINDINGS if x.dotted == dotted), None)
+    if b is None:
+        return
+    module = sys.modules.get(b.module)
+    if module is not None:
+        _rebind.unbind(module, b.attr, owner="provider")
+    _BINDINGS.remove(b)
+    _SKIPPED.pop(dotted, None)
+    _TRIED.discard(dotted)
+
+
 # ----------------------------------------------------------------------
 # 绑定执行（机制：装 dispatcher + 留痕 + 扫尾 + provenance）
 # ----------------------------------------------------------------------

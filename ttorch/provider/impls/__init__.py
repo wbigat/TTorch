@@ -15,9 +15,17 @@ SEMANTICS = ("rmsnorm", "swiglu", "bias_swiglu", "rope_bshd")
 
 
 def build_all():
-    """构建全部已知模块语义的 Provider（自动注册的来源）。"""
+    """构建全部已知模块语义的 Provider（自动注册的来源）。
+
+    一个语义包可返回单个 Provider 或列表（一变体一 provider，如 rmsnorm 的
+    标准 + zcg）——列表在此扁平化。
+    """
     providers = []
     for sem in SEMANTICS:
         mod = importlib.import_module(f"ttorch.provider.impls.{sem}")
-        providers.append(mod.build_provider())
+        built = mod.build_provider()
+        if isinstance(built, (list, tuple)):
+            providers.extend(built)
+        else:
+            providers.append(built)
     return providers
