@@ -23,7 +23,8 @@ from ttorch.bridge import bootstrap as _bootstrap
 from ttorch.platform.platform_handle import TTPlatformError  # noqa: F401  # 再导出
 
 __all__ = ["activate", "active", "is_active", "assert_healthy", "device_spec",
-           "finalize", "provider_wrap", "check_bindings", "assert_bindings_intact",
+           "finalize", "provider_wrap", "provider_auto_wrap",
+           "restore_vendor_symbols", "check_bindings", "assert_bindings_intact",
            "start_call_trace", "call_trace_report", "TTPlatformError",
            "FRAMEWORK_PACKAGES"]
 
@@ -43,6 +44,17 @@ def activate(platform="auto", sweep_packages=None, skip_conformance=False):
     # provider 自动注册 + 接线（平台已激活）。惰性 import 保持 import ttorch 轻。
     from ttorch.provider import manager as _provider_mgr
     _provider_mgr.activate()
+    # 厂商性能 patch 清场（启动期口径开关）：TT_RESTORE_VENDOR=perf/all 时恢复
+    # torch_xmlir 对 transformers 建模类的性能符号替换——baseline 回到社区原生
+    # 分解，用于 TT vs xmlir 的性能对比；不设则 xmlir patch 在场（xmlir 基线）。
+    # 派生进程（skip_conformance，DataLoader worker 等）跳过：不建模不训练。
+    import os
+    _rv = os.environ.get("TT_RESTORE_VENDOR", "none")
+    if _rv != "none" and not skip_conformance:
+        from ttorch.provider import vendor_patch
+        restored, skipped = vendor_patch.restore(_rv)
+        print(f"[tt] vendor_patch 清场（TT_RESTORE_VENDOR={_rv}）："
+              f"恢复 {len(restored)} 个性能符号，跳过 {len(skipped)} 个", flush=True)
     # 通道 B：框架性能符号的后置绑定——清单已由 provider.activate() 注册，
     # 此时装 import 钩子（框架在本进程大多尚未 import）。机制在 provider 层
     # （性能替换的执行归 provider，bridge 只管功能域的 torch.cuda 收束）。
@@ -73,14 +85,45 @@ def assert_healthy():
 
 
 def provider_wrap(model):
-    """自动发现并 patch 模型里匹配已注册 provider 的模块（自动生效）。
+    """自动发现并 patch 模型里匹配已注册 provider 的模块（主路径，手动触发）。
 
     在模型建好（from_pretrained / 搬到设备）之后调用一次：模型里的
     RMSNorm/RoPE 等模块被路由到对应 provider，首次前向时按平台自动选实现。
-    返回 patch 的模块数。
+    返回 patch 的模块数。时机自由（D14 延迟自检后并行包装前后均可）。
+
+    swift/megatron 框架路径可改用 auto-wrap（`TT_PROVIDER_AUTO_WRAP=1` 或
+    `tt.provider_auto_wrap(True)`）：建模入口返回后自动调本函数，免逐一手动。
     """
     from ttorch.provider import manager as _provider_mgr
     return _provider_mgr.wrap_model(model)
+
+
+def provider_auto_wrap(enable=True):
+    """auto-wrap 开关：框架建模入口的定点包装（swift/megatron 路径的模型构建
+    后自动 provider_wrap）。
+
+    默认关（手动 provider_wrap 为主路径）；两种使能方式：环境变量
+    `TT_PROVIDER_AUTO_WRAP=1`（activate 时读取，部署侧）或本函数显式调用
+    （代码侧，覆盖环境变量默认值）。enable=False 摘除全部建模入口包装。
+    机制详见 provider/auto_wrap.py。
+    """
+    from ttorch.provider import auto_wrap
+    if enable:
+        auto_wrap.enable()
+    else:
+        auto_wrap.disable()
+
+
+def restore_vendor_symbols(scope="perf"):
+    """恢复厂商栈（torch_xmlir）的符号替换 patch（性能优化职责归 TT 的清场）。
+
+    scope="perf"（默认）：只恢复 TT provider 接管语义的性能符号（RMSNorm/RoPE），
+    框架对接类 patch 保留；scope="all"：一键全关（测试 TT 整网独立性用）。
+    **时序**：框架 import 后、模型构建前调用（厂商 patch 在目标模块 import
+    后才生效）。返回 (restored, skipped)。详见 provider/vendor_patch.py。
+    """
+    from ttorch.provider import vendor_patch
+    return vendor_patch.restore(scope)
 
 
 def active():

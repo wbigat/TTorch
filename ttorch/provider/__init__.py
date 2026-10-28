@@ -9,6 +9,8 @@ platform manager 的激活平台名（attach_platform 注入），绝不碰 cuda
                 provider 内、面向某平台的高性能实现）
 - registry.py   ProviderRegistry（按 semantic 注册第一层 Provider）
 - manager.py    ProviderManager（门禁/选择/分发/开关）+ 进程级单例
+- auto_wrap.py  框架建模入口的定点包装（TT_PROVIDER_AUTO_WRAP=1 门控；
+                建模返回后自动 provider_wrap，复用 fn_binding 通道）
 - impls/        各模块语义的实现集合（一种语义一个文件夹，内含 Provider 类型
                 + native + 各平台 ProviderImpl）
 

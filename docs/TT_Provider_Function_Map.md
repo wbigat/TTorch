@@ -167,8 +167,31 @@ ttorch/provider/
 | 段 | 时机 | 入口 |
 |---|---|---|
 | 自动注册 | `ttorch.activate()` 时 | `provider.activate()` 注册全部已知 provider + 接线平台 |
-| 自动生效 | 模型建好后 | `ttorch.provider_wrap(model)` 按 `module_names` 自动发现并 patch |
+| 生效 | 模型建好后 | **手动主路径**：`ttorch.provider_wrap(model)` 按 `module_names` 自动发现并 patch（时机自由，D14 后并行包装前后均可）。**框架路径免手动**：`TT_PROVIDER_AUTO_WRAP=1` 时 auto-wrap（`provider/auto_wrap.py`）定点包装框架建模入口（如 `mcore_bridge.get_mcore_model`），建模返回后自动调 provider_wrap——与手动同一代码路径，wrap 时终端打印可见 |
 | 自动选择 | 首次前向 | 惰性 `select()`：platform 过滤 + 三级门禁 + kind 优先级，写绑定缓存 |
+
+> auto-wrap 形态定案（2026-10-28）：**定点包装框架建模入口**，废除此前的
+> `Module._call_impl` 全局 patch——后者有热路径开销（+2.7µs/模块调用）、
+> torch 私有方法侵入（版本漂移/patch 叠加风险）与全局作用域问题；定点形态
+> 零热路径开销、作用域精确（只影响清单内框架的建模流程）、与手动路径同一
+> 代码。绑定复用 fn_binding 通道（import hook + _rebind 扫尾）。覆盖盲区
+> （如实记录）：只覆盖清单入口建的模型——建模后再加工替换模块的流程与纯
+> transformers 手搭路径走手动 provider_wrap。swift-megatron 实测（Qwen3.5
+> -0.75B SFT，KL3）：`TT_PROVIDER_AUTO_WRAP=1` 下 `get_mcore_model -> 31
+> modules wrapped`，训练 loss 与无 TT 基线逐位一致。
+
+> **厂商性能 patch 清场（2026-10-26 职责重划，10-28 收敛为启动期开关）**：
+> torch_xmlir 的 symbrewrite 会把框架符号替换成厂商融合实现（如
+> Qwen3_5RMSNorm 类 → RMSNormFunction mock 类）——不清场时 baseline 本身就是
+> 融合态，provider 收益测不出。`TT_RESTORE_VENDOR=perf/all` 由 activate()
+> 启动期读取执行（`provider/vendor_patch.py`，按 `__origin_` 留痕恢复）：
+> 不设=xmlir 基线；perf=只关 TT 接管语义的性能符号（TT vs xmlir 对比口径）；
+> all=一键全关（整网独立性测试）。生产上 TT 在场无需恢复 xmlir 任何接口。
+> 配套修复：变体分流在模块无 zcg flag 时不预拒（原始 Qwen3_5RMSNorm 无
+> flag），自检失败同步重试其余变体 provider（一个调用内完成分流）。
+> 实测（KL3，Qwen3.5-0.75B SFT）：清场后 baseline（分解）391.5ms → TT vendor
+> 372.3ms（**1.05x**），追平厂商 patch 态（373.8ms）；all 档 49 符号全关
+> 功能完整、性能一致。Qwen2 清场口径 1.12x。
 
 > **函数级接入（2026-10-19，三级接入形态定型）**：框架内部的函数级性能符号
 > （megatron 的 swiglu/rope 等非 nn.Module 调用点）由 `Provider.bind_points`

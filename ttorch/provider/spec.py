@@ -82,11 +82,21 @@ class ProviderModuleForward:
             self._checked = self._provider._self_check(
                 self._module, eps0, x=x, ref_forward=self._orig_forward)
             if not self._checked:
-                # 自检未过：恢复原生 forward，本模块不接管（功能不降级）。
-                self._module.forward = self._orig_forward
+                # 自检未过：恢复原生 forward（功能不降级）并记录拒绝——若属变体
+                # 误接管（模块无 zcg flag 时标准 provider 先 wrap，如关闭厂商 patch
+                # 后的原始 Qwen3_5RMSNorm），同步重试其余变体 provider：当前 x
+                # 直接用于自检，一个调用内完成正确分流；全部被拒则保持原生。
+                module = self._module
+                module.forward = self._orig_forward
+                module._tt_provider_wrapped = False
+                rej = getattr(module, "_tt_wrap_rejected", set())
+                rej.add(self._semantic)
+                module._tt_wrap_rejected = rej
+                new_fwd = m._retry_wrap(module)
+                if new_fwd is not None:
+                    return new_fwd(x, *args, **kw)
                 return self._orig_forward(x, *args, **kw)
-        if not self._checked:
-            return self._orig_forward(x, *args, **kw)
+        # 走到此处 _checked 必为 True（False 分支上面已全 return）
         module = self._module
         # 传原始 weight——scale 语义由 provider 的 native/impl 内部固定
         # （标准 provider 用 w 直乘；zcg provider 内部做 1+w）。一对一，
@@ -168,12 +178,62 @@ class Provider(ABC):
         import torch
         if not isinstance(getattr(module, "weight", None), torch.nn.Parameter):
             raise TypeError(f"{type(module).__name__} 无可包装的 weight Parameter")
-        # 轻量分流（flag 先验，不跑前向）：本 provider 的变体语义与模块的
-        # zero_centered_gamma flag 不符则不接管（由对应变体 provider 接管）。
-        # flag 可能丢/伪造——精度兜底在首次 __call__ 延迟复检（纠正 flag 错误）。
-        if getattr(module, "zero_centered_gamma", False) != self.zero_centered_gamma:
+        # 轻量分流（flag 先验，不跑前向）：模块**显式带** zero_centered_gamma
+        # flag 且与本 provider 变体不符则不接管（由对应变体 provider 接管）。
+        # flag **缺失**（None，如原始 Qwen3_5RMSNorm 无此属性）不预拒——交给
+        # 延迟自检的精度兜底分流（自检失败会同步重试其余变体 provider，见
+        # ProviderModuleForward.__call__）；flag 伪造同理被精度兜底纠正。
+        flag = getattr(module, "zero_centered_gamma", None)
+        if flag is not None and bool(flag) != self.zero_centered_gamma:
             return None
         return ProviderModuleForward(module, self.semantic, self.slot, self)
+
+    def _fx_ssa_compare(self, module, eps, x, ref_forward=None):
+        """fx graph SSA 结构对比（module 等价性的图结构证据，与数值兜底互补）。
+
+        对比 module.forward（外部框架实现）和 provider.native（分解）的 fx graph
+        算子序列。两者都是**小算子分解**时 SSA 直接可比——一致则结构等价（强证据，
+        证明 native 复刻了框架的标准分解语义）；不一致则识别出语义差异（如 zcg 的
+        1+w 多一个 add）。
+
+        **实测口径修正（2026-10-26）**：transformers 5.12.1 的 Qwen2/Qwen3_5
+        RMSNorm **原生就是分解实现**（fp32 upcast + rsqrt，社区总会提供 native
+        实现作为原始语义基准）——此前实测到的"custom_ops 融合"是 **torch_xmlir
+        symbrewrite patch 生效后的 mock 类**（`torch.ops.custom_ops` 命名空间由
+        libxmlir_custom_ops.so 注册，非 transformers 原生），归因错误已修正。
+        经 `vendor_patch.restore` 清场后：Qwen2RMSNorm 与标准 native SSA 逐算子
+        一致；Qwen3_5RMSNorm（zcg）与 zcg native SSA 一致（native 的 (1+w) 与
+        缩放乘已对齐原始的 fp32 域）。Llama/Gemma3 未被厂商 patch 覆盖，原生
+        分解直接可比。
+
+        **适用范围**：融合算子（厂商 patch 的 mock 类 / 厂商 AOT kernel）的语义
+        等价**不能用 SSA 对比**（融合 vs 分解算子序列本质不同）——需开发者确认 +
+        精度 case 兜底（数值自检）。本方法对融合 module 返回 applicable=False。
+
+        返回 None（functorch 缺/追踪失败）或 dict（applicable/ssa_equal/ops 序列）。
+        """
+        try:
+            from functorch import make_fx
+        except ImportError:
+            return None
+        w = module.weight
+        # 延迟自检时 module.forward 已被替换为 ProviderModuleForward——必须用
+        # ref_forward（orig_forward）追踪模块原始实现，否则会追踪到分发逻辑（递归）。
+        ref_fn = ref_forward if ref_forward is not None else module.forward
+        try:
+            g_mod = make_fx(lambda inp: ref_fn(inp))(x)
+            g_nat = make_fx(lambda inp: self.native(inp, w, eps))(x)
+        except Exception:
+            return None  # 追踪失败（控制流/动态 shape/不支持算子），fx SSA 不可做
+        mod_ops = [str(n.target) for n in g_mod.graph.nodes if n.op == 'call_function']
+        nat_ops = [str(n.target) for n in g_nat.graph.nodes if n.op == 'call_function']
+        # module 用融合算子（非 aten 分解）→ SSA 不适用（融合 vs 分解本质不可比）
+        if any('aten.' not in o for o in mod_ops):
+            return {"applicable": False,
+                    "reason": "module 用融合算子，SSA 不适用（需开发者确认+精度兜底）",
+                    "module_ops": mod_ops, "native_ops": nat_ops}
+        return {"applicable": True, "ssa_equal": mod_ops == nat_ops,
+                "module_ops": mod_ops, "native_ops": nat_ops}
 
     def _self_check(self, module, eps, x=None, ref_forward=None, admit_tol=None):
         """精度兜底：本 provider 固定语义的实现 vs 模块参考 forward 一致性。
@@ -192,9 +252,15 @@ class Provider(ABC):
         语义偏差 4e-2，bf16 阈值取 2e-2 即可分；fp32 同语义差 ~0，阈值 1e-3。
         在模块实际 dtype 下自检——零侵入、更贴近生产负载。
 
-        **预留扩展点（2026-10-23）**：fx graph SSA 结构对比将作为 module 等价性
-        check 的一环（functorch make_fx 转译 module 与 provider 实现的计算图做 SSA
-        直接对比——非侵入、图结构级等价证据），与数值精度兜底互补。当前先预留位置。
+        **fx graph SSA 结构对比（2026-10-23 已实现，10-26 口径修正）**：
+        `_fx_ssa_compare` 用 functorch make_fx 转译 module 与 provider.native 的
+        计算图，对比算子序列（SSA）——**分解 vs 分解**直接可比（一致则 native 复刻
+        了框架的标准分解语义；zcg 的 1+w 多一个 add 会被识别出）。**融合算子**
+        （厂商 symbrewrite patch 的 mock 类 / 厂商 AOT）语义等价不能用 SSA 对比
+        （融合 vs 分解本质不同）——需开发者确认 + 精度兜底。社区 transformers 的
+        RMSNorm 原生都是分解，清场（vendor_patch.restore）后 SSA 可比。结果记
+        provenance（fx_ssa 事件），作辅助证据（不单独判错，接管决策由数值兜底
+        rel 判定）。
 
         **延迟模式（2026-10-23，D14 时机消解）**：传入 x/ref_forward 时为延迟自检
         （首次 __call__，真实输入，经 __call__ 流程——FSDP/DDP 的 all-gather hook
@@ -235,6 +301,17 @@ class Provider(ABC):
                               error=f"{type(e).__name__}: {e}")
             return False
         ok = rel < admit_tol
+        # fx graph SSA 结构对比（辅助等价证据，与数值兜底互补）：分解 vs 分解时
+        # 结构一致证明 native 复刻了框架的标准分解语义；融合算子不适用（需开发者
+        # 确认 + 精度兜底）。只记录证据，不单独判错（接管决策由数值兜底 rel 判定）。
+        fx = self._fx_ssa_compare(module, eps, x, ref_forward=ref_forward)
+        if fx is not None:
+            provenance.record(provenance.LAYER_PROVIDER, "wrap",
+                              type(module).__name__, "fx_ssa",
+                              semantic=self.semantic,
+                              applicable=fx.get("applicable", False),
+                              ssa_equal=fx.get("ssa_equal"),
+                              note=fx.get("reason", ""))
         if not ok:
             # 精度不一致（兜底生效）：本 provider 语义与模块真实实现不匹配——
             # 拒绝接管。可能是变体不符（应由对应变体的独立 provider 接管）或实现偏差。

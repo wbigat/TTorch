@@ -171,6 +171,13 @@ class ProviderManager:
                         fn_binding.make_dispatcher(_sem, orig)))
         if self._platform_probe is None:
             self.attach_platform(platform_manager.activation)
+        # 建模入口自动 wrap（opt-in）：TT_PROVIDER_AUTO_WRAP=1 时包装框架建模
+        # 入口函数（swift/megatron 路径的模型构建后自动 provider_wrap，免逐一
+        # 手动调用）。默认关——手动 tt.provider_wrap(model) 为主路径。
+        import os
+        from ttorch.provider import auto_wrap
+        if os.environ.get(auto_wrap.ENV_VAR) == "1":
+            auto_wrap.enable()
         # 启动期 provenance：可复现快照（平台 + 能力 + 版本 + 注册了哪些 provider）。
         # §4"可复现"硬要求——另一次运行凭这份快照重放同一套选择。
         # 能力面从"实现即事实"派生（supports 内省子类覆盖）；capabilities() 自报表
@@ -204,33 +211,64 @@ class ProviderManager:
                               type(model).__name__, "wrap_after_parallel",
                               detail=f"检测到并行包装（{violation[0]}，{violation[1]}），"
                                      f"精度兜底延迟到首次 __call__")
-        providers = [p for p in self.registry.all() if p.module_names]
         n = 0
         wrapped = []
         for module in model.modules():
-            if getattr(module, "_tt_provider_wrapped", False):
-                continue
             cls_name = type(module).__name__
-            for p in providers:
-                if any(cls_name == mn or cls_name.endswith(mn) for mn in p.module_names):
-                    try:
-                        new_forward = p.wrap_module(module)
-                    except TypeError:
-                        break  # 无 weight Parameter 等，跳过该模块
-                    if new_forward is None:
-                        continue  # 本 provider 语义与模块不符（self_check 精度兜底未过）：
-                                  # 试下一个 provider——一对一语义分流，不同变体的
-                                  # provider（如 ZcgRMSNormProvider）可能匹配该模块。
-                    module.forward = new_forward
-                    module._tt_provider_wrapped = True
-                    wrapped.append(f"{cls_name}->{p.semantic}")
-                    n += 1
-                    break
+            if self._wrap_one(module) is not None:
+                wrapped.append(f"{cls_name}->{module.forward._semantic}")
+                n += 1
         if n:
             provenance.record(provenance.LAYER_PROVIDER, "wrap",
                               type(model).__name__, "wrapped",
                               count=n, modules=wrapped)
         return n
+
+    def _wrap_one(self, module):
+        """尝试把一个模块接管到匹配的 provider（跳过已 wrap / 已被自检拒绝的
+        变体）。返回新 forward 或 None。
+
+        供 wrap_model（整树）与 `_retry_wrap`（延迟自检失败后的变体重试）共用：
+        类名 endswith 匹配 module_names -> wrap_module（TypeError=形态不符换
+        provider 无意义 / None=变体不符试下一个）。机制异常收敛为不接管 +
+        留痕（Function Map §245：机制失败不许影响功能）。
+        """
+        if getattr(module, "_tt_provider_wrapped", False):
+            return None
+        rejected = getattr(module, "_tt_wrap_rejected", set())  # 自检已拒的变体
+        cls_name = type(module).__name__
+        for p in self.registry.all():
+            if not p.module_names or p.semantic in rejected:
+                continue
+            if not any(cls_name == mn or cls_name.endswith(mn) for mn in p.module_names):
+                continue
+            try:
+                new_forward = p.wrap_module(module)
+            except TypeError:
+                break  # 无 weight Parameter 等——换 provider 无意义
+            except Exception as e:
+                provenance.record(provenance.LAYER_PROVIDER, "wrap", cls_name,
+                                  "wrap_error", semantic=p.semantic,
+                                  error=f"{type(e).__name__}: {e}")
+                return None
+            if new_forward is None:
+                continue  # 变体 flag 显式不符——试下一个 provider
+            module.forward = new_forward
+            module._tt_provider_wrapped = True
+            return new_forward
+        return None
+
+    def _retry_wrap(self, module):
+        """延迟自检失败后的变体重试（ProviderModuleForward 调用）：跳过 rejected
+        变体再试其余 provider。返回新 forward 或 None（全部被拒）。"""
+        new_forward = self._wrap_one(module)
+        provenance.record(provenance.LAYER_PROVIDER, "wrap",
+                          type(module).__name__,
+                          "retry_wrapped" if new_forward is not None
+                          else "retry_exhausted",
+                          semantic=(new_forward._semantic
+                                    if new_forward is not None else None))
+        return new_forward
 
     def _find_impl(self, name):
         """按 impl 名定位 (provider, impl)（含 native）。"""

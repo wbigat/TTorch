@@ -18,18 +18,24 @@ from ttorch.provider.impls.rmsnorm.base import RMSNormProvider, _EPS
 class ZcgNativeRMSNorm(ProviderImpl):
     """zcg 变体的 native：y = normalized(x) * (1 + w)。
 
-    归一化 upcast fp32 计算、缩放乘回原 dtype（与标准 native 同精度姿态）。
+    精度姿态对齐社区原始实现（transformers Qwen3_5RMSNorm，2026-10-26 经 fx
+    SSA 校验修正）：归一化 upcast fp32，**(1+w) 与缩放乘都在 fp32 域**（原始
+    是 `output * (1.0 + weight.float())` 后 `type_as`），最后才 cast 回输入
+    dtype。此前 (1+w) 与乘法在输入 dtype 域——SSA 对比识别出该结构差异
+    （数值差在 bf16 自检阈值内，但 native 是精度基准，应复刻原始语义）。
     """
 
     name = "native:rmsnorm_zcg"
     kind = "reference"
-    intent = "zcg RMSNorm torch 原生流程；功能底线 + 精度/收益基准"
+    intent = "zcg RMSNorm torch 原生流程（fp32 域 1+w 与缩放乘，对齐社区原始语义）；功能底线 + 精度/收益基准"
 
     def __call__(self, x, w, eps=_EPS):
         in_dtype = x.dtype
         x32 = x.to(torch.float32)
         var = x32.pow(2).mean(-1, keepdim=True)
-        return (1 + w).to(in_dtype) * (x32 * torch.rsqrt(var + eps)).to(in_dtype)
+        # 求值顺序对齐原始实现（norm 完成后再算 1+w 并乘）——fx SSA 逐算子一致
+        normed = x32 * torch.rsqrt(var + eps)
+        return (normed * (1 + w.float())).to(in_dtype)
 
 
 class ZcgRMSNormProvider(RMSNormProvider):

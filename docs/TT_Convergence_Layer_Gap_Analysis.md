@@ -48,6 +48,19 @@
 >   税率 1.74x）+ D9 对账边界输入（`_probe_variants` 特征维×2/÷2 + 批次维空/单，
 >   KLX 空张量教训）+ D12 detect 异常隔离（try/except）+ D14 延迟自检（wrap 期
 >   零侵入，自检延迟到首次 `__call__`，并行包装后可替换）——均加单测闭环。
+> - ✅ **D14 后续：auto-wrap 落地（2026-10-23 初版，10-28 形态定案）**：
+>   时机约束消解后 wrap 自动化——定案形态为**定点包装框架建模入口**
+>   （`provider/auto_wrap.py`：`TT_PROVIDER_AUTO_WRAP=1` 时包装
+>   `mcore_bridge.get_mcore_model` 等建模函数，返回后自动 provider_wrap，
+>   复用 fn_binding import hook + _rebind 扫尾；10-23 的 `Module._call_impl`
+>   全局 patch 初版因热路径开销/私有方法侵入/全局作用域已废除）。swift-megatron
+>   实测：Qwen3.5-0.75B SFT 自动接管 31 模块、训练 loss 与基线逐位一致。
+>   配套修复：**ZcgRMSNormProvider 此前从未注册**（`build_provider` 只装
+>   标准变体），Qwen3.5 的 zcg RMSNorm 无 provider 可接管（patch 0）——装配改
+>   为返回标准 + zcg 两个 provider 并补 KL3 zcg impl（`zcg_kl3.py`，1+w 预折算
+>   调同源 kernel）；变体分流修正：模块无 zcg flag 时不预拒（原始
+>   Qwen3_5RMSNorm 无 flag），自检失败同步重试其余变体 provider（`_retry_wrap`，
+>   一个调用内完成分流）。
 
 ---
 
@@ -761,6 +774,26 @@ x = torch.randn(4, w.numel(), dtype=torch.float32, ...)   # 固定形状
 > 对账移到 witness 层（`_edge_input_variants`），兜底对账恢复单点。空张量校验
 > 特判"不崩+形状一致"（无数值可比）。单测 `test_provider_admit.py`（边界变体 +
 > native 空张量正确 + 泛化校验 5 边界全过）。
+>
+> **fx graph SSA 结构对比（2026-10-23 落地，`_self_check` 的一环）**：
+> `Provider._fx_ssa_compare` 用 functorch make_fx 转译 module 与 provider.native 的
+> 计算图，对比算子序列（SSA）。**关键定位（用户澄清）**：对比的是**分解 vs 分解**
+> （外部框架的小算子实现 vs provider native，都是小算子）——SSA 直接可比。实测：
+> LlamaRMSNorm/Gemma3RMSNorm 分解（可比，Gemma3 的 zcg 1+w 多一个 add 被识别）。
+> **融合算子的语义等价由开发者确认 + 精度 case 兜底**（数值自检）。
+> 结果记 provenance（fx_ssa 事件），作辅助证据——不单独判错（接管决策由数值兜底
+> rel 判定）。修正点：延迟自检时 module.forward 已被替换，需用 ref_forward 追踪
+> 模块原始实现（否则递归追到 ProviderModuleForward 分发逻辑）。
+>
+> **归因修正（2026-10-26）**：此前"Qwen2RMSNorm 是 transformers 5.12.1 原生融合
+> （custom_ops.rms_layer_norm）"的结论**错误**——transformers 源码里 Qwen2/
+> Qwen3_5 RMSNorm 原生都是分解（社区总会提供 native 实现作为原始语义基准）；
+> 实测到的融合是 **torch_xmlir symbrewrite patch 的 mock 类**（`torch.ops.
+> custom_ops` 命名空间由厂商 libxmlir_custom_ops.so 注册，import torch 时经
+> .pth 即生效——"纯 CPU 环境"里它也已生效）。经 vendor_patch.restore 清场后
+> 实证：Qwen2RMSNorm vs 标准 native SSA 逐算子一致；Qwen3_5RMSNorm（zcg）vs
+> zcg native SSA 一致——且 SSA 对比驱动了 zcg native 的精度姿态修正（(1+w) 与
+> 缩放乘对齐原始的 fp32 域，bf16 rel_err 0.0）。
 
 ---
 
