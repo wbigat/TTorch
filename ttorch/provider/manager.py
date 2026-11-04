@@ -224,7 +224,7 @@ class ProviderManager:
                               count=n, modules=wrapped)
         return n
 
-    def _wrap_one(self, module):
+    def _wrap_one(self, module, trust_flag=True):
         """尝试把一个模块接管到匹配的 provider（跳过已 wrap / 已被自检拒绝的
         变体）。返回新 forward 或 None。
 
@@ -232,6 +232,10 @@ class ProviderManager:
         类名 endswith 匹配 module_names -> wrap_module（TypeError=形态不符换
         provider 无意义 / None=变体不符试下一个）。机制异常收敛为不接管 +
         留痕（Function Map §245：机制失败不许影响功能）。
+
+        trust_flag（A4）：首轮为 True（信模块的变体 flag 先验，省一次前向）；
+        重试阶段由 `_retry_wrap` 传 False——此时先验已被自检的数值证据否定，
+        继续执行 flag 预拒会把正确变体一起挡住（见 Provider.wrap_module）。
         """
         if getattr(module, "_tt_provider_wrapped", False):
             return None
@@ -243,7 +247,7 @@ class ProviderManager:
             if not any(cls_name == mn or cls_name.endswith(mn) for mn in p.module_names):
                 continue
             try:
-                new_forward = p.wrap_module(module)
+                new_forward = p.wrap_module(module, trust_flag=trust_flag)
             except TypeError:
                 break  # 无 weight Parameter 等——换 provider 无意义
             except Exception as e:
@@ -260,8 +264,13 @@ class ProviderManager:
 
     def _retry_wrap(self, module):
         """延迟自检失败后的变体重试（ProviderModuleForward 调用）：跳过 rejected
-        变体再试其余 provider。返回新 forward 或 None（全部被拒）。"""
-        new_forward = self._wrap_one(module)
+        变体再试其余 provider。返回新 forward 或 None（全部被拒）。
+
+        trust_flag=False（A4）：本轮进入重试，说明首轮 provider 的语义已被自检
+        的**数值证据**否定——模块的变体 flag 作为先验已不可信（可能正是它写错
+        才走到这里）。重试阶段改由精度兜底 + 判别力裁决，不再执行 flag 预拒。
+        """
+        new_forward = self._wrap_one(module, trust_flag=False)
         provenance.record(provenance.LAYER_PROVIDER, "wrap",
                           type(module).__name__,
                           "retry_wrapped" if new_forward is not None

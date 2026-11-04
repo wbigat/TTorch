@@ -17,7 +17,8 @@ provider 的门禁/选择/调用事件，两份 schema 各自为政，排障要�
            provider=pass/fail（gate）、selected（select）、called/fallback（call）、
            enabled/disabled（switch）
   evidence 层特有字段（bridge: target/intent/swept_modules；provider:
-           probe_us/ref_us/speedup/max_abs_err/fallback_actual/rejected/...）
+           probe_us/ref_us/speedup/max_abs_err/max_rel_err/probe_dtype/
+           bwd_checked/grad_contract/fallback_actual/rejected/...）
   pid/rank 产生该事件的**进程来源**（2026-10-21，D11）。多进程下 N 份记录格式
            相同、无法区分来源——跨 rank 对账与 fork 继承分析都因此无从下手。
            rank 读 RANK/LOCAL_RANK（缺省 None = 非分布式环境，与 rank 0 区分）。
@@ -192,8 +193,11 @@ def report():
             lines.append(f"[caliber] {r['subject']}: {r['outcome']}  ({detail})")
         elif r["event"] == "gate":
             mark = "PASS" if r["outcome"] == "pass" else "FAIL"
+            # bwd_checked/probe_dtype 必须进报告（A1/A2）：旧版只记 max_abs_err，
+            # 读者无法分辨"反向未测"与"反向测过=0"，也看不出结论属哪个 dtype。
             extra = " ".join(f"{k}={ev[k]}" for k in
-                             ("probe_us", "ref_us", "speedup", "max_abs_err") if k in ev)
+                             ("probe_us", "ref_us", "speedup", "max_abs_err",
+                              "max_rel_err", "probe_dtype", "bwd_checked") if k in ev)
             lines.append(f"[gate]   {r['subject']}: {mark} {ev.get('reason', '')}"
                          + (f"  ({extra})" if extra else ""))
         elif r["event"] == "select":

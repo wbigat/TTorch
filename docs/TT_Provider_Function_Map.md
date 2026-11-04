@@ -266,3 +266,139 @@ provenance 与 bridge **统一进 `ttorch.witness.provenance`**（同一事件�
    （从 `_origin_` 留痕拿原实现）。模块级类是唯一正确形态。
 8. **自检/门禁是 provider 内部机制，其失败必须收敛为"不接管"**——fp32 自检期
    模块异常曾穿透 wrap_model（只 catch TypeError）。机制失败不许影响功能。
+
+---
+
+### 6.4 准入链路 as-built（2026-11-04，A1–A5 修复后的整体逻辑）
+
+A1–A5 来自 `transformers_symbrewrite_插件_TT覆盖能力复核_20261028.md` §4，共同指向
+同一件事：**准入链路此前能被"看起来对"的候选骗过**。五条修完后，准入链路的完整
+形态如下。回归：`pytest tests/unit` = **85 passed**，其中本节对应的新增用例
+**6 文件 32 例**（明细见 §6.4.5），全部经红绿校验。
+
+#### 6.4.1 两条准入轨道（谁在什么时候判什么）
+
+| 轨道 | 落点 | 入口 | 判什么 | 失败后果 |
+|---|---|---|---|---|
+| **函数级门禁** | `witness/verify.verify_impl`，由 `provider/manager._gate` 调用 | 首次调用某签名时惰性 `select()` | 候选 impl vs **native** 的功能/精度/收益 | 该 impl 不入选，退 native |
+| **模块级自检** | `provider/spec.Provider._self_check` | 首次 `__call__`（延迟自检，D14） | 本 provider 的 **native** vs **模块原始 forward** 的语义是否同一变体 | 拒绝接管 + 同步重试其余变体 provider |
+
+两条轨道的基准方向相反，必须分清：门禁拿 native 当**真值**去判候选；自检拿 native
+当**待证对象**去判它是否复刻了框架语义。混为一谈会出现"用没验过的 native 去验候选"。
+
+#### 6.4.2 门禁链路的五道闸（verify_impl 的执行顺序）
+
+```text
+probe_input() ──► 生产 dtype（A2，不再升 fp32）
+   │              args / args2 两份独立叶子（requires_grad=True）
+   ▼
+① gate_infra   probe 构造 / native 前向失败 → fail（不向上抛，训练不被测量工具搞崩）
+② gate_infra   max|ref| <= atol → fail「基准输出近零，精度判据无判别力」（A3 同根）
+③ 精度(fwd)    max_rel_err vs _rel_tol(dtype)：bf16 4e-2 / fp16 1e-2 / 其余用 rtol
+④ 梯度契约     契约以 native 为真值推导（A1）：
+                  native 需反向 ─► 候选无图          → fail  candidate_detached
+                               ─► native 有梯度而候选无 → fail  grad_missing
+                               ─► 逐 arg 比梯度 rel  → 超阈 fail
+                  native 不可微 ─► 合法未测，skip_reason=native_no_graph
+                  候选多建图   ─► candidate_extra_graph（更保守，只留痕不阻断）
+⑤ 收益         两侧同口径测吞吐；native 需反向时 **fwd+bwd 都真跑**（A1 步骤 5）
+                  evidence.perf_scope = "fwd+bwd" | "fwd"
+```
+
+**A1 的关键反转**：旧实现把 `out.requires_grad` 写在守卫位
+（`if ref_out.requires_grad and out.requires_grad`），等于**让候选自证豁免反向验证**
+——厂商推理 kernel（`rms_layer_norm`，输出无 `grad_fn`）前向逐位正确即可 pass，
+evidence 还记成 `max_grad_err=None`（看起来"零误差"）。叠加当时
+`measure_throughput_us` 只跑前向，断图候选省掉建图开销 **speedup 反而更高**——
+门禁不仅漏判，还会**优先选中**错误实现。现在缺图是契约违约。
+
+**evidence 三态化**：`bwd_checked` / `bwd_skip_reason` / `grad_contract` 三个字段
+把旧实现 `max_grad_err=None` 的二义性（"native 不可微合法未测" vs "候选断图被漏
+放行"）拆开，provenance 与 summary 可分辨。
+
+**A2 的代价要写明**：精度轨道从 fp32 改回生产 dtype，是因为厂商 kernel 按 dtype
+分派（fastbf16/fp32 走不同符号），升 fp32 对账等于**生产用的那份 kernel 从未被门禁
+调用过**（实测反例：候选 fp32 正确、bf16 返回两倍，门禁仍 pass 且
+`max_abs_err=0.0`，bf16 路径执行 210 次一次没看输出）。代价是低精度下舍入噪声与
+小幅语义偏差分不开——`_LOWP_REL_TOL` 的注释里逐条写了**能拦住什么、拦不住什么**，
+拦不住的那类（同量级舍入顺序差异）需 fp64 三方对比，刻意不做。
+
+#### 6.4.3 模块级自检的判别力裁决（A3 / A3b / A4）
+
+旧判据只验"本 provider 与模块一致"，**判别力依赖输入非退化**：x=0 时 w 直乘与
+(1+w) 乘输出都塌成零，`rel` 与 `rival_rel` 同时为 0，且 scale=1e-12 让
+`0/1e-12=0` 恒过。旧实现据此接管并**永久缓存**（`_checked=True` 不复验），
+**首个 batch 一个全零输入就能把模块永久绑错语义**（实测后续误差 0.9999995）。
+
+现在的判据是**双边**的：
+
+```text
+rel        = |native(x) - module.forward(x)| / scale     # 本变体要匹配
+rival_rel  = min over 真竞争者 |rival_native(x) - module.forward(x)| / scale
+discrim_margin = admit_tol * 4                           # 留 4× 间隔避免灰区
+
+接管 ⟺ rel < admit_tol  且  rival_rel >= discrim_margin
+```
+
+- **真竞争者筛选**：`_rival_natives` 取同模块类名下语义不同的 provider native。
+  对每个候选竞争者先测它与本 native 的分离度——分不开的是「语义等价兄弟」，
+  静默排除（否则同义 provider 会互相否决）；真实输入上分不开但合成输入上分得开的，
+  判定为**真实输入退化**，自检改用合成输入复测。
+- **合成输入**：局部 `torch.Generator`，**不碰全局 RNG**，真实参数只读。
+- **仍分不开 → 拒绝接管**（`reason="indiscriminable"` 留痕）。宁可退 native 不猜语义。
+
+**A3b（探测权重）**：`probe_input` 旧实现恒用 `torch.ones_like(w)`——标准语义下
+w=1 使 y=normed，于是**一个完全忽略 weight 的 kernel 也能通过门禁**。现改为
+`w.detach().clone()`（保留生产保真度 + 与 Parameter 解耦防原地写污染）；真实 w 为
+常量时（zcg 零初始化 w≡0，(1+w)≡1 同样丧失判别力）叠一个**确定性**小扰动——
+判别力优先于逐值保真，dtype/shape/device 仍与生产一致。
+
+**A4（flag 先验只在首轮可信）**：`wrap_module(trust_flag=...)`。
+`zero_centered_gamma` flag 先验此前在**重试路径**也执行预拒，造成死锁——模块 flag
+写错（显式 `False` 的 zcg 模块）时：标准 provider 先 wrap → 自检数值否定 →
+重试 zcg provider **又被同一个错误 flag 预拒** → 只能退 native（数值对、白丢加速）。
+现在重试阶段放弃先验，改由精度兜底 + 判别力裁决，"flag 伪造被精度兜底纠正"这句
+承诺才真正成立。注意 flag **缺失**（原始 `Qwen3_5RMSNorm` 无此属性）从来不预拒。
+
+#### 6.4.4 fx 图对比的口径收紧（A5）
+
+旧名 `_fx_ssa_compare` / 字段 `ssa_equal` **误导为"SSA 等价证明"**，实际只比较
+`call_function` 的 target **名称有序列表**，丢掉常量、维度参数与 def-use 边——
+SSA 的全部实质内容。实测：
+
+| 反例 | 旧判定 | 真实输出误差 |
+|---|---|---|
+| eps `1e-6` → `0.1` | `True`（假阳性） | 0.25 |
+| 归约维 `-1` → `0` | `True`（假阳性） | 0.91 |
+| `mean` vs `sum/N` | `False`（假阴性） | 0（数学等价） |
+
+现为 `_fx_graph_compare`，产出两个字段：`op_seq_equal`（名称序列，保留旧口径）+
+`norm_equal`（**规范化结构** = target + def-use 边 + 常量/维度字面量 + kwargs）。
+并剥离 `aten.detach` 等纯图管理节点——w 是 `requires_grad=True` 的 Parameter，
+对它建图会让 make_fx 插入 detach，使**同一份正确实现在不同 grad 上下文下产出不同
+序列**（曾造成"看似检出了数据依赖错误"的伪影）。
+
+**判据契约（不可动摇）**：图对比永远只是**弱正向证据**，图不等**不构成拒绝理由**，
+接管决策 100% 由数值兜底 `rel` + 判别力裁决。原因：融合算子（厂商 symbrewrite 的
+mock 类 / AOT kernel）根本不可比。另：结论随 dtype 变化（fp32 标准 6 ops / zcg
+7 ops；bf16 各多 `_to_copy` 变 8/10），**只对 `probe_dtype` 成立，不可外推**。
+
+#### 6.4.5 回归清单（新增）
+
+| 文件 | 例数 | 钉住什么 |
+|---|---|---|
+| `test_verify_grad_contract.py` | 5 | 断图候选被拒 / native 不可微合法 skip / 候选多建图只留痕 |
+| `test_verify_lowp_track.py` | 6 | bf16 翻倍被拦 / dtype 自适应阈值 / 基准近零报 gate_infra |
+| `test_verify_perf_scope.py` | 5 | fwd+bwd 口径与仅 fwd 口径的 speedup 不同（口径生效的直接证据） |
+| `test_selfcheck_discriminability.py` | 6 | 零输入不误接管 / 语义等价兄弟不互相否决 / 分不开则拒绝 |
+| `test_wrap_retry_flag.py` | 3 | flag 写错时重试能纠正（不再死锁退 native） |
+| `test_fx_graph_compare.py` | 7 | eps/归约维假阳性被 `norm_equal` 捕获 / detach 伪影被剥离 |
+| **合计** | **32** | 6 文件。B1 的 `test_framework_patch_thd_rope`（9 例）见 `TT_Bridge_Deep_Dive.md` §9；large-weight 的 17 例已随 B2/B3 撤出到 `experiments/large_weight/` |
+
+**红绿校验曾出过一次假信号（记录在案）**：A1 首版断言写 `speedup < 1.0`，但该条件对
+修复前后**都成立**（autograd.Function 的 Python 调度开销让仅-fwd 口径也只有 0.38）
+——测试过了但没证明任何事。改为**比较两种口径的比值**后红绿才成立。
+教训：断言必须对"修复前的代码"为假，否则它不是回归测试。
+
+**仍未闭环（如实登记）**：以上全部是 CPU 单测口径；KL3 XPU 上的 bf16/fastbf16
+真实 kernel 分派未复验（设备前置见待办 E 组）。A6/A7/A8 未动。
