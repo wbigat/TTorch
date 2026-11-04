@@ -14,3 +14,6 @@ examples/*/provenance.jsonl
 
 # 注意：policy_snapshot.yaml **要**入库——它是 policy 的生成物快照，
 # CI 靠 diff 它来发现未评审的 policy 改动（docs/TT_Bridge_Deep_Dive.md §2.2）
+
+# 实测证据输出（e2e 运行产物，勿入库）
+.benchmarks/

@@ -13,6 +13,30 @@ from ttorch.provider.spec import Provider, ProviderImpl
 _EPS = 1e-6
 
 
+def _probe_weight(w):
+    """门禁探测用的权重（A3b，2026-11-03）。
+
+    旧实现恒用 `torch.ones_like(w)`：标准语义下 w=1 使 y=normed，于是**一个
+    完全忽略 weight 的 kernel 也能通过门禁**（返回 normed 与 native 逐位一致），
+    上线后 w≠1 时静默算错。ref 本来就带着真实 w，没有理由丢掉。
+
+    detach().clone()：与真实 Parameter 解耦（防 impl 原地写污染训练权重），
+    同时保留生产保真度。真实 w 为常量时（zcg 零初始化权重 w≡0，(1+w)≡1，
+    同样丧失判别力）叠一个确定性小扰动——判别力优先于逐值保真，dtype/shape/
+    device 仍与生产一致，门禁结论的适用范围不变。
+    """
+    wp = w.detach().clone()
+    if wp.numel() > 1 and wp.float().std().item() < 1e-6:
+        try:
+            gen = torch.Generator(device=wp.device).manual_seed(0)
+        except Exception:
+            gen = None  # 部分设备栈不支持 Generator 构造
+        noise = torch.randn(wp.shape, dtype=torch.float32, device=wp.device,
+                            generator=gen) * 0.1
+        wp = (wp.float() + noise).to(wp.dtype)
+    return wp
+
+
 class NativeRMSNorm(ProviderImpl):
     """torch 原生单算子流程（native）：x * rsqrt(mean(x^2)+eps) * w。
 
@@ -64,7 +88,7 @@ class RMSNormProvider(Provider):
             x, w = args[0], args[1]
             # 完整保留非张量参数（eps 等）与 kwargs——门禁必须在生产同语义的
             # 负载上测；丢 eps（真实 1e-2 vs 默认 1e-6）门禁结论就不对应生产。
-            return (torch.randn_like(x), torch.ones_like(w)) + tuple(args[2:]), dict(kw)
+            return (torch.randn_like(x), _probe_weight(w)) + tuple(args[2:]), dict(kw)
         if device is None:
             device = "cpu"
         x = torch.randn(4096, 4096, device=device)
