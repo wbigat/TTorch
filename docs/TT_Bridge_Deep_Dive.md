@@ -403,3 +403,288 @@ PyTorch 官方在三个层面做了与 Bridge 对应的事，TT 应对齐而非�
 3. 官方不提供逐符号的语义等价准入测试（sync 范围、RNG、显存口径）。
 
 **行动项**：TT Universal API 直接代理/对齐 `torch.accelerator`，只补缺口（RNG 统一、comm metadata、provenance 钩子），不自造平行接口。
+
+---
+
+## 9. 框架功能补丁通道（2026-11-04 落地，as-built）
+
+### 9.1 为什么 Bridge 要多一条通道
+
+XSwift 插件退役后，原插件里**修框架自身缺陷**的那部分补丁无人接手（见
+`xswift_退役能力分析与实施计划_20261029.md` §9 实施队列）。
+这类补丁**不能走 provider**。下面四条按严重程度排，**第 1、4 条是硬阻断**
+（不是调参数能解决的）：
+
+**1. 方向性冲突 —— provider 的参考系与功能补丁相反（致命）。**
+`fn_binding` 接管前要跑对账（`fn_binding.py:219-224`）：
+
+```python
+if b.semantic and not _admit_native_vs_orig(b, orig):
+    reason = "native_vs_orig 超差，拒绝接管：框架保持原实现"
+```
+
+provider 的全套机制建立在「**框架原实现 / native 是真值，候选待证**」之上。
+功能补丁恰好反过来 —— 框架原实现**就是那个有缺陷的东西**。以 B1 为例：
+CP>1 下框架原路径直接 `raise ValueError`，对账不是「超差」而是**抛异常**
+→ 必然拒绝接管 → **退回缺陷实现**。用 provider 实现功能补丁，结果是补丁永不生效。
+
+**2. 门禁的判据探测不到这类缺陷。** 门禁判的是**数值对账**，而功能缺陷常是
+**参数传递契约缺失**。B1 的缺陷只在「CP>1 且走 non-batched 分支」时触发：
+`probe_input` 在单卡/CP=1 下走 batched 分支碰不到 bug；CP>1 下 native 一进门就 raise，
+`verify_impl` 第一道闸 `gate_infra` 直接 fail。两种情况都验不出东西。
+
+**3. 收益门禁必然误判。** 功能补丁的收益恒 1x（B1 实际**略慢** —— 多一次 getattr
++ 一次字典写）。要让它过必须 `enforce_benefit=False` + `min_speedup=0`，等于把三级
+门禁里的两级架空成空壳；且会在 semantic 注册表产生**没有 native 也没有 impl 的
+空语义** —— 此前已明确禁止「非性能的生命周期适配通过空 semantic 偷渡为算子已通过门禁」。
+
+**4. `bind_points` 的落点机制绑不上（硬阻断）。** provider 绑的是**模块属性**
+（`setattr(module, attr, dispatcher)`）。但框架缺陷的落点常是**闭包捕获值**：
+`mcore_bridge/patcher.py:198` 在 import 期就把上游函数抓进了
+`_origin_apply_rotary_pos_emb_thd`。之后无论谁改 `rope_utils._apply_rotary_pos_emb_thd`
+这个模块属性，`patcher.py:211` 调的仍是闭包里那份旧引用。
+**这正是本通道首版设计被测试证伪的同一个坑**（见 §9.4），provider 没有改写闭包 cell 的能力。
+
+**所以新增** `bridge/framework_patch.py`（机制）+ `bridge/patches.py`（清单）：
+与 `provider/fn_binding` **同构但独立**的第二条 import 后置绑定通道。
+边界仍是文档既定的那条：**provider 管性能增量，bridge 管功能接入**。
+
+### 9.1a 复用了什么、刻意不复用什么
+
+机制形态上**最大化复用** provider 那条通道的已验证部分，只在门禁处分叉：
+
+| 能力 | `provider/fn_binding` | `bridge/framework_patch` |
+|---|---|---|
+| import 后置绑定钩子 | `_PostImportFinder` | `_PatchFinder`（同构，独立注册表） |
+| 替换动作本体 | **`utils/_rebind.rebind()`** | **同一个函数**（替换动作的唯一实现） |
+| owner 留痕 + 全局快照 | ✅ | ✅（纳入 `assert_bindings_intact`） |
+| provenance 事件流 | ✅ | ✅（`LAYER_BRIDGE` / `patch` 事件） |
+| 失效可见 | `_print_summary` | `patch_status()` + 摘要打印 |
+| **三级门禁 + dispatcher** | ✅ | **刻意不接**（理由见上四条） |
+
+准确说，`framework_patch` 就是「**去掉门禁与 dispatcher 的 fn_binding**」。
+不共用 finder 是因为注册表与失效语义不同 —— 共用会把「性能绑定没生效」和
+「功能补丁没生效」的诊断混在一起。
+
+```text
+ttorch.activate()
+  ├─ platform.auto_activate()        # 平台选择 + conformance
+  ├─ cuda_compat.activate(...)       # torch.cuda 符号收束（§2）
+  ├─ provider.fn_binding.install()   # 性能符号 → FunctionDispatcher（经门禁）
+  └─ bridge.patches.register_all()   # ← 新增：功能补丁清单
+     bridge.framework_patch.install()#   ← 新增：机制（import 钩子 + 落点绑定）
+```
+
+### 9.2 机制形态
+
+`FunctionPatch`（frozen dataclass）每条必须回答三个问题：
+
+| 字段 | 回答的问题 |
+|---|---|
+| `dotted` / `module` / `attr` | 补在哪（`attr` 支持 `"Class.method"`，嵌套类用点号下钻） |
+| `wrapper(orig) -> new` | 怎么补。**orig 不可用时必须返回 orig 本身**（= 不接管） |
+| `intent` | 修什么缺陷——没有 intent 半年后没人敢删 |
+| `applies_when()` | 前置判据（如"仅 CP>1 需要"）；False 则**留痕后不接管**，不静默跳过 |
+| `upstream_ref` | 上游修好后能否删 |
+
+**失效必须可见**：`patch_status()` 给每条补丁的状态
+（`applied` / `skipped(符号不存在)` / `skipped(前置条件不满足)` /
+`skipped(wrapper 判定不需要接管)` / `error(XxxError)` / `pending(模块未到场)`），
+`install(verbose=True)` 打印 `applied/total` 摘要。静默失效是最危险的状态
+——训练照跑，但缺陷依旧。
+
+**所有机制异常收敛为"不接管" + provenance 留痕，绝不向上抛**：功能补丁失败应退回
+框架原实现（可能有缺陷但能跑），不能让 TT 把训练搞崩。
+
+### 9.3 两个落在实践里的机制修正
+
+**(a) 类方法落点禁用扫尾。** `_rebind._sweep` 是拿**叶子名**去各模块 `getattr`
+比对的，用于修 `from x import f` 的陈旧引用。类方法的叶子名（如 `merge`）在模块
+命名空间里可能巧合同名 → 扫尾会误改无关函数。且类方法本就不存在 from-import
+陈旧引用问题：持有者是类本身，经描述符协议访问，改类属性即全局生效。
+
+**(b) 类方法落点曾打断整个完整性检测（实测发现的真实缺陷，已真修）。**
+`rebind` 的全局快照 key 原先用 `holder.__name__`，而类对象的 `__name__` 只有类名、
+不含模块路径。后果：`witness.bindings.assert_bindings_intact()` 按 key 做
+`import_module("GPTBridge")` → `ModuleNotFoundError` → **一条类方法绑定让 87 条
+绑定的完整性检测全部中断**。修法两处：
+
+- `_rebind.rebind/unbind` 加 `holder_path` 形参，非模块 holder 必须给出可 import 的
+  定位路径，形如 `"pkg.mod:Class"`（冒号分隔模块与类链）；
+- `witness/bindings.py` 支持 `"pkg.mod"` 与 `"pkg.mod:Class[.Sub]"` 两种 key 形态，
+  且 holder 定位失败按 tampered 计数 + 留证据，**不让异常穿透**打断其余条目。
+
+> 这条曾被我登记为"已知局限、暂不修"，实测证明它当场就是 bug。回归
+> `test_class_method_patch_keeps_integrity_check_working` 钉住。
+> 验收口径注意：`assert_bindings_intact` 要的是
+> `cuda_compat.post_bind_snapshot()`（`{key: obj}`），传 `_rebind.snapshot()`
+> （`{key: (obj, owner)}`）会让全部条目误报 tampered——是取证方式错，不是检测坏了。
+
+**当前实测数**（真机 `mcore_bridge` 1.5.1 在场，`activate(skip_conformance=True)`）：
+`tampered=0 / 84`，owner 分布 `bridge 80 + provider 3 + fwpatch 1`。
+（B2/B3 撤出前是 87 = 80+3+**4**，差额正是撤出的 3 条注册，逐项对得上。）
+
+### 9.4 补丁清单（`bridge/patches.py`）
+
+| ID | 落点 | 修什么 | 验证状态 |
+|---|---|---|---|
+| B1 | `megatron...rope_utils._apply_rotary_pos_emb_thd` | THD RoPE non-batched fallback 丢失 `cp_group`（社区缺陷，已含升级安全保障，见 §9.4a/b） | 单测 12 例（含红绿）+ 真机落点验收 + **真实链路 e2e 全档**（`b1_thd_rope_e2e.py`：CP=1 gloo + **CP=2/CP=4 四卡 XPU**——各 rank 无补丁复现 ValueError / 有补丁 ≡ 直调上游逐位 ≡ zigzag 手写参考 err≈2e-7）。**多卡算子级已闭环**；训练级因 Qwen3.5 走 batched 分支未触发 fallback（原因已定位） |
+
+**注册即全部 —— 当前只有这 1 条。** B2/B3（large-weight）已于 2026-11-04 撤出，见 §9.5。
+
+实测验收（真实 `mcore_bridge` 1.5.1 / `megatron.core` 0.18.0 在场，撤出后复验）：
+
+```text
+[patch status]  applied <- megatron.core.models.common.embeddings.rope_utils._apply_rotary_pos_emb_thd
+[integrity]     tampered=0，B1 条目已纳管
+```
+
+**B1 的修补位置是设计要点（首版被测试直接证伪）。** 缺陷链只有三行：
+
+```python
+# mcore_bridge/patcher.py
+202:  cp_group = kwargs.pop('cp_group', None)              # 取出，没放回
+206:  cp_size = mpu.get_context_parallel_world_size()      # mcore_bridge 自己有 fallback
+211:  return _origin_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, *args, **kwargs)
+                                                          # kwargs 里已无 cp_group
+```
+
+最初的实现是在**入口处**补 `kwargs["cp_group"]` 再转给 mcore_bridge —— **无效**：
+丢失动作（`pop`）发生在 mcore_bridge **内部**，入口补得再全照样被 pop 掉
+（`test_patch_restores_cp_group_on_fallback` 首版即
+`ValueError: cp_group must be provided`）。
+
+正确做法是**包住上游实现本身**：改写 mcore_bridge 闭包里
+`_origin_apply_rotary_pos_emb_thd` 的 cell（`__closure__` 的 `cell_contents` 可写，
+是 Python 层唯一能在不改框架源码的前提下替换闭包捕获值的手段）。于是：
+
+- batched 分支（`patcher.py:213`）：不经上游，行为**完全不变**；
+- non-batched fallback（`:211`）：进我们的包装，`cp_group` 被补回；
+- **不复制** mcore_bridge 的 `use_batched_rope` 分支判据（XSwift 原补丁复制了，
+  框架改判据就会漂移），职责更窄。
+
+上游对 `cp_group` 是**硬要求**，`rope_utils.py` 有**两处**硬 raise
+（`:59` 的 `_get_pos_emb_on_this_cp_rank`、`:201` 的 THD），且拿它做分片：
+
+```python
+# megatron/core/models/common/embeddings/rope_utils.py
+200:  if cp_group is None:
+201:      raise ValueError("cp_group must be provided for THD format RoPE")
+202:  cp_size = cp_group.size()
+203:  cp_rank = cp_group.rank()
+204:  seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+```
+
+所以「自带默认值绕过报错」比报错更危险（freqs 按错误 rank 取片 = **静默数值错**）。
+拿不到组时让 `ValueError` 暴露、**不吞**
+（回归 `test_upstream_error_not_swallowed_when_group_unavailable`）。
+
+#### 9.4a 根因归因（2026-11-04 补全，全部有出处）
+
+**B1 是社区缺陷，且社区已修复——我们装的版本太旧。**
+
+1. **源头变更**：Megatron-LM **0.18.0** 给 `_apply_rotary_pos_emb_thd` 新增
+   `cp_group` 硬要求（`rope_utils.py:200-201`）；
+2. **适配层未跟上**：mcore-bridge ≤1.5.x 的包装按旧签名写成 pop 不放回。
+   mcore-bridge 归属核实：`pip show` → **ModelScope 开源**（Apache-2.0，
+   github.com/modelscope/mcore-bridge），非内部包；
+3. **社区修复已存在**：PR **#146**「FIX APPLY_ROTARY_POS_EMB_THD MISSING
+   CP_GROUP」（hjh0119，功能提交 `f42016e` / 合并提交 `2220f77`，
+   2026-07-11 合入；**首个含修复版本 1.6.0**，2026-07-13；页面未见关联 issue）。
+   修复逻辑：pop → None 时 `mpu.get_context_parallel_group()` 兜底 → fallback
+   显式回传 `cp_group=cp_group`（已逐行核实 main 与 v1.6.0 tag 均含此形态）；
+4. **版本窗口**：**≤1.5.2 受影响，≥1.6.0 已修**。我们装的是 **1.5.1**
+   （2026-06-21，早于修复 3 周）。ms-swift 4.3.1 约束 `mcore-bridge>=1.4.0`，
+   升级在约束内（兼容性冒烟属待办 E 组，未跑）。
+
+**与社区修复完全对齐（2026-11-04 用户决策，取代此前的保守偏差）**：
+社区修法对 `mpu.get_context_parallel_group()` 是**无条件调用**——PR 评审中
+gemini-code-assist 指出 parallel_state 未初始化时会抛 `AssertionError`，建议
+`if cp_size > 1 else None`，**未被采纳**。本补丁同样无条件回退：打过补丁的
+≤1.5.x 与社区 ≥1.6.0 **行为逐点一致**（含边界），升级是行为无感的——这正是
+「不用着急跟进社区版本」的成立条件。此前「拿不到组就不注入、让上游 ValueError
+暴露」的保守版已废弃（它让新旧版本在边界上行为不一致，违背逻辑兼容目标）。
+回归 `test_parallel_state_failure_matches_community_behavior` 钉住该对齐
+（打桩在 parallel_state 层而非 `_current_cp_group`，否则测不到真实接缝）。
+
+**一个已知的语义差**（位置决定的，生产不可达）：补丁在闭包 cell 层注入，若调用方
+显式传的 cp_group 与 parallel_state 当前组**不同**且走了 fallback，注入的是后者。
+真实链路中两者恒为同一对象，且不改时该路径直接 `ValueError`——严格属于改善，
+如实登记。真机探测另发现：未初始化进程在 mcore_bridge 自己的
+`cu_seqlens // cp_size` 处就先炸（`cp_size=0` → ZeroDivisionError），**在我们的
+接缝上游**，与本补丁无关（打不打都一样）。
+
+#### 9.4b 升级安全保障（2026-11-04 用户决策：保留独立 patcher，四层保险）
+
+用户决策：不删补丁等升级，而是**保留独立 patcher、对齐社区修复逻辑**，
+并要求「社区更新后本补丁零负面影响」。四层保障（任一生效即安全）：
+
+| # | 层 | 机制 |
+|---|---|---|
+| 1 | **源码形态探测**（注册期） | `_upstream_has_fix` 在上游包装源码里检出 `cp_group=cp_group` 显式回传 → 判定已修复 → **整个补丁不接管**（skipped + 留痕）。用源码形态而非版本号——内部 fork / 定制打包会让版本号说谎 |
+| 2 | **结构探测** | 上游重构导致闭包 cell 找不到 → 不接管 |
+| 3 | **运行时透传** | 上游修复后 fallback 显式传 `cp_group=cp_group`，「缺了才补」判据永远命中不了 → 无害透传（前两层全漏也安全） |
+| 4 | **幂等** | `_tt_cp_group_fixed` 防重复激活叠层 |
+
+探测的误判方向分析：误判「未修复」（源码拿不到时）→ 补丁生效但运行时恒透传，
+无害；误判「已修复」→ 漏补，但 `cp_group=cp_group` 出现在未修复代码里的概率
+可忽略。**安全方向偏置正确**。
+
+红绿校验：`test_applies_when_rejects_upstream_fixed_version`（fixed 形态 → 不接管）
+在实现前失败、实现后通过；`test_applies_when_accepts_defective_version` 对照。
+真机复验（1.5.1 在场）：`_upstream_has_fix=False`、`_thd_rope_applies=True`、
+`applied` —— 当前版本不误判。
+
+**诚实边界**：闭包改写依赖 mcore_bridge 的内部变量名与闭包结构，**是脆的**——
+这正是第 2 层存在的理由。环境升级到 ≥1.6.0 并通过冒烟后，本补丁可整个删除
+（删除触发点已写进 `upstream_ref`）。
+
+### 9.5 large-weight 相关缺口：**已撤出本通道**（2026-11-04 决策，已执行）
+
+原计划把三条 large-weight 补丁迁进本通道，**已决策并执行撤出**：
+
+```text
+ttorch/bridge/large_weight_shim.py          ─┐
+ttorch/bridge/patches.py 的 B2/B3 注册+wrapper├─► experiments/large_weight/
+tests/unit/test_large_weight_shim.py        ─┘   （不参与 ttorch 包导入）
+```
+
+撤出后：`patches.py` 只注册 B1 一条；`pytest tests/unit` = **88 例**（含 B1 升级安全与幂等共 12 例）
+（存档的 17 例在 `experiments/large_weight/` 单独跑）。
+完整的来源、理由与留给新方案的结论见 `experiments/large_weight/README.md`。
+
+**撤出理由 —— 触发条件决定归属**。源码核实确认：这些缺口**仅在主动开启
+`XTE_GROUPED_GEMM_LARGE_WEIGHT=1` 时存在**，LW=0 下全部不成立。
+
+| 缺口 | LW=1 的失败点 | LW=0 时 |
+|---|---|---|
+| 权重转换 | `gpt_bridge.py` 12 处 `getattr(..., f'weight{i}')` → `AttributeError` | `weight{i}` 是真实 Parameter，正常 |
+| LoRA merge | `tuners/lora.py:518` `base_layer.weight0.device` —— **一进门就 `AttributeError`** | 同上，正常 |
+| 跨栈 ckpt | 盘上 key 集合 `large_weight` vs `weight{i}` 分叉 | 两侧同为 `weight{i}`，无分叉 |
+
+于是它不是「硬件/框架缺口」，而是「**一个可选开关的代价**」：
+
+1. 该开关**默认 False**（`xmegatron_ext/envs.py:68`），且厂商源码自标
+   「large weight is temporary solution，need to be removed in the future」
+   （`grouped_linear.py:786`）—— 给厂商自己准备废弃的临时特性在 TT 里建长期兼容层，
+   方向不对；
+2. shim 要替厂商维护「3D 合并参数 ↔ per-expert 视图」的映射，这是**厂商权重布局的
+   实现细节**，不属于 bridge 的「功能接入」语义 —— 迁进来会污染本层职责边界；
+3. 继续迁移路线还必须吃下 C1（优化器 `param_state` 裸索引重排，**高危且错位不可
+   检测**），风险最大的一块反而由 TT 背。
+
+**转为独立方案**（不在 TT 内解决），其选型关键输入是一份尚缺的 XPU 数据：
+`LW=1` vs `LW=0 + XTE_USE_GROUPED_FC_FUSION=1` 的性能对比（LW=1 时厂商会把
+`GROUPED_FC_FUSION` 强制置 0）。若差距可接受，「关开关」就是最简方案，
+三条缺口与 C 组整组触发面同时消失。详见
+`待办总览_持续推进清单_20261103.md` §B.1a。
+
+**留给新方案的分析结论**（门控判据 / 专家数口径 / 切片方式 / `__getattr__` 的
+读写不对称 / merge 与 unmerge 的差别 / 缺陷的两层性，共 6 条，均带源码出处）
+**统一记在 `experiments/large_weight/README.md`** —— 不在本文档复写一份，
+避免两处维护漂移。
+
+**残留风险（如实登记）**：生产脚本 `runtime/script/env.sh:31` 当前是**显式**
+`XTE_GROUPED_GEMM_LARGE_WEIGHT=1`。撤出后 LW=1 下的 `AttributeError` 会**回归**
+（此前靠 XSwift 插件挡，插件退役后靠这两条补丁挡）。按 2026-11-04 决策，
+**TT 侧不加告警也不接管**，该风险由生产侧把控。

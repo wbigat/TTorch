@@ -55,7 +55,7 @@ def _find_other_owner(module, attr, owner):
     return None
 
 
-def rebind(module, attr, new, *, owner, sweep_packages=()):
+def rebind(module, attr, new, *, owner, sweep_packages=(), holder_path=None):
     """执行一次符号替换：源头 setattr + 扫尾 + 带 owner 留痕。
 
     - 留痕写 `_tt_origin_<owner>_<attr>`（非 `_origin_<attr>`），消灭撞名；
@@ -66,6 +66,15 @@ def rebind(module, attr, new, *, owner, sweep_packages=()):
     行为不变）；真正的优先级/overlay 策略留待出现真实重叠时再定（Rewrite
     文档 §6 挂起项）——当前无符号重叠，不提前建机制。
 
+    holder_path（2026-11-04）：**非模块** holder 的快照 key。
+    `module` 形参实际接受任意持有者；类方法落点传进来的是**类对象**，而
+    `type.__name__` 只有类名、不含模块路径。实测后果：类名进快照后
+    `assert_bindings_intact()` 按 key 做 `import_module("GPTBridge")` 直接
+    `ModuleNotFoundError`，**整个完整性检测被一条类方法绑定打断**。
+    所以非模块 holder 必须显式给出可 import 的定位路径
+    （形如 `"pkg.mod:Class"`，冒号分隔模块与类链）。
+    None 时沿用 `module.__name__`（模块落点，行为不变）。
+
     返回 swept 的模块数。
     """
     from ttorch.witness import provenance
@@ -73,20 +82,21 @@ def rebind(module, attr, new, *, owner, sweep_packages=()):
     # 重复绑定同一 owner（如重复 activate 未先 uninstall）：当前值已是上一轮的
     # 门面，直接存成 origin 会"门面叠门面"丢失真原实现。先恢复到本 owner 留痕
     # 里的原实现再绑——origin 始终是真实原实现。
+    key_name = holder_path or module.__name__
     if hasattr(module, origin_attr(owner, attr)):
-        unbind(module, attr, owner)
+        unbind(module, attr, owner, holder_path=holder_path)
     original = getattr(module, attr)
     other = _find_other_owner(module, attr, owner)
     if other is not None:
         provenance.record(provenance.LAYER_BRIDGE, "bind",
-                          f"{module.__name__}.{attr}", "conflict",
+                          f"{key_name}.{attr}", "conflict",
                           owner=owner, other_owner=other,
                           detail=f"该符号已被 {other} 绑定过；owner 留痕可区分，"
                                  f"但回滚语义需人工确认（当前无优先级策略）")
     setattr(module, origin_attr(owner, attr), original)
     setattr(module, attr, new)
     swept = _sweep(module, attr, new, original, sweep_packages)
-    _SNAPSHOT[(module.__name__, attr)] = (new, owner)
+    _SNAPSHOT[(key_name, attr)] = (new, owner)
     return swept
 
 
@@ -122,7 +132,7 @@ def snapshot():
     return dict(_SNAPSHOT)
 
 
-def unbind(module, attr, owner):
+def unbind(module, attr, owner, holder_path=None):
     """恢复一次 rebind：符号恢复为该 owner 留痕里的原实现，删留痕、删快照条目。
 
     与 rebind 对称收敛：本模块自称"替换动作的唯一实现"，恢复动作也必须在
@@ -141,7 +151,7 @@ def unbind(module, attr, owner):
         delattr(module, name)
     except AttributeError:
         pass
-    _SNAPSHOT.pop((module.__name__, attr), None)
+    _SNAPSHOT.pop((holder_path or module.__name__, attr), None)
     return True
 
 

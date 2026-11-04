@@ -158,7 +158,7 @@ class Provider(ABC):
         """
         raise NotImplementedError
 
-    def wrap_module(self, module):
+    def wrap_module(self, module, trust_flag=True):
         """把一个匹配的 nn.Module 包成走 provider.call 的 forward（自动生效）。
 
         默认按 RMSNorm 类约定从模块提取 weight（Parameter）与 eps
@@ -182,19 +182,51 @@ class Provider(ABC):
         # flag 且与本 provider 变体不符则不接管（由对应变体 provider 接管）。
         # flag **缺失**（None，如原始 Qwen3_5RMSNorm 无此属性）不预拒——交给
         # 延迟自检的精度兜底分流（自检失败会同步重试其余变体 provider，见
-        # ProviderModuleForward.__call__）；flag 伪造同理被精度兜底纠正。
+        # ProviderModuleForward.__call__）。
+        #
+        # trust_flag（A4，2026-11-03）：先验只在**首轮**可信。此前重试路径同样
+        # 执行 flag 预拒，造成死锁——模块 flag 写错（显式 False 的 zcg 模块）时，
+        # 标准 provider 先 wrap → 自检数值否定 → 重试 zcg provider 又被同一个
+        # 错误 flag 预拒 → 只能退 native。实测：zcg_wrongflag 场景最终绑定
+        # native（数值对、但白丢加速）。自检已经用数值否定了先验，重试阶段
+        # 必须放弃先验、改由精度兜底 + 判别力裁决，否则"flag 伪造被精度兜底
+        # 纠正"这句注释不成立。
         flag = getattr(module, "zero_centered_gamma", None)
-        if flag is not None and bool(flag) != self.zero_centered_gamma:
+        if trust_flag and flag is not None and bool(flag) != self.zero_centered_gamma:
             return None
         return ProviderModuleForward(module, self.semantic, self.slot, self)
 
-    def _fx_ssa_compare(self, module, eps, x, ref_forward=None):
-        """fx graph SSA 结构对比（module 等价性的图结构证据，与数值兜底互补）。
+    # 纯图管理节点：不改变数学语义，比较前剥离（A5）。
+    # 理由（实测）：w 是 requires_grad=True 的 Parameter，对它建图会让 make_fx
+    # 插入 aten.detach.default，使同一份正确实现在不同 grad 上下文下产出不同
+    # 序列——曾造成"看似检出了数据依赖错误"的伪影（实为 detach 多了一个节点）。
+    _FX_NOISE_OPS = ("aten.detach.default", "aten.alias.default",
+                     "aten.lift_fresh_copy.default")
+    # 带维度参数的算子（维度需按 rank 归一化，避免 -1 与 rank-1 被判不等）
+    _FX_DIM_OPS = ("mean", "sum", "var", "amax", "amin", "softmax",
+                   "cat", "stack", "squeeze", "unsqueeze", "cumsum")
 
-        对比 module.forward（外部框架实现）和 provider.native（分解）的 fx graph
-        算子序列。两者都是**小算子分解**时 SSA 直接可比——一致则结构等价（强证据，
-        证明 native 复刻了框架的标准分解语义）；不一致则识别出语义差异（如 zcg 的
-        1+w 多一个 add）。
+    def _fx_graph_compare(self, module, eps, x, ref_forward=None):
+        """fx graph 规范化节点对比（module 等价性的图结构证据，与数值兜底互补）。
+
+        **这不是"SSA 等价证明"，口径已于 2026-11-03（A5）收紧并改名。**
+        旧实现（名为 `_fx_ssa_compare`、字段名 `ssa_equal`）只比较
+        `call_function` 的 target **名称有序列表**，丢掉了常量、维度参数与
+        def-use 边——SSA 的全部实质内容。实测假阳性：eps 由 1e-6 改成 0.1、
+        归约维由 -1 改成 0，两者都仍判 `True`，实际输出误差 0.25 / 0.91。
+        本版把节点规范化为 (target, 前驱序号, 非张量字面量, kwargs) 后再比，
+        这三类差异可被识别。
+
+        **判据契约（非对称，不得接入裁决）**：
+          序列相等   -> 弱正向证据（native 复刻了框架的分解语义）；
+          序列不相等 -> **不构成任何拒绝理由**（数学等价而算子序列不同是常见的，
+                        实测 mean vs sum/N 即输出逐位一致但序列不等）；
+          接管裁决   -> 100% 由数值兜底（_self_check 的 rel）+ 判别力裁决。
+        一般情形下"数学等价"不可由图比较判定，所以本方法**永远只记证据**。
+
+        **结论的 dtype 局部性**：图随 dtype 变化（实测 fp32 下 upcast 是 no-op
+        被消除：标准 native 6 ops / zcg 7 ops；bf16 下各多出 `_to_copy`，
+        变成 8 / 10）。结论只对 `probe_dtype` 那个 dtype 成立，不可外推。
 
         **实测口径修正（2026-10-26）**：transformers 5.12.1 的 Qwen2/Qwen3_5
         RMSNorm **原生就是分解实现**（fp32 upcast + rsqrt，社区总会提供 native
@@ -210,8 +242,10 @@ class Provider(ABC):
         等价**不能用 SSA 对比**（融合 vs 分解算子序列本质不同）——需开发者确认 +
         精度 case 兜底（数值自检）。本方法对融合 module 返回 applicable=False。
 
-        返回 None（functorch 缺/追踪失败）或 dict（applicable/ssa_equal/ops 序列）。
+        返回 None（functorch 缺/追踪失败）或 dict（applicable/op_seq_equal/
+        norm_equal/ops 序列/probe_dtype）。
         """
+        import torch  # 模块级不 import torch（非该硬件机器 import 安全）
         try:
             from functorch import make_fx
         except ImportError:
@@ -224,16 +258,84 @@ class Provider(ABC):
             g_mod = make_fx(lambda inp: ref_fn(inp))(x)
             g_nat = make_fx(lambda inp: self.native(inp, w, eps))(x)
         except Exception:
-            return None  # 追踪失败（控制流/动态 shape/不支持算子），fx SSA 不可做
-        mod_ops = [str(n.target) for n in g_mod.graph.nodes if n.op == 'call_function']
-        nat_ops = [str(n.target) for n in g_nat.graph.nodes if n.op == 'call_function']
-        # module 用融合算子（非 aten 分解）→ SSA 不适用（融合 vs 分解本质不可比）
-        if any('aten.' not in o for o in mod_ops):
-            return {"applicable": False,
-                    "reason": "module 用融合算子，SSA 不适用（需开发者确认+精度兜底）",
-                    "module_ops": mod_ops, "native_ops": nat_ops}
-        return {"applicable": True, "ssa_equal": mod_ops == nat_ops,
-                "module_ops": mod_ops, "native_ops": nat_ops}
+            return None  # 追踪失败（控制流/动态 shape/不支持算子），图对比不可做
+
+        rank = x.dim()
+
+        def _nodes(graph):
+            """剥离纯图管理节点后的 call_function 节点列表。"""
+            return [n for n in graph.nodes
+                    if n.op == "call_function" and str(n.target) not in self._FX_NOISE_OPS]
+
+        def _normalize(nodes):
+            """节点 -> (target, 前驱在本序列中的序号, 字面量, kwargs)。
+
+            前驱序号提供 def-use 边（数据依赖）；字面量涵盖 eps 这类常量与
+            归约维度——正是旧实现丢掉、因而产生假阳性的两类信息。
+            """
+            idx = {n: i for i, n in enumerate(nodes)}
+            out = []
+            for n in nodes:
+                tname = str(n.target)
+                is_dim_op = any(k in tname for k in self._FX_DIM_OPS)
+                deps, lits = [], []
+                for a in n.args:
+                    if isinstance(a, torch.fx.Node):
+                        deps.append(idx.get(a, -1))  # -1 = 来自 placeholder/常量
+                    elif isinstance(a, (list, tuple)):
+                        for e in a:
+                            if isinstance(e, torch.fx.Node):
+                                deps.append(idx.get(e, -1))
+                            elif isinstance(e, int) and is_dim_op and rank:
+                                lits.append(e % rank)  # 负维归一化
+                            else:
+                                lits.append(e)
+                    elif isinstance(a, int) and not isinstance(a, bool) \
+                            and is_dim_op and rank:
+                        lits.append(a % rank)
+                    else:
+                        lits.append(a)
+                out.append((tname, tuple(deps), tuple(lits),
+                            tuple(sorted((k, str(v)) for k, v in n.kwargs.items()))))
+            return out
+
+        mod_nodes, nat_nodes = _nodes(g_mod.graph), _nodes(g_nat.graph)
+        mod_ops = [str(n.target) for n in mod_nodes]
+        nat_ops = [str(n.target) for n in nat_nodes]
+        base = {"module_ops": mod_ops, "native_ops": nat_ops,
+                "probe_dtype": str(x.dtype)}
+        # 空图不是"结构等价"：旧实现 any([])=False -> applicable=True 且
+        # []==[] -> 判等，追踪不到任何算子反而报通过（真空真理）。
+        if not mod_ops:
+            return dict(base, applicable=False,
+                        reason="module 图内无 call_function 节点，图对比无证据力")
+        # module 用融合算子（非 aten 分解）→ 不适用（融合 vs 分解本质不可比）
+        if any("aten." not in o for o in mod_ops):
+            return dict(base, applicable=False,
+                        reason="module 用融合算子，图对比不适用（需开发者确认+精度兜底）")
+        return dict(base, applicable=True,
+                    op_seq_equal=(mod_ops == nat_ops),
+                    norm_equal=(_normalize(mod_nodes) == _normalize(nat_nodes)))
+
+    def _rival_natives(self, module):
+        """同一模块类名下、语义不同的其余 provider 的 native（判别力参照，A3）。
+
+        用途：自检只验"本 provider 与模块一致"，不验"竞争变体与模块不一致"——
+        退化输入下两者同时成立时判据失效（x=0 时 w 直乘与 (1+w) 乘都输出全零）。
+        本方法取出竞争参照，由 _self_check 据此要求**判别力**而非仅匹配。
+
+        不硬编码 zcg：按 module_names 匹配的兄弟 provider 都算竞争变体，
+        后续新增变体（如其他 scale 语义）自动纳入。
+        """
+        from ttorch.provider import manager as _pm  # 延迟 import 避免环
+        cls_name = type(module).__name__
+        rivals = []
+        for p in _pm.instance().registry.all():
+            if p.semantic == self.semantic or not p.module_names:
+                continue
+            if any(cls_name == mn or cls_name.endswith(mn) for mn in p.module_names):
+                rivals.append((p.semantic, p.native))
+        return rivals
 
     def _self_check(self, module, eps, x=None, ref_forward=None, admit_tol=None):
         """精度兜底：本 provider 固定语义的实现 vs 模块参考 forward 一致性。
@@ -252,15 +354,23 @@ class Provider(ABC):
         语义偏差 4e-2，bf16 阈值取 2e-2 即可分；fp32 同语义差 ~0，阈值 1e-3。
         在模块实际 dtype 下自检——零侵入、更贴近生产负载。
 
-        **fx graph SSA 结构对比（2026-10-23 已实现，10-26 口径修正）**：
-        `_fx_ssa_compare` 用 functorch make_fx 转译 module 与 provider.native 的
-        计算图，对比算子序列（SSA）——**分解 vs 分解**直接可比（一致则 native 复刻
-        了框架的标准分解语义；zcg 的 1+w 多一个 add 会被识别出）。**融合算子**
-        （厂商 symbrewrite patch 的 mock 类 / 厂商 AOT）语义等价不能用 SSA 对比
-        （融合 vs 分解本质不同）——需开发者确认 + 精度兜底。社区 transformers 的
-        RMSNorm 原生都是分解，清场（vendor_patch.restore）后 SSA 可比。结果记
-        provenance（fx_ssa 事件），作辅助证据（不单独判错，接管决策由数值兜底
-        rel 判定）。
+        **fx graph 规范化节点对比（2026-10-23 实现，10-26 口径修正，11-03 改名
+        并收紧）**：`_fx_graph_compare` 用 functorch make_fx 转译 module 与
+        provider.native 的计算图后比较规范化节点——**分解 vs 分解**可比（一致
+        则 native 复刻了框架的标准分解语义；zcg 的 1+w 多一个 add 会被识别出）。
+        **融合算子**（厂商 symbrewrite patch 的 mock 类 / 厂商 AOT）不适用。
+        结果记 provenance（fx_op_seq 事件），**只作弱辅助证据**：图不等不构成
+        拒绝理由，接管决策 100% 由数值兜底 rel + 判别力裁决。旧名
+        `_fx_ssa_compare` / `ssa_equal` 误导为等价证明，已废止。
+
+        **判别力判据（A3，2026-11-03 修正）**：判据从"本 provider 与模块匹配"
+        改为"本 provider 匹配 **且** 竞争变体不匹配"。只验匹配时判据的判别力
+        依赖输入非退化——x=0 使两变体输出都塌成零（rel 与 rival_rel 同时为 0，
+        且 scale=1e-12 让 0/1e-12=0 恒过），旧实现据此接管并**永久缓存**
+        （_checked=True 不复验、_retry_wrap 只在拒绝时触发），首个 batch 一个
+        全零输入就能把模块永久绑错语义（实测后续误差 0.9999995）。
+        判别力不足时用局部 Generator 合成非退化**输入**复测（真实参数只读、
+        不碰全局 RNG）；仍分不开则拒绝接管（宁可退 native 不猜语义）。
 
         **延迟模式（2026-10-23，D14 时机消解）**：传入 x/ref_forward 时为延迟自检
         （首次 __call__，真实输入，经 __call__ 流程——FSDP/DDP 的 all-gather hook
@@ -287,11 +397,74 @@ class Provider(ABC):
             x = torch.randn(4, w.numel(), dtype=dtype, device=w.device, generator=gen)
         # 延迟自检时 ref_forward=orig_forward（避免递归调已替换的 module.forward）
         ref_fn = ref_forward if ref_forward is not None else module.forward
-        try:
-            ref = ref_fn(x)               # 模块参考实现（原生/被接管对象）
-            out = self.native(x, w, eps)  # 本 provider 固定语义的参考实现
+        # 判别力 margin（A3）：必须显著大于 admit_tol，否则存在"本变体与竞争变体
+        # 都判通过"的灰区。取 4× 留足间隔（真实判别信号量级 ~1.0，远超该值）。
+        discrim_margin = admit_tol * 4
+        rivals = self._rival_natives(module)
+
+        def _synth_like(xi):
+            """同 shape/dtype/device 的非退化合成输入。局部 Generator——门禁在
+            训练循环中途触发，不碰全局 RNG；真实参数只读，只合成**输入**。
+            模块对输入为纯函数是前提（RMSNorm 成立；非纯模块的 provider
+            接入前需另行确认）。"""
+            try:
+                gen = torch.Generator(device=w.device).manual_seed(0)
+            except Exception:
+                gen = None  # 部分设备栈不支持 Generator 构造
+            return torch.randn(tuple(xi.shape), dtype=xi.dtype,
+                               device=w.device, generator=gen)
+
+        def _sep(xi, nat):
+            """本 native 与某竞争 native 在 xi 上的分离度（**与模块无关**）。
+
+            这是"两个 provider 语义是否真不同"的度量。不能用"竞争者与模块的
+            误差"代替——语义等价的兄弟 provider（如重复注册、同语义不同命名）
+            与模块误差同样为 0，会被误判成"分不开"，使判据退化为永远拒绝。
+            """
+            base = self.native(xi, w, eps)
+            scale = base.abs().max().item() + 1e-12
+            return (nat(xi, w, eps) - base).abs().max().item() / scale
+
+        def _rel_to_module(xi):
+            ref = ref_fn(xi)
             scale = ref.abs().max().item() + 1e-12
-            rel = (out - ref).abs().max().item() / scale
+            return (self.native(xi, w, eps) - ref).abs().max().item() / scale, ref, scale
+
+        try:
+            # 第 1 步：筛出**真竞争者**并判断真实输入是否退化。
+            #   sep 小有两种成因，必须分开：
+            #     a) 输入退化（x=0 使两变体输出都塌成零）-> 换非退化输入重测；
+            #     b) 兄弟 provider 语义等价 -> 不是竞争者，排除出参照集。
+            #   区分办法：在非退化合成输入上重测 sep——仍然小的是 (b)。
+            genuine, need_synth = [], False
+            for sem, nat in rivals:
+                try:
+                    if _sep(x, nat) >= discrim_margin:
+                        genuine.append((sem, nat))
+                        continue
+                    if _sep(_synth_like(x), nat) >= discrim_margin:
+                        genuine.append((sem, nat))
+                        need_synth = True   # 真实输入退化
+                    # else: 语义等价兄弟，静默排除
+                except Exception:
+                    continue  # 竞争变体不支持该输入形态——不参与判别力评估
+            # 第 2 步：退化输入下全部判定改用合成输入（判据与参照同一输入）。
+            x_eval = _synth_like(x) if need_synth else x
+            if need_synth:
+                provenance.record(provenance.LAYER_PROVIDER, "wrap",
+                                  type(module).__name__, "resynth",
+                                  semantic=self.semantic,
+                                  reason="degenerate_real_input",
+                                  rivals=[s for s, _ in genuine])
+            rel, ref, scale = _rel_to_module(x_eval)
+            # 第 3 步：判别力 = 真竞争者必须被该输入明确区分开（都不匹配模块）。
+            rival_rel = None
+            for _sem, nat in genuine:
+                try:
+                    r = (nat(x_eval, w, eps) - ref).abs().max().item() / scale
+                except Exception:
+                    continue
+                rival_rel = r if rival_rel is None else min(rival_rel, r)
         except Exception as e:
             # 自检失败（如模块不支持该 dtype 输入）必须收敛为"不接管"——
             # 不许穿透 wrap_model（不变式 1：只降性能不降功能）。
@@ -300,17 +473,30 @@ class Provider(ABC):
                               semantic=self.semantic, reason="self_check_error",
                               error=f"{type(e).__name__}: {e}")
             return False
+        if rival_rel is not None and rival_rel < discrim_margin:
+            # 真竞争者在非退化输入上也与模块一致：模块语义究竟属哪个变体无法
+            # 判定，拒绝接管并留痕，不赌（宁可退 native 不猜语义）。
+            provenance.record(provenance.LAYER_PROVIDER, "wrap",
+                              type(module).__name__, "rejected",
+                              semantic=self.semantic, reason="indiscriminable",
+                              rel_err=round(rel, 6),
+                              rival_rel=round(rival_rel, 6),
+                              margin=discrim_margin)
+            return False
         ok = rel < admit_tol
-        # fx graph SSA 结构对比（辅助等价证据，与数值兜底互补）：分解 vs 分解时
-        # 结构一致证明 native 复刻了框架的标准分解语义；融合算子不适用（需开发者
-        # 确认 + 精度兜底）。只记录证据，不单独判错（接管决策由数值兜底 rel 判定）。
-        fx = self._fx_ssa_compare(module, eps, x, ref_forward=ref_forward)
+        # fx graph 规范化节点对比（辅助等价证据，与数值兜底互补）：分解 vs 分解时
+        # 一致是 native 复刻了框架分解语义的**弱正向证据**；融合算子不适用。
+        # 永远只记录证据，序列/结构不等**不构成拒绝理由**（见 _fx_graph_compare
+        # 的判据契约）——接管决策 100% 由数值兜底 rel + 判别力裁决。
+        fx = self._fx_graph_compare(module, eps, x_eval, ref_forward=ref_forward)
         if fx is not None:
             provenance.record(provenance.LAYER_PROVIDER, "wrap",
-                              type(module).__name__, "fx_ssa",
+                              type(module).__name__, "fx_op_seq",
                               semantic=self.semantic,
                               applicable=fx.get("applicable", False),
-                              ssa_equal=fx.get("ssa_equal"),
+                              op_seq_equal=fx.get("op_seq_equal"),
+                              norm_equal=fx.get("norm_equal"),
+                              probe_dtype=fx.get("probe_dtype"),
                               note=fx.get("reason", ""))
         if not ok:
             # 精度不一致（兜底生效）：本 provider 语义与模块真实实现不匹配——

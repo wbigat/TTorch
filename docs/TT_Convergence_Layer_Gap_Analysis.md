@@ -12,6 +12,15 @@
 >
 > **配套文档**：各条的社区解法对照与可选方案见 `TT_Convergence_Fix_Options.md`。
 >
+> **本文范围说明（2026-11-04）**：本文只管 D1–D14（收束层边界）。
+> 另两组缺陷的 as-built 整体逻辑写在各自的机制文档里，不在此重复：
+> - **A1–A5**（provider 准入链路：梯度契约 / 生产 dtype 轨道 / 判别力裁决 /
+>   flag 先验 / fx 图口径）→ `TT_Provider_Function_Map.md` §6.4；
+> - **B1–B3**（XSwift 退役后的框架功能补丁通道 + large-weight shim）
+>   → `TT_Bridge_Deep_Dive.md` §9。
+>
+> 其中 A5 对 `_fx_graph_compare` 的口径收紧与本文 D9 同源，记在 D9 节内。
+>
 > **修复状态（2026-10-22）**：
 > - ✅ **D1 / D3 / D11 已修复并实测**（两档激活 + 进程分类 + 完整回滚含扫尾 +
 >   provenance pid/rank + fork 事件流按进程重置；单测 14 例 + 4 卡 DP 回归通过）
@@ -775,15 +784,26 @@ x = torch.randn(4, w.numel(), dtype=torch.float32, ...)   # 固定形状
 > 特判"不崩+形状一致"（无数值可比）。单测 `test_provider_admit.py`（边界变体 +
 > native 空张量正确 + 泛化校验 5 边界全过）。
 >
-> **fx graph SSA 结构对比（2026-10-23 落地，`_self_check` 的一环）**：
-> `Provider._fx_ssa_compare` 用 functorch make_fx 转译 module 与 provider.native 的
-> 计算图，对比算子序列（SSA）。**关键定位（用户澄清）**：对比的是**分解 vs 分解**
-> （外部框架的小算子实现 vs provider native，都是小算子）——SSA 直接可比。实测：
+> **fx graph 规范化节点对比（2026-10-23 落地，`_self_check` 的一环；
+> 2026-11-03 A5 改名并收紧）**：`Provider._fx_graph_compare` 用 functorch
+> make_fx 转译 module 与 provider.native 的计算图后比较**规范化节点**
+> （target + def-use 边 + 常量/维度字面量 + kwargs）。**关键定位（用户澄清）**：
+> 对比的是**分解 vs 分解**（外部框架的小算子实现 vs provider native）。实测：
 > LlamaRMSNorm/Gemma3RMSNorm 分解（可比，Gemma3 的 zcg 1+w 多一个 add 被识别）。
 > **融合算子的语义等价由开发者确认 + 精度 case 兜底**（数值自检）。
-> 结果记 provenance（fx_ssa 事件），作辅助证据——不单独判错（接管决策由数值兜底
-> rel 判定）。修正点：延迟自检时 module.forward 已被替换，需用 ref_forward 追踪
-> 模块原始实现（否则递归追到 ProviderModuleForward 分发逻辑）。
+> 结果记 provenance（`fx_op_seq` 事件），作**弱辅助证据**——图不等不构成拒绝
+> 理由（接管决策 100% 由数值兜底 rel + 判别力裁决）。修正点：延迟自检时
+> module.forward 已被替换，需用 ref_forward 追踪模块原始实现（否则递归追到
+> ProviderModuleForward 分发逻辑）。
+>
+> **口径收紧（2026-11-03，A5）**：旧名 `_fx_ssa_compare` / 字段 `ssa_equal`
+> 误导为"SSA 等价证明"，实际只比较 `call_function` 的 target **名称有序列表**。
+> 实测假阳性：eps `1e-6`→`0.1`、归约维 `-1`→`0` 都判 `True`，实际输出误差
+> 0.25 / 0.91；假阴性：`mean` vs `sum/N` 数学等价但序列不等。现字段为
+> `op_seq_equal`（名称序列）+ `norm_equal`（规范化结构），并剥离
+> `aten.detach` 等 autograd 伪影（否则同一实现在不同 grad 上下文下结论会翻转）。
+> 结论随 dtype 变化（fp32 标准 6 ops / zcg 7 ops；bf16 各多 `_to_copy` 变 8/10），
+> 只对 `probe_dtype` 成立，不可外推。
 >
 > **归因修正（2026-10-26）**：此前"Qwen2RMSNorm 是 transformers 5.12.1 原生融合
 > （custom_ops.rms_layer_norm）"的结论**错误**——transformers 源码里 Qwen2/

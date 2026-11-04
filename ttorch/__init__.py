@@ -60,6 +60,14 @@ def activate(platform="auto", sweep_packages=None, skip_conformance=False):
     # （性能替换的执行归 provider，bridge 只管功能域的 torch.cuda 收束）。
     from ttorch.provider import fn_binding
     fn_binding.install()
+    # 框架功能补丁（bridge 层，与性能接管分开）：修框架自身实现的正确性缺陷
+    # ——不替换 kernel、收益恒 1x，走 provider 门禁会被收益门禁误判。
+    # 装在 fn_binding 之后：两条通道的 finder 独立，顺序不影响正确性，但让
+    # 摘要打印保持"性能绑定 → 功能补丁"的阅读顺序。
+    from ttorch.bridge import patches as _fw_patches
+    _fw_patches.register_all()
+    from ttorch.bridge import framework_patch as _fw
+    _fw.install(verbose=not skip_conformance)
     # 激活完成仪式（打进程标记 + 挂 fork 钩子）：必须放这里而非 .pth——
     # 显式 activate() 的进程也要让其后代能判"派生"（D1）、fork 事件流重置
     # （D11），详见 utils/_auto_init.mark_activated 的注释。
