@@ -46,7 +46,26 @@ def assert_bindings_intact(snapshot):
     rows = []
     n = 0
     for (mod_name, attr), expected in snapshot.items():
-        cur = getattr(importlib.import_module(mod_name), attr, None)
+        # key 支持两种形态（2026-11-04）：
+        #   "pkg.mod"             -> 模块级符号
+        #   "pkg.mod:Class[.Sub]" -> 类（方法）落点
+        # 不支持后者时，一条类方法绑定就会让 import_module("GPTBridge") 抛
+        # ModuleNotFoundError，**整个完整性检测被打断**（实测）。
+        path, _, cls_chain = mod_name.partition(":")
+        try:
+            holder = importlib.import_module(path)
+            for part in filter(None, cls_chain.split(".")):
+                holder = getattr(holder, part)
+        except (ImportError, AttributeError) as e:
+            # 定位不到 holder 本身也是一种"完整性丢失"，按篡改计并留证据，
+            # 不让异常穿透打断对其余条目的检查。
+            n += 1
+            provenance.record(provenance.LAYER_BRIDGE, "bind",
+                              f"{mod_name}.{attr}", "tampered",
+                              current=f"holder 不可定位: {type(e).__name__}")
+            rows.append((False, f"{mod_name}.{attr}"))
+            continue
+        cur = getattr(holder, attr, None)
         ok = cur is expected
         if not ok:
             n += 1
