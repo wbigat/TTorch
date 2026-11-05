@@ -17,6 +17,7 @@ swift 包），但走独立的注册表与 wrap 语义。
 
 补丁清单见 patches.py；本模块只提供机制。
 """
+import importlib.abc
 import sys
 from dataclasses import dataclass, field
 from typing import Callable
@@ -56,6 +57,12 @@ class FunctionPatch:
     intent：补丁要修的是什么缺陷——没有 intent 半年后没人敢删。
     applies_when：() -> bool 的前置判据（如"仅 CP>1 时需要"）。返回 False
         则不接管并留痕，而不是静默跳过（失效必须可见）。
+    retry_after：前置条件依赖**另一个模块的安装动作**时，给出这些模块名——
+        它们 exec 完成时会重试本补丁。典型场景（2026-11-04 实测）：B1 的
+        判据要求 mcore_bridge 已把上游符号包进闭包，而该动作发生在
+        ``import mcore_bridge``（其 __init__ 调 apply_patch）期间——若
+        rope_utils 先于它被 import，首次判据必然失败，必须靠
+        ``retry_after=("mcore_bridge",)`` 在它 exec 完成后重试。
     """
     dotted: str
     module: str
@@ -64,6 +71,7 @@ class FunctionPatch:
     intent: str = ""
     applies_when: Callable = None
     upstream_ref: str = ""     # 对应的上游 issue/PR，便于升级时判断能否删
+    retry_after: tuple = ()
 
 
 _PATCHES = []
@@ -179,37 +187,67 @@ def _apply_one(p: FunctionPatch):
         return False
 
 
-class _PatchFinder:
-    """import 钩子：目标模块加载完成的瞬间打补丁。
+class _PatchFinder(importlib.abc.MetaPathFinder):
+    """import 钩子：目标模块 exec_module 完成的瞬间打补丁（后置通道）。
 
     与 fn_binding._PostImportFinder 同构但独立——两条通道的注册表与语义不同，
     共用一个 finder 会让"性能绑定"与"功能补丁"的失效诊断混在一起。
+
+    **实现要点（2026-11-04 修复）**：必须**包装真实 loader 的 exec_module**
+    并在模块体执行完后立即绑定——旧实现只在 find_spec 里把模块名记入
+    _PENDING，exec 完成后没有任何地方 drain，"先 install 后 import"的路径
+    （正是生产 activate 的真实时序）补丁永远打不上。回归
+    tests/unit/test_framework_patch_hook.py。
     """
 
-    def find_module(self, fullname, path=None):
-        return None
+    def __init__(self):
+        # 重入防护：本 finder 委托遍历 meta_path 时，若另一个 TT 后置 finder
+        # （fn_binding._PostImportFinder）盯上同一模块，对方会再委托回来——
+        # 各自只跳过 `finder is self`，形成无限互递归（2026-11-05 实测
+        # RecursionError：activate 的 rope_utils 绑定 + B1 补丁同模块）。
+        # 被委托而重入时返回 None 让位，外层循环继续找到真实 loader；
+        # 两通道的 exec 包装自然嵌套，两个钩子都会执行。回归
+        # tests/unit/test_finder_mutual_guard.py。
+        self._resolving = set()
 
     def find_spec(self, fullname, path=None, target=None):
-        if any(p.module == fullname for p in _PATCHES):
-            _PENDING.add(fullname)
-        return None
+        targets = {p.module for p in _PATCHES}
+        triggers = {m for p in _PATCHES for m in p.retry_after}
+        if fullname not in targets and fullname not in triggers:
+            return None
+        if fullname in self._resolving:
+            return None
+        self._resolving.add(fullname)
+        try:
+            for finder in sys.meta_path:
+                if finder is self or not hasattr(finder, "find_spec"):
+                    continue
+                spec = finder.find_spec(fullname, path, target)
+                if spec is not None and spec.loader is not None:
+                    break
+            else:
+                return None
+        finally:
+            self._resolving.discard(fullname)
+        orig_exec = spec.loader.exec_module
 
-
-_PENDING = set()
-
-
-def _drain_pending():
-    """把已完成 import 的待处理模块逐个打上补丁。"""
-    for name in list(_PENDING):
-        if name in sys.modules:
+        def _exec(module):
+            orig_exec(module)
+            # 模块体执行完立即绑定：from-import 方拿到的就是新实现。
+            # 除目标模块自身外，retry_after 声明的依赖模块 exec 完成也重试——
+            # 前置条件依赖其他模块的安装动作时，首次判据必然失败（见字段说明）。
             for p in _PATCHES:
-                if p.module == name:
+                if _APPLIED.get(p.dotted) == "applied":
+                    continue
+                if p.module == module.__name__ or module.__name__ in p.retry_after:
                     _apply_one(p)
-            _PENDING.discard(name)
+
+        spec.loader.exec_module = _exec
+        return spec
 
 
 def install(verbose=True):
-    """安装功能补丁（幂等）。已在场的模块立即打，未到场的等 import。
+    """安装功能补丁（幂等）。已在场的模块立即打，未到场的等 import 钩子。
 
     返回 patch_status() 快照。摘要打印让"补丁没生效"立刻可见——静默失效
     是最危险的状态（训练照跑，但缺陷依旧）。
@@ -220,7 +258,6 @@ def install(verbose=True):
         sys.meta_path.insert(0, _PatchFinder())
     for p in _PATCHES:
         _apply_one(p)
-    _drain_pending()
     status = patch_status()
     if verbose and status:
         applied = sum(1 for v in status.values() if v == "applied")
@@ -236,4 +273,3 @@ def uninstall():
     sys.meta_path[:] = [f for f in sys.meta_path
                         if not isinstance(f, _PatchFinder)]
     _INSTALLED = False
-    _PENDING.clear()

@@ -32,6 +32,10 @@ XSWIFT_PLUGIN_ENABLE=0 python real_sft_smoke.py --platform cpu  # 无卡机器
 CPU fp32 参考 rel_err < 5e-3）。模型自造是有意的：精度对账需要逐位可控的
 参考实现，真实模型做不到。
 
+`integration/vendor_bugs/` 归档**厂商算子缺陷**的最小复现与报告（零 TT 依赖，
+可直接发厂商）：当前有 `b8_rotary_pos_emb_backward/`（部分旋转反向梯度错，
+复现退出码 1 为预期）。
+
 ## e2e
 
 ```bash

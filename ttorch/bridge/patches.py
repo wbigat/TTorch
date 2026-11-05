@@ -13,7 +13,8 @@
 """
 from ttorch.bridge.framework_patch import FunctionPatch, register_patch
 
-__all__ = ["register_all", "thd_rope_cp_group_wrapper"]
+__all__ = ["register_all", "thd_rope_cp_group_wrapper", "gather_object_cpu_wrapper",
+           "ddp_stream_fence_wrapper"]
 
 # mcore_bridge 在自己的 patch 闭包里保存的上游实现名
 _MCORE_BRIDGE_ORIGIN = "_origin_apply_rotary_pos_emb_thd"
@@ -21,6 +22,91 @@ _MCORE_BRIDGE_ORIGIN = "_origin_apply_rotary_pos_emb_thd"
 _THD_MODULE = "megatron.core.models.common.embeddings.rope_utils"
 _THD_ATTR = "_apply_rotary_pos_emb_thd"
 _THD_DOTTED = f"{_THD_MODULE}.{_THD_ATTR}"
+
+_GATHER_MODULE = "swift.loss.embedding"
+_GATHER_ATTR = "gather_object"
+_GATHER_DOTTED = f"{_GATHER_MODULE}.{_GATHER_ATTR}"
+
+_WRAP_MODEL_MODULE = "swift.megatron.utils.megatron_lm_utils"
+_WRAP_MODEL_ATTR = "wrap_model"
+_WRAP_MODEL_DOTTED = f"{_WRAP_MODEL_MODULE}.{_WRAP_MODEL_ATTR}"
+
+
+def _fn_source_contains(fn, needle):
+    """源码形态探测：fn 的源码里是否出现 needle。
+
+    升级安全共用件（B1 的 ``_upstream_has_fix`` 同款判据）：用源码形态而非
+    版本号——内部 fork / 定制打包会让版本号说谎。拿不到源码按「不含」处理：
+    该方向是安全的（误判未修复 → 补丁生效但运行时判据兜底；误判已修复
+    才会漏补，而 needle 出现在未修复代码里的概率可忽略）。
+    """
+    import inspect
+
+    try:
+        return needle in inspect.getsource(fn)
+    except (OSError, TypeError):
+        return False
+
+
+def ddp_stream_fence_wrapper(orig):
+    """B5：给 swift ``wrap_model`` 的 DDP 初始化侧流补双向同步栅栏。
+
+    **缺陷（源码核实）**：swift ≤4.3.1 的 ``wrap_model``
+    （`swift/megatron/utils/megatron_lm_utils.py:540`）在**裸侧流**里构造
+    DDP 包装（``with torch.cuda.stream(torch.cuda.Stream())``），侧流与默认
+    流**双向都没有 join**。两个静默隐患：① 侧流的参数拷贝可能读到主流上
+    尚未完成的 ``.cuda()``/cast 结果；② ``broadcast_params()`` 与首次前向
+    可能在侧流写完 flat buffer 前读取它。是否显形取决于 kernel 调度
+    （640 rank-case 无错 ≠ 无风险）。
+
+    **社区修复（已存在）**：ms-swift **≥4.3.2** 的 ``wrap_model`` 已带双栅栏
+    （``ddp_stream.wait_stream(主流)`` + ``主流.wait_stream(ddp_stream)``；
+    v4.3.2 / v4.4.0 / main 均已核实）。本补丁是该修复在 ≤4.3.1 窗口的摆渡。
+
+    **与社区修复的关系——语义等价、实现更强、零复制**：社区的
+    ``wait_stream`` 是事件排序（不阻塞 host）；本补丁在**函数外**加
+    ``synchronize``——入口保证内部侧流启动前主流既有工作全部完成，出口
+    保证内部侧流的 DDP 初始化全部完成后再返回，提供的 happens-before
+    保证与社区修复相同（且更强：host 阻塞；出口的
+    ``torch.cuda.synchronize()`` 是**全设备**同步，会把同进程其它并发流
+    一起等住——``wrap_model`` 是每次启动只跑一次的初始化路径，此代价
+    可接受）。换来的是**不复制** ``wrap_model`` 的 50 行本体（XSwift
+    原补丁是逐字复制 + 两行，框架演进即漂移）。
+    """
+    import functools
+
+    import torch
+
+    @functools.wraps(orig)
+    def wrapper(*args, **kwargs):
+        """swift wrap_model + DDP 侧流双向栅栏。"""
+        torch.cuda.current_stream().synchronize()   # 入口栅栏
+        try:
+            return orig(*args, **kwargs)
+        finally:
+            torch.cuda.synchronize()                # 出口栅栏（异常也执行）
+
+    return wrapper
+
+
+def _ddp_fence_applies():
+    """前置判据：swift 的 wrap_model 在场 **且未含社区修复**（双栅栏）。
+
+    升级安全：源码检出 ``ddp_stream``（≥4.3.2 修复引入的命名流变量）→
+    整个补丁不接管（skipped + 留痕），保证社区更新后零影响。
+    """
+    import sys
+
+    mod = sys.modules.get(_WRAP_MODEL_MODULE)
+    if mod is None:
+        return False
+    fn = getattr(mod, _WRAP_MODEL_ATTR, None)
+    if fn is None:
+        return False
+    # needle 用 "ddp_stream" 而非 "wait_stream"：前者是 4.3.2 修复引入的
+    # 命名流变量，特异性高；后者是通用 API 名，上游无关改动含它就误判
+    # 已修复（方向危险：不接管 → 裸侧流风险静默回归）。
+    return not _fn_source_contains(fn, "ddp_stream")
 
 
 def thd_rope_cp_group_wrapper(orig):
@@ -198,13 +284,7 @@ def _upstream_has_fix(fn):
     在已修复版本上永远命中不了），误判已修复才会漏补，而 ``cp_group=cp_group``
     出现在未修复代码里的概率可忽略。
     """
-    import inspect
-
-    try:
-        src = inspect.getsource(fn)
-    except (OSError, TypeError):
-        return False
-    return "cp_group=cp_group" in src
+    return _fn_source_contains(fn, "cp_group=cp_group")
 
 
 def _thd_rope_applies():
@@ -232,6 +312,64 @@ def _thd_rope_applies():
     return _find_origin_cell(fn) is not None
 
 
+def gather_object_cpu_wrapper(orig):
+    """B7：object gather 前把 payload 里的张量递归搬到 CPU（detach）。
+
+    **定性（2026-11-04 用户确认）**：**未实际复现故障，但理论风险成立**。
+
+    **风险点**：``swift/loss/embedding.py:159-160``（embedding 模型 InfoNCE
+    对比损失跨 DP gather 句向量）对 **CUDA 张量**直接调 accelerate 的
+    ``gather_object``。object collective 的 pickle 序列化会触发 CUDA storage
+    的反序列化——这在 PyTorch/accelerate 的约定中本来就是脆弱用法
+    （推荐 CPU payload），KL3 masquerade 栈的 storage 反序列化路径把该
+    风险进一步放大（XSwift 原补丁注释：Avoid CUDA storage deserialization）。
+
+    **为什么语义零争议**：把 payload 搬 CPU 是 PyTorch 文档对 object
+    collective 的推荐实践；业务侧本来就在 gather 后自己
+    ``.to(sentences.device)`` 搬回（`swift/loss/embedding.py:167`），
+    数值路径不变。与 XSwift 原补丁（``xswift_ext/components/swift/loss/
+    embedding.py``）的差别：原补丁硬编码调 accelerate 的实现，本补丁
+    **包装当前绑定的原函数**（``orig``），不假设其来源。
+
+    **绑定位置为什么有效**：调用点 ``gather_object(...)`` 是
+    ``swift.loss.embedding`` 模块命名空间里的 from-import 绑定
+    （`embedding.py:7`），调用时按模块全局解析——rebind 该命名空间即可
+    生效，无需扫尾。
+
+    **后续**：作为外部框架的基础功能修复点收录；可推 swift 社区
+    （CPU-ify 是普适健壮性改进，所有后端受益），上游采纳后按升级安全退场。
+    """
+    import functools
+
+    import torch
+
+    def _to_cpu_object(obj):
+        """递归 CPU-ify。容器语义：dict/list/tuple 重建保型；namedtuple 用
+        ``_make`` 保型（2026-11-04 review 修正：此前会降级为 plain tuple）；
+        set/frozenset 递归保型；其余 tuple 子类（torch.Size 等）按 plain
+        tuple 重建——payload 实际只含张量与 list，其余类型属防御性覆盖。"""
+        if torch.is_tensor(obj):
+            return obj.detach().cpu()
+        if isinstance(obj, dict):
+            return {k: _to_cpu_object(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_to_cpu_object(v) for v in obj]
+        if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+            return type(obj)._make(_to_cpu_object(v) for v in obj)
+        if isinstance(obj, tuple):
+            return tuple(_to_cpu_object(v) for v in obj)
+        if isinstance(obj, (set, frozenset)):
+            return type(obj)(_to_cpu_object(v) for v in obj)
+        return obj
+
+    @functools.wraps(orig)
+    def wrapper(obj):
+        """accelerate gather_object + payload 递归 CPU-ify。"""
+        return orig(_to_cpu_object(obj))
+
+    return wrapper
+
+
 def register_all():
     """注册全部框架功能补丁（ttorch.activate 时调用）。
 
@@ -242,6 +380,32 @@ def register_all():
     from ttorch.bridge.framework_patch import get_patches
 
     registered = {p.dotted for p in get_patches()}
+    if _WRAP_MODEL_DOTTED not in registered:
+        register_patch(FunctionPatch(
+            dotted=_WRAP_MODEL_DOTTED,
+            module=_WRAP_MODEL_MODULE,
+            attr=_WRAP_MODEL_ATTR,
+            wrapper=ddp_stream_fence_wrapper,
+            intent="补 swift ≤4.3.1 wrap_model 的 DDP 初始化侧流双栅栏"
+                   "（裸侧流建 DDP，参数拷贝与 broadcast/首次前向存在跨流"
+                   "竞态；是否显形取决于 kernel 调度）",
+            applies_when=_ddp_fence_applies,
+            upstream_ref="社区已修复：ms-swift ≥4.3.2 wrap_model 双栅栏"
+                         "（v4.3.2/v4.4.0/main 均核实）；升级后由源码形态"
+                         "探测（wait_stream）自动不接管",
+        ))
+    if _GATHER_DOTTED not in registered:
+        register_patch(FunctionPatch(
+            dotted=_GATHER_DOTTED,
+            module=_GATHER_MODULE,
+            attr=_GATHER_ATTR,
+            wrapper=gather_object_cpu_wrapper,
+            intent="object gather 的 payload 递归 CPU-ify：CUDA storage 反序列化"
+                   "是 object collective 的脆弱用法（未实际复现，理论风险成立），"
+                   "CPU payload 是 PyTorch 推荐实践，语义零争议",
+            upstream_ref="拟推 swift 社区 PR（普适健壮性改进）；上游采纳后"
+                         "按升级安全退场",
+        ))
     if _THD_DOTTED in registered:
         return
     register_patch(FunctionPatch(
@@ -253,6 +417,11 @@ def register_all():
                " cp_group（megatron-core 0.18 起上游对其为硬要求；缺失即"
                " ValueError 或 freqs 按错误 cp_rank 取片）",
         applies_when=_thd_rope_applies,
+        # 判据要求 mcore_bridge 已把上游包进闭包——该动作发生在
+        # import mcore_bridge（__init__ 调 apply_patch）期间；rope_utils
+        # 若先被 import，首次判据必失败，必须在它 exec 完成后重试
+        # （2026-11-04 生产时序实测发现）。
+        retry_after=("mcore_bridge",),
         upstream_ref="社区已修复：modelscope/mcore-bridge PR #146"
                      "（commit 2220f77，2026-07-11，首个含修复版本 1.6.0）；"
                      "本补丁是 ≤1.5.2 窗口的摆渡，升级后由 _upstream_has_fix"

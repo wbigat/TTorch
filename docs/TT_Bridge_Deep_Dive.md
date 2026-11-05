@@ -464,7 +464,9 @@ CP>1 下框架原路径直接 `raise ValueError`，对账不是「超差」而�
 
 准确说，`framework_patch` 就是「**去掉门禁与 dispatcher 的 fn_binding**」。
 不共用 finder 是因为注册表与失效语义不同 —— 共用会把「性能绑定没生效」和
-「功能补丁没生效」的诊断混在一起。
+「功能补丁没生效」的诊断混在一起。**但不共用不等于无交互**：两个 finder 都会在
+`find_spec` 里手动委托遍历 `sys.meta_path`，同一模块同时是两通道目标时会互委托
+无限递归——见 §9.3a 缺陷 3（2026-11-05，双侧已加重入防护）。
 
 ```text
 ttorch.activate()
@@ -496,6 +498,37 @@ ttorch.activate()
 **所有机制异常收敛为"不接管" + provenance 留痕，绝不向上抛**：功能补丁失败应退回
 框架原实现（可能有缺陷但能跑），不能让 TT 把训练搞崩。
 
+### 9.3a 后置钩子的三个实测缺陷（2026-11-04 review 复验发现两个并修复；2026-11-05 PR 收口验证发现第三个并修复）
+
+review 复验时用「先 install 后 import」的生产时序实测，抓到**两个此前所有验证都
+没覆盖到的机制缺陷**（此前的验证全是「先 import 后 install」的直接路径）：
+
+1. **后置钩子根本不触发**：旧 `_PatchFinder` 只在 `find_spec` 里把模块名记入
+   `_PENDING`，**模块 exec 完成后没有任何地方 drain**——生产真实时序
+   （`ttorch.activate()` 早于 `swift.megatron` 导入）下补丁永远打不上，
+   状态永远停在 `pending`。修复：与 `fn_binding._PostImportFinder` 同构，
+   **包装真实 loader 的 `exec_module`**，模块体执行完立即绑定
+   （from-import 方拿到的就是新实现）。
+2. **前置条件的安装时序依赖**：修好钩子后 B1 又暴露第二层——它的判据要求
+   mcore_bridge 已把上游符号包进闭包，而该动作发生在 `import mcore_bridge`
+   （`__init__.py:8` 调 `apply_patch()`）期间；`rope_utils` 若先被 import
+   （它正是被 mcore_bridge 的 exec 链导入的），首次判据必然失败且被永久记录为
+   skipped。修复：`FunctionPatch` 新增 **`retry_after`** 字段——声明依赖模块，
+   其 exec 完成时重试（B1 注册    `retry_after=("mcore_bridge",)`）。
+3. **两通道 finder 互委托无限递归（2026-11-05 PR 收口验证实测）**：`_PatchFinder`
+   与 `fn_binding._PostImportFinder` 都在 `find_spec` 里手动遍历 `sys.meta_path`
+   委托其他 finder，各自只跳过 `finder is self`——当**同一模块同时是两通道目标**
+   （`activate()` 的 provider rope_utils 绑定 + B1 补丁同模块），A 委托 B、B 又委托
+   回 A，无限互递归 → `RecursionError`，megatron 路径整个起不来。此前未暴露：B1 的
+   四卡 e2e 没和 provider fn_binding 同进程叠加，单测两通道各自为战。修复：两侧各加
+   per-module **重入防护**（`_resolving` 集合，被委托而重入时返回 None 让位给真实
+   loader）；两通道的 exec 包装自然嵌套，**两个钩子都执行**。修复后真实场景复验：
+   activate + import megatron rope_utils 正常，B1/B5/B7 全部 `applied`。
+
+回归：`tests/unit/test_framework_patch_hook.py`（3 例）+
+`tests/unit/test_finder_mutual_guard.py`（2 例，均红绿校验——互递归用例在修复前
+稳定 RecursionError）。
+
 ### 9.3 两个落在实践里的机制修正
 
 **(a) 类方法落点禁用扫尾。** `_rebind._sweep` 是拿**叶子名**去各模块 `getattr`
@@ -520,17 +553,33 @@ ttorch.activate()
 > `cuda_compat.post_bind_snapshot()`（`{key: obj}`），传 `_rebind.snapshot()`
 > （`{key: (obj, owner)}`）会让全部条目误报 tampered——是取证方式错，不是检测坏了。
 
-**当前实测数**（真机 `mcore_bridge` 1.5.1 在场，`activate(skip_conformance=True)`）：
-`tampered=0 / 84`，owner 分布 `bridge 80 + provider 3 + fwpatch 1`。
-（B2/B3 撤出前是 87 = 80+3+**4**，差额正是撤出的 3 条注册，逐项对得上。）
+**当前实测数**（2026-11-05 复验，真机 `mcore_bridge` 1.5.1 在场，
+`activate()` + 三补丁落点后）：
+`tampered=0 / 86`，owner 分布 `bridge 80 + provider 3 + fwpatch 3`。
+（11-04 撤出 B2/B3 后是 84 = 80+3+1；本轮 +2 正是 B5/B7 两条 fwpatch 注册，
+逐项对得上。）
 
 ### 9.4 补丁清单（`bridge/patches.py`）
 
 | ID | 落点 | 修什么 | 验证状态 |
 |---|---|---|---|
 | B1 | `megatron...rope_utils._apply_rotary_pos_emb_thd` | THD RoPE non-batched fallback 丢失 `cp_group`（社区缺陷，已含升级安全保障，见 §9.4a/b） | 单测 12 例（含红绿）+ 真机落点验收 + **真实链路 e2e 全档**（`b1_thd_rope_e2e.py`：CP=1 gloo + **CP=2/CP=4 四卡 XPU**——各 rank 无补丁复现 ValueError / 有补丁 ≡ 直调上游逐位 ≡ zigzag 手写参考 err≈2e-7）。**多卡算子级已闭环**；训练级因 Qwen3.5 走 batched 分支未触发 fallback（原因已定位） |
+| B5 | `swift.megatron.utils.megatron_lm_utils.wrap_model` | DDP 初始化侧流补双栅栏（社区缺陷，≥4.3.2 已修；函数外 synchronize 栅栏，语义等价零复制） | 单测 6 例 + 真实模块三命名空间换绑核实；**4 卡训练冒烟未验**（可并 E14） |
+| B7 | `swift.loss.embedding.gather_object` | object gather 的 payload 递归 CPU-ify（**未实际复现，理论风险成立**：CUDA storage 反序列化是 object collective 的脆弱用法） | 单测 6 例 + 真实落点 `applied`（2026-11-05 复验）；**真实 embedding InfoNCE 训练未验**（场景不在当前环境） |
 
-**注册即全部 —— 当前只有这 1 条。** B2/B3（large-weight）已于 2026-11-04 撤出，见 §9.5。
+当前注册 3 条（B1 + B5 + B7）。B2/B3（large-weight）已于 2026-11-04 撤出，见 §9.5。
+
+**B5 的两个设计点**：① 函数外 `synchronize` 栅栏与社区 `wait_stream` 提供同一组
+happens-before（更强：host 阻塞），换来零复制（XSwift 原补丁是 50 行逐字复制 +
+两行，框架演进即漂移）；`wrap_model` 每次启动只跑一次，成本可忽略。
+② `wrap_model` 被两层 from-import 转链（`megatron_lm_utils` → `utils/__init__`
+→ `trainers/base`），机制默认扫尾（`_SWEEP_PACKAGES` 含 `swift`）自动覆盖三个
+命名空间——无需改机制。
+
+**B7 的绑定位置为什么不用扫尾**：调用点 `gather_object(...)` 是
+`swift.loss.embedding` 模块命名空间里的 from-import 绑定（`embedding.py:7`），
+调用时按模块全局解析——rebind 该命名空间即生效。与 XSwift 原补丁的差别：
+包装**当前绑定的原函数**（`orig`），不硬编码 accelerate 实现来源。
 
 实测验收（真实 `mcore_bridge` 1.5.1 / `megatron.core` 0.18.0 在场，撤出后复验）：
 
@@ -649,8 +698,10 @@ ttorch/bridge/patches.py 的 B2/B3 注册+wrapper├─► experiments/large_wei
 tests/unit/test_large_weight_shim.py        ─┘   （不参与 ttorch 包导入）
 ```
 
-撤出后：`patches.py` 只注册 B1 一条；`pytest tests/unit` = **88 例**（含 B1 升级安全与幂等共 12 例）
+撤出后：`patches.py` 只注册 B1 一条；当时 `pytest tests/unit` = **88 例**（含 B1 升级安全与幂等共 12 例）
 （存档的 17 例在 `experiments/large_weight/` 单独跑）。
+**当前（2026-11-05，B5/B7/finder 入库后）= 105 例**，组成：44 既有 + A 组 32 +
+B1 12 + B5 6 + B7 6 + hook 3 + finder 互递归 2。
 完整的来源、理由与留给新方案的结论见 `experiments/large_weight/README.md`。
 
 **撤出理由 —— 触发条件决定归属**。源码核实确认：这些缺口**仅在主动开启
