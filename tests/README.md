@@ -36,6 +36,36 @@ CPU fp32 参考 rel_err < 5e-3）。模型自造是有意的：精度对账需�
 可直接发厂商）：当前有 `b8_rotary_pos_emb_backward/`（部分旋转反向梯度错，
 复现退出码 1 为预期）。
 
+### big_leaf 真实硬件集成测试
+
+从仓库根执行，并显式指定当前源码，避免导入旧安装包：
+
+```bash
+export PYTHONPATH="$PWD"
+python tests/integration/big_leaf/core.py
+python tests/integration/big_leaf/checkpoint.py
+python tests/integration/big_leaf/forward_patch.py
+python tests/integration/big_leaf/regressions.py
+python tests/integration/big_leaf/lora.py
+```
+
+分布式与全模型测试：
+
+```bash
+torchrun --standalone --nproc-per-node=2 tests/integration/big_leaf/distopt.py --runtime-wrapper
+torchrun --standalone --nproc-per-node=2 tests/integration/big_leaf/distopt_checkpoint.py
+torchrun --standalone --nproc-per-node=2 tests/integration/big_leaf/lora_distopt.py
+TP_SIZE=2 EP_SIZE=1 torchrun --standalone --nproc-per-node=2 tests/integration/big_leaf/tp_ep.py
+TP_SIZE=1 EP_SIZE=2 torchrun --standalone --nproc-per-node=2 tests/integration/big_leaf/tp_ep.py
+
+python tests/integration/big_leaf/full_model.py --bigleaf 0 --out /tmp/big_leaf_stock.json
+python tests/integration/big_leaf/full_model.py --bigleaf 1 --out /tmp/big_leaf_big.json
+python tests/integration/big_leaf/full_model.py --compare /tmp/big_leaf_stock.json /tmp/big_leaf_big.json
+```
+
+这些脚本使用真实加速卡，不会被 `pytest tests/unit` 收集；性能 benchmark 不属于核心
+正确性套件。
+
 ## e2e
 
 ```bash
@@ -51,6 +81,19 @@ checkpoint resume 连续性 / schema 守门 / **运行期中转证据**（证明
 
 `run_swift_megatron.sh` 不复制生产训练脚本，只套环境变量后转调——生产脚本
 含集群路径与 API Key，不进仓库。前置条件见脚本头部注释。
+
+big_leaf 生产验收使用独立 Python CLI，不在仓库根放置 `run.sh`：
+
+```bash
+python tests/e2e/big_leaf_production.py --mode smoke --production-script-dir /path/to/production
+python tests/e2e/big_leaf_production.py --mode lifecycle --production-script-dir /path/to/production
+python tests/e2e/big_leaf_production.py --mode benchmark --steps 200 --rounds 3 --warmup 20 \
+  --production-script-dir /path/to/production
+```
+
+`--production-script-dir` 指向含 `run.sh + train_megatron.sh` 的目标生产目录，也可用
+`TRAIN_SCRIPT_DIR` 设置。首次生成合成资产需 `--tokenizer`，完整缓存或
+`--model + --dataset` 不需要 tokenizer。
 
 **对照组是归因工具**：接框架后遇到任何报错，先用 `TT_MODE=0` 跑一遍。实测
 踩过一次——`SEQ_LEN=2048` 下 `get_rope_index` 崩，对照组同样崩在同一行，
