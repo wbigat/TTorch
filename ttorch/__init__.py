@@ -26,7 +26,7 @@ __all__ = ["activate", "active", "is_active", "assert_healthy", "device_spec",
            "finalize", "provider_wrap", "provider_auto_wrap",
            "restore_vendor_symbols", "check_bindings", "assert_bindings_intact",
            "start_call_trace", "call_trace_report", "TTPlatformError",
-           "FRAMEWORK_PACKAGES"]
+           "FRAMEWORK_PACKAGES", "apply_big_leaf"]
 
 
 def activate(platform="auto", sweep_packages=None, skip_conformance=False):
@@ -68,6 +68,12 @@ def activate(platform="auto", sweep_packages=None, skip_conformance=False):
     _fw_patches.register_all()
     from ttorch.bridge import framework_patch as _fw
     _fw.install(verbose=not skip_conformance)
+    # Swift 会在父进程之外再执行 torchrun worker 的 sft.py。显式设置总开关
+    # （含 0 的 stock A/B）时，每个 worker 都安装同一套 fast-FC 生命周期；
+    # 派生 DataLoader 进程不建模，保持轻量且不安装训练补丁。
+    if not skip_conformance and "TT_BIG_LEAF" in os.environ:
+        from ttorch.bridge.big_leaf.swift import enable_from_env
+        enable_from_env()
     # 激活完成仪式（打进程标记 + 挂 fork 钩子）：必须放这里而非 .pth——
     # 显式 activate() 的进程也要让其后代能判"派生"（D1）、fork 事件流重置
     # （D11），详见 utils/_auto_init.mark_activated 的注释。
@@ -90,6 +96,16 @@ def assert_healthy():
     不是错误状态）。实现见 bridge.bootstrap.assert_healthy()。
     """
     _bootstrap.assert_healthy()
+
+
+def apply_big_leaf(model, **kwargs):
+    """对 TE GroupedLinear 应用 big_leaf；仅在显式调用时导入 TE 实现。
+
+    Megatron dist-opt 不走此单机入口，使用 ``ttorch.bridge.big_leaf.megatron``
+    或 ``python -m ttorch.bridge.big_leaf.swift`` 完成 DDP 生命周期接线。
+    """
+    from ttorch.bridge.big_leaf.core import apply_big_leaf as _apply
+    return _apply(model, **kwargs)
 
 
 def provider_wrap(model):

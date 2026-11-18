@@ -393,7 +393,14 @@ mock 类 / AOT kernel）根本不可比。另：结论随 dtype 变化（fp32 �
 | `test_selfcheck_discriminability.py` | 6 | 零输入不误接管 / 语义等价兄弟不互相否决 / 分不开则拒绝 |
 | `test_wrap_retry_flag.py` | 3 | flag 写错时重试能纠正（不再死锁退 native） |
 | `test_fx_graph_compare.py` | 7 | eps/归约维假阳性被 `norm_equal` 捕获 / detach 伪影被剥离 |
-| **合计** | **32** | 6 文件。B1 的 `test_framework_patch_thd_rope`（9 例）见 `TT_Bridge_Deep_Dive.md` §9；large-weight 的 17 例已随 B2/B3 撤出到 `experiments/large_weight/` |
+| `test_finder_mutual_guard.py` | 2 | fn_binding 与 framework_patch 两个后置 finder 同模块双目标时不再互委托无限递归（2026-11-05，红绿：修复前稳定 RecursionError）；单通道场景不误伤 |
+| **合计** | **34** | 7 文件。B1/B5/B7 的 framework_patch 回归（12+6+6+3 例）见 `TT_Bridge_Deep_Dive.md` §9；large-weight 的 17 例已随 B2/B3 撤出到 `experiments/large_weight/` |
+
+**finder 互委托递归（2026-11-05 修复，跨 fn_binding / framework_patch 的机制级缺陷）**：
+两个后置 finder 在 `find_spec` 里手动遍历 `sys.meta_path` 委托时只跳 `self`，
+同一模块同时是两通道目标即无限互递归（activate + B1 + import megatron rope_utils
+必现）。两侧加 per-module 重入防护（`_resolving`）；详见 `TT_Bridge_Deep_Dive.md`
+§9.3a 缺陷 3。
 
 **红绿校验曾出过一次假信号（记录在案）**：A1 首版断言写 `speedup < 1.0`，但该条件对
 修复前后**都成立**（autograd.Function 的 Python 调度开销让仅-fwd 口径也只有 0.38）

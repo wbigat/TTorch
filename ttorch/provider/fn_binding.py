@@ -251,19 +251,30 @@ class _PostImportFinder(importlib.abc.MetaPathFinder):
 
     def __init__(self, on_module):
         self._on_module = on_module
+        # 重入防护：与 framework_patch._PatchFinder 互委托时防无限互递归
+        # （同一模块同时在两通道目标集合，2026-11-05 实测 RecursionError）。
+        # 详见 framework_patch._PatchFinder.__init__ 注释；回归
+        # tests/unit/test_finder_mutual_guard.py。
+        self._resolving = set()
 
     def find_spec(self, fullname, path=None, target=None):
         pending = {b.module for b in _BINDINGS}
         if fullname not in pending:
             return None
-        for finder in sys.meta_path:
-            if finder is self or not hasattr(finder, "find_spec"):
-                continue
-            spec = finder.find_spec(fullname, path, target)
-            if spec is not None and spec.loader is not None:
-                break
-        else:
+        if fullname in self._resolving:
             return None
+        self._resolving.add(fullname)
+        try:
+            for finder in sys.meta_path:
+                if finder is self or not hasattr(finder, "find_spec"):
+                    continue
+                spec = finder.find_spec(fullname, path, target)
+                if spec is not None and spec.loader is not None:
+                    break
+            else:
+                return None
+        finally:
+            self._resolving.discard(fullname)
         orig_exec = spec.loader.exec_module
         on_module = self._on_module
 

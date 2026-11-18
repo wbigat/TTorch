@@ -1,6 +1,11 @@
 # KLX large weight（`XTE_GROUPED_GEMM_LARGE_WEIGHT`）特性全链路分析
 
 - 整理日期：2026-10-30
+- **2026-11-05 复核（全量代码枚举）**：XTE / XME / XSwift 三包的点位与本文 L0–L8 清单
+  逐一对账一致；**torch_xmlir 全包证伪零参与**（`large_weight|LARGE_WEIGHT` 0 命中，
+  symbrewrite 81 个插件文件无 megatron/TE/MoE 类，`megatron|expert` 命中仅为 C++ 底层
+  kernel 头文件与版本探测）——该特性的全部上层逻辑就在 TE + XME + XSwift 三个包，
+  torch_xmlir 只提供底层 grouped GEMM/dispatch kernel 能力。
 - 来源：从《XSwift 退役能力分析与实施计划》（`xswift_退役能力分析与实施计划_20261029.md` §14）抽离为独立文档，主文档 §14 已替换为指向本文的指针。
 - 环境基线：KL3 / XTE `transformer_engine==2.12.0+c9c3d0d9`、Megatron 0.18、`mcore_bridge`、XME `xmegatron_ext`、XSwift `xswift_ext`。
 - 一句话定性：**large weight 是 KL3 专属的性能特性，不是跨平台通用优化，更不是正确性特性**；本质是"list kernel 有精度 bug 被互斥禁用、唯一可用 kernel 只吃连续 3D 张量"这一现状下的结构解。
@@ -17,6 +22,8 @@
 8. 升级到 TE 2.14 / 上游 single_grouped_weight 的可行性
 9. 对 XSwift 退役的结论
 10. 证据位置
+11. **替代方案简介：big_leaf（详见 big_leaf 专属文档）**
+12. ckpt 补丁归因与 swift 路径缺口
 
 ---
 
@@ -381,9 +388,27 @@ mcore_bridge 对非标准权重布局的两个契约漏洞：
 - 实测证据：`/root/dl/TTorch/.benchmarks/xswift_full_20261029/`（15 项 rank-case）
 ---
 
-## 11. ckpt 补丁归因与 swift 路径缺口（2026-10-30）
+## 11. 替代方案简介：big_leaf
 
-### 11.1 XME 全部 ckpt 相关补丁：门控、用途、是否 large-weight 引入
+big_leaf 是不改变原 `weight{i}` 注册名和模型 checkpoint 逻辑键的 LW 替代方案：
+它在连续存储上建立自持有的 plain-tensor 大叶子，forward 直接消费大权重，并将特有
+适配集中在 TTorch。生产固定 patch forward，通过唯一 `TT_BIG_LEAF` 总开关接入
+Megatron DistributedOptimizer 的 DDP layout、main_grad 和 fast-FC 生命周期，复用原
+optimizer/checkpoint 逻辑契约；手工普通 optimizer 路径仍需显式 state converter。
+它不完整获得 LW=1 的 optimizer 单实体收益，也不代表所有外部流程无感。
+
+在当前 4 层×16 专家代理模型上，相对同环境 TTorch LW=0 stock 的三轮 200 步整网
+`train_step` 中位数加速为 **1.030-1.056x**；该结果没有 LW=1 同环境对照，也不外推
+大型生产模型。
+
+**big_leaf 的方案推导、代码逻辑、与 LW 的 gap、完整测试、阶段完善、支持边界和
+后续优化均见 `docs/big_leaf_方案设计与实现_20261109.md`；本文不再重复展开。**
+
+---
+
+## 12. ckpt 补丁归因与 swift 路径缺口（2026-10-30）
+
+### 12.1 XME 全部 ckpt 相关补丁：门控、用途、是否 large-weight 引入
 
 以下逐条经过**源码核实**（非仅注释）。`xmegatron_ext/plugin.py` 的 ckpt/优化器相关补丁：
 
@@ -403,7 +428,7 @@ mcore_bridge 对非标准权重布局的两个契约漏洞：
 其余 ckpt 相关补丁是 Bridge 转换显存控制（4 个）与 XPU D2H staging（1 个），与 large-weight 无关；
 `_get_param_groups` 是 MoE+PP 通用正确性补丁，也与 large-weight 无关。
 
-### 11.2 关键：3 个 large-weight ckpt 补丁里，被 swift 旁路的恰好是 2 个函数级的
+### 12.2 关键：3 个 large-weight ckpt 补丁里，被 swift 旁路的恰好是 2 个函数级的
 
 | 补丁 | 层级 | 触发条件 | swift 路径是否触发 |
 | --- | --- | --- | --- |
@@ -419,7 +444,7 @@ swift 的实际路径（`swift/megatron/utils/megatron_lm_utils.py`）：
 
 **已被代码核实**：swift 的 `_generate_state_dict` 不 import / 不调 `megatron.training.checkpointing.generate_state_dict`；`load_mcore_checkpoint` 不调 `_load_base_checkpoint`。
 
-### 11.3 由此产生的盘上格式分叉（large-weight + MoE + swift 的 ckpt 缺口）
+### 12.3 由此产生的盘上格式分叉（large-weight + MoE + swift 的 ckpt 缺口）
 
 因为只有"类方法分片"在 swift 路径触发、而"函数级格式转换"不触发：
 
@@ -437,13 +462,15 @@ swift 的实际路径（`swift/megatron/utils/megatron_lm_utils.py`）：
 
 典型踩坑场景：megatron 预训练出 per-expert ckpt → ms-swift MoE SFT → resume 即挂。
 
-### 11.4 把握度与待实证
+### 12.4 把握度与待实证
 
 - **代码已核实**：XME 3 个补丁的 large-weight 门控、swift 旁路两个函数挂点、类补丁两路径都触发、模型分片两路径正确、4 个 Bridge 补丁与 `_get_param_groups` 均与 large-weight 无关。
 - **待运行时实证**（需多卡 XPU，当前设备不稳定）：两路径各存一个 large-weight MoE dist-ckpt，diff key 集合（`weight{i}` vs `large_weight`）+ 交叉加载，把"格式分叉"从推断变成实测。
 
-### 11.5 对 XSwift 退役的含义
+### 12.5 对 XSwift 退役的含义
 
 - 这 3 个 ckpt 补丁都在 **XME**（不在退役范围），退役 XSwift 不影响它们。
 - XSwift 自己的 ckpt 触点只有 L7（`_set_mlp_state` HF↔MG）和 L8（LoRA merge），与上述 ckpt 格式转换是两件事。
 - **但** §11.3 的格式分叉是 XME 的**挂载位置**问题（挂在 `megatron.training` 而 swift 旁路），与是否退役 XSwift 无关——它在本就运行的 swift 路径上就是一个待补缺口。
+
+---
