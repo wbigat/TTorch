@@ -113,11 +113,33 @@ def enable_from_env():
     enable(big_leaf=_env_bool(ENV_VAR))
 
 
+def _report_overwritten_patches():
+    """swift import 完成后复核 TT 功能补丁是否还在落点上（B17）。
+
+    厂商插件走 lazy hook：`import swift` 才触发 XSwift 的整函数替换，所以
+    `enable()` 里那道"禁止 pending"的 fail-fast **结构上拦不住覆盖**
+    （检查发生在覆盖之前）。这里补上覆盖发生之后的那一眼。
+
+    **刻意不 raise**：过渡期（XSwift=1 + big_leaf）厂商实现本身就在干同一件
+    事（如 wrap_model 的双栅栏），把它判为致命错误会把能正常跑的训练打挂。
+    要的是"失效可见"与归因正确，而不是停机。
+    """
+    from ttorch.bridge import framework_patch as fw
+    overwritten = fw.overwritten_patches()
+    if overwritten:
+        print("[tt] 警告：以下 TT 功能补丁已被第三方（通常是厂商插件）整体覆盖，"
+              "TT 的修正不再生效：", flush=True)
+        for dotted, usurper in overwritten.items():
+            print(f"[tt]   {dotted} -> {usurper}", flush=True)
+    return overwritten
+
+
 def main():
     import ttorch
     ttorch.activate()
     enable_from_env()
     from swift.cli._megatron.main import cli_main
+    _report_overwritten_patches()
     cli_main()
 
 

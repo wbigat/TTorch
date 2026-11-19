@@ -1,0 +1,85 @@
+{
+  "order": "tt_first",
+  "xswift_plugin_enable": "1",
+  "xme_plugin_enable": "0",
+  "large_weight": "1",
+  "after_tt_then_xswift": {
+    "swift.megatron.utils.megatron_lm_utils.wrap_model": {
+      "state": "present",
+      "impl_module": "xswift_ext.components.swift.megatron.utils.megatron_lm_utils",
+      "impl_qualname": "wrap_model",
+      "tt_origin_trace_present": true,
+      "has_functools_wrapped": false,
+      "wrapped_module": null,
+      "is_xswift_impl": true,
+      "closure_marker_tt_cp_group_fixed": null
+    },
+    "swift.loss.embedding.gather_object": {
+      "state": "present",
+      "impl_module": "xswift_ext.components.swift.loss.embedding",
+      "impl_qualname": "gather_object_cpu",
+      "tt_origin_trace_present": true,
+      "has_functools_wrapped": false,
+      "wrapped_module": null,
+      "is_xswift_impl": true,
+      "closure_marker_tt_cp_group_fixed": null
+    },
+    "mcore_bridge.patcher.rope_utils._apply_rotary_pos_emb_thd": {
+      "state": "present",
+      "impl_module": "mcore_bridge.patcher",
+      "impl_qualname": "_patch_mrope.<locals>._apply_rotary_pos_emb_thd",
+      "tt_origin_trace_present": true,
+      "has_functools_wrapped": true,
+      "wrapped_module": "mcore_bridge.patcher",
+      "is_xswift_impl": false,
+      "closure_marker_tt_cp_group_fixed": "marker_absent"
+    }
+  },
+  "tt_active": true,
+  "tt_patch_status": {
+    "swift.megatron.utils.megatron_lm_utils.wrap_model": "overwritten(xswift_ext.components.swift.megatron.utils.megatron_lm_utils.wrap_model)",
+    "swift.loss.embedding.gather_object": "overwritten(xswift_ext.components.swift.loss.embedding.gather_object_cpu)",
+    "megatron.core.models.common.embeddings.rope_utils._apply_rotary_pos_emb_thd": "applied"
+  },
+  "tt_bindings_intact": {
+    "raised": false,
+    "tampered": 4,
+    "tampered_rows": [
+      "megatron.core.models.common.embeddings.rope_utils._apply_rotary_pos_emb_bshd",
+      "megatron.core.models.common.embeddings.rope_utils._apply_rotary_pos_emb_thd",
+      "swift.megatron.utils.megatron_lm_utils.wrap_model",
+      "swift.loss.embedding.gather_object"
+    ]
+  },
+  "tt_overwritten_patches": {
+    "swift.megatron.utils.megatron_lm_utils.wrap_model": "xswift_ext.components.swift.megatron.utils.megatron_lm_utils.wrap_model",
+    "swift.loss.embedding.gather_object": "xswift_ext.components.swift.loss.embedding.gather_object_cpu"
+  },
+  "tt_patch_status_install_time": {
+    "swift.megatron.utils.megatron_lm_utils.wrap_model": "applied",
+    "swift.loss.embedding.gather_object": "applied",
+    "megatron.core.models.common.embeddings.rope_utils._apply_rotary_pos_emb_thd": "applied"
+  },
+  "retirement_report": {
+    "plugins": {
+      "xswift_ext": {
+        "importable": true,
+        "imported": true,
+        "initialized": true,
+        "enable_env": "XSWIFT_PLUGIN_ENABLE",
+        "enable_env_value": "1"
+      },
+      "xmegatron_ext": {
+        "importable": true,
+        "imported": true,
+        "initialized": true,
+        "enable_env": "XME_PLUGIN_ENABLE",
+        "enable_env_value": "0"
+      }
+    },
+    "xswift_protection_expected": true,
+    "dummy_module_traces": [],
+    "export_safety_issues": []
+  },
+  "xswift_initialized": true
+}

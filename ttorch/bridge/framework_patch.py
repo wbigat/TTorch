@@ -22,7 +22,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Callable
 
-from ttorch.utils._rebind import rebind
+from ttorch.utils._rebind import rebind, snapshot
 from ttorch.witness import provenance
 
 # 替换动作的 owner 标识（留痕属性名 `_tt_origin_fwpatch_<attr>`）。
@@ -37,7 +37,7 @@ _OWNER = "fwpatch"
 _SWEEP_PACKAGES = ("megatron", "mcore_bridge", "swift")
 
 __all__ = ["FunctionPatch", "register_patch", "get_patches", "install",
-           "uninstall", "patch_status"]
+           "uninstall", "patch_status", "overwritten_patches"]
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,9 @@ class FunctionPatch:
 
 
 _PATCHES = []
-_APPLIED = {}      # dotted -> "applied" / 跳过原因
+_APPLIED = {}      # dotted -> "applied" / 跳过原因（**安装时**结论，不随后续覆盖变化）
+_BOUND = {}        # dotted -> _rebind 快照 key `(holder_key, leaf)`，运行期复核的基准
+_OVERWRITE_SEEN = {}   # dotted -> 已留痕的篡夺者描述（同一覆盖只记一次证据）
 _INSTALLED = False
 
 
@@ -91,12 +93,115 @@ def get_patches():
     return tuple(_PATCHES)
 
 
-def patch_status():
-    """每条补丁的当前状态（applied / 跳过原因 / pending）。失效可见。"""
+def _describe_impl(obj):
+    """当前落点上那个对象的可读身份（谁把我们顶掉了）。"""
+    if obj is None:
+        return "符号已消失"
+    mod = getattr(obj, "__module__", None) or "?"
+    name = getattr(obj, "__qualname__", None) or getattr(obj, "__name__", None) \
+        or type(obj).__name__
+    return f"{mod}.{name}"
+
+
+def _overwritten_by(p):
+    """运行期复核一条**安装时为 applied** 的补丁是否还在落点上。
+
+    返回篡夺者描述（字符串）或 None（仍是我们装的那个）。
+
+    为什么必须复核（2026-11-18 实测，退役文档 §15.3-A）：`_APPLIED` 是**安装
+    那一刻**的结论，而第三方（厂商插件 XSwift 的 `KlxSymbolRewriter.replace()`
+    是整函数替换）可以在之后把同一符号整体顶掉。生产的真实时序正是
+    `activate()` 先打补丁、再 import swift 触发厂商 hook ——
+    此前 `patch_status()` 仍报三项全 `applied`（**谎报**），
+    `big_leaf/swift.py` 的「禁止 pending」fail-fast 也拦不住（检查发生在覆盖之前）。
+
+    基准取自 `_rebind.snapshot()` 而非本模块私藏的对象引用：它是替换动作的
+    唯一快照，也是 `assert_bindings_intact()` 的基准——同源才能保证两个报告
+    不会互相矛盾（此前两者各说各话，正是"状态不可信"的根源）。
+    """
+    key = _BOUND.get(p.dotted)
+    if key is None:
+        # 未经本进程 rebind（`_tt_patched` 标记早退路径）：无基准，不猜。
+        return None
+    entry = snapshot().get(key)
+    if entry is None:
+        return "绑定快照条目已被移除（unbind/clear 过）"
+    expected = entry[0]
+    mod = sys.modules.get(p.module)
+    if mod is None:
+        return "模块已从 sys.modules 移除"
+    holder, leaf = _resolve_holder(mod, p.attr)
+    if holder is None:
+        return "落点持有者已消失"
+    cur = getattr(holder, leaf, None)
+    if cur is expected or _wraps_object(cur, expected):
+        return None
+    return _describe_impl(cur)
+
+
+def _wraps_object(cur, expected):
+    """cur 是否把 expected 包在自己的 `__wrapped__` 链里。
+
+    第三方**在我们外面再套一层**（functools.wraps 风格）时，TT 的修正仍在
+    调用链上真实生效——报 overwritten 是假警报，而 big_leaf 入口的 fail-fast
+    直接读这个状态，假警报会把能正常工作的训练打挂。只有落点被**整体替换**
+    （厂商 `KlxSymbolRewriter.replace(is_wrapper=False)` 的形态，无 `__wrapped__`）
+    才算覆盖。
+    """
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = getattr(cur, "__wrapped__", None)
+        if cur is expected:
+            return True
+    return False
+
+
+def _recheck_one(p):
+    """复核一条补丁并在首次发现覆盖时留痕。返回篡夺者描述或 None。"""
+    if _APPLIED.get(p.dotted) != "applied":
+        return None
+    usurper = _overwritten_by(p)
+    if usurper is None:
+        return None
+    if _OVERWRITE_SEEN.get(p.dotted) != usurper:
+        _OVERWRITE_SEEN[p.dotted] = usurper
+        provenance.record(provenance.LAYER_BRIDGE, "patch", p.dotted,
+                          "overwritten", current=usurper, intent=p.intent,
+                          detail="安装时 applied，但落点已被第三方整体替换；"
+                                 "TT 的修正不再生效")
+    return usurper
+
+
+def patch_status(recheck=True):
+    """每条补丁的当前状态（applied / 跳过原因 / pending / overwritten）。失效可见。
+
+    recheck=True（默认）对 applied 条目做**运行期复核**：落点上的对象不再是
+    我们装的那个即报 `overwritten(<篡夺者>)` 并留一次 provenance 证据。
+    recheck=False 给出安装时的原始结论（调试/对比用）。
+
+    **不改写 `_APPLIED`**：被覆盖后自动重打会把补丁叠到厂商实现之上，
+    那是语义决策（谁该赢）而不是状态查询该做的事；这里只负责让覆盖可见。
+    """
     out = {}
     for p in _PATCHES:
-        out[p.dotted] = _APPLIED.get(p.dotted, "pending(模块未到场)")
+        state = _APPLIED.get(p.dotted, "pending(模块未到场)")
+        if recheck and state == "applied":
+            usurper = _recheck_one(p)
+            if usurper is not None:
+                state = f"overwritten({usurper})"
+        out[p.dotted] = state
     return out
+
+
+def overwritten_patches():
+    """被第三方顶掉的补丁清单 `{dotted: 篡夺者}`（空 dict = 全部仍在落点上）。
+
+    供"框架 import 完成之后"的复核点使用（厂商插件的 lazy hook 在框架
+    import 时才接管，安装期的 fail-fast 必然查不到）。
+    """
+    return {p.dotted: u for p in _PATCHES
+            if (u := _recheck_one(p)) is not None}
 
 
 def _resolve_holder(mod, attr):
@@ -174,6 +279,11 @@ def _apply_one(p: FunctionPatch):
         swept = rebind(holder, leaf, new, owner=_OWNER,
                        sweep_packages=() if is_method else _SWEEP_PACKAGES,
                        holder_path=holder_path)
+        # 运行期复核的基准：记 rebind 的快照 key（不记对象本身——对象要从
+        # 共享快照里取，才能保证与 assert_bindings_intact() 同源）。
+        _BOUND[p.dotted] = (holder_path or getattr(holder, "__name__", p.module),
+                            leaf)
+        _OVERWRITE_SEEN.pop(p.dotted, None)
         _APPLIED[p.dotted] = "applied"
         provenance.record(provenance.LAYER_BRIDGE, "patch", p.dotted,
                           "applied", intent=p.intent, swept=swept,

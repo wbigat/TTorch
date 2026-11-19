@@ -170,6 +170,17 @@ def _init():
         _record_scope(kind, reason, skip_conformance=(kind == "derived"))
         return True
     except Exception as e:  # noqa: BLE001
+        # 导出安全契约不满足时**不许降级继续**：这条路径（.pth / sitecustomize）
+        # 的异常会被 site 的 `except Exception` 吞成一行警告，训练照跑，
+        # 而后果正是「exit=0 + loss 一致 + 垃圾权重」的静默损坏（退役文档 §16.3）。
+        # SystemExit 是 BaseException，能穿透 site 的捕获让 worker 立刻失败。
+        try:
+            from ttorch.bridge.vendor_retire import ExportUnsafeError
+            fatal = isinstance(e, ExportUnsafeError)
+        except Exception:  # noqa: BLE001  判据不可用时按"非致命"处理，不猜
+            fatal = False
+        if fatal:
+            raise SystemExit(f"[ttorch] 拒绝启动：{e}")
         # .pth 里的异常会被 site 吞掉成一行警告，排障极难——显式打全栈。
         # 但不 re-raise：解释器启动阶段抛异常会让所有 python 进程不可用
         # （含 pip/conda），代价远超"TT 未激活"。激活与否由后续

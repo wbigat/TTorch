@@ -1,0 +1,83 @@
+XCCL /root/miniconda/envs/python312_torch29_cuda/lib/python3.12/site-packages/torch_xmlir/libbkcl.so loaded
+[35mSYMBOL_REWRITE [0m[32mtorch success[0m
+[35mSYMBOL_REWRITE [0m[32mdeepspeed success[0m
+[35mSYMBOL_REWRITE [0m[32mtorchaudio success[0m
+[xpu_fla] triton patched: jit/autotune/heuristics → noop, driver.active → mock(cuda), fla.utils.device_torch_lib → torch.cuda
+/root/miniconda/envs/python312_torch29_cuda/lib/python3.12/site-packages/fla/utils.py:420: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(('Triton is not supported on current platform, roll back to CPU.'), stacklevel=1)
+/root/miniconda/envs/python312_torch29_cuda/lib/python3.12/site-packages/fla/utils.py:420: UserWarning: Triton is not supported on current platform, roll back to CPU.
+  warnings.warn(('Triton is not supported on current platform, roll back to CPU.'), stacklevel=1)
+[35mSYMBOL_REWRITE [0m[32mtransformers success[0m
+G8_2048_1536/train_mb1         stock_sep      median=   2924.3us [p25=  2899.7 p75=  2968.9] /big_leaf= 1.1130x params=8
+G8_2048_1536/train_mb1         stock_contig   median=   2896.7us [p25=  2870.5 p75=  2926.9] /big_leaf= 1.1025x params=8
+G8_2048_1536/train_mb1         lw1_pin        median=   2652.2us [p25=  2639.4 p75=  2669.5] /big_leaf= 1.0094x params=1
+G8_2048_1536/train_mb1         lw1_nopin      median=   2634.4us [p25=  2625.9 p75=  2648.8] /big_leaf= 1.0027x params=1
+G8_2048_1536/train_mb1         big_leaf       median=   2627.4us [p25=  2614.9 p75=  2642.0] /big_leaf= 1.0000x params=1
+G8_2048_1536/train_mb1         big_leaf_nocheck median=   2617.6us [p25=  2606.8 p75=  2631.3] /big_leaf= 0.9963x params=1
+G8_2048_1536/train_mb4         stock_sep      median=   7898.6us [p25=  7708.7 p75=  8339.9] /big_leaf= 1.2891x params=8
+G8_2048_1536/train_mb4         stock_contig   median=   7807.2us [p25=  7555.5 p75=  8150.9] /big_leaf= 1.2742x params=8
+G8_2048_1536/train_mb4         lw1_pin        median=   6393.0us [p25=  6134.7 p75=  6730.5] /big_leaf= 1.0434x params=1
+G8_2048_1536/train_mb4         lw1_nopin      median=   6209.1us [p25=  5984.2 p75=  6460.1] /big_leaf= 1.0134x params=1
+G8_2048_1536/train_mb4         big_leaf       median=   6127.3us [p25=  5925.3 p75=  6362.7] /big_leaf= 1.0000x params=1
+G8_2048_1536/train_mb4         big_leaf_nocheck median=   6012.6us [p25=  5872.1 p75=  6263.6] /big_leaf= 0.9813x params=1
+G8_2048_1536/train_mb1_rc      stock_sep      median=   3620.4us [p25=  3595.5 p75=  3752.7] /big_leaf= 1.1702x params=8
+G8_2048_1536/train_mb1_rc      stock_contig   median=   3542.7us [p25=  3514.6 p75=  3695.6] /big_leaf= 1.1451x params=8
+G8_2048_1536/train_mb1_rc      lw1_pin        median=   3130.4us [p25=  3113.0 p75=  3169.7] /big_leaf= 1.0118x params=1
+G8_2048_1536/train_mb1_rc      lw1_nopin      median=   3109.6us [p25=  3094.1 p75=  3169.2] /big_leaf= 1.0051x params=1
+G8_2048_1536/train_mb1_rc      big_leaf       median=   3093.8us [p25=  3082.9 p75=  3130.9] /big_leaf= 1.0000x params=1
+G8_2048_1536/train_mb1_rc      big_leaf_nocheck median=   3078.4us [p25=  3067.9 p75=  3109.4] /big_leaf= 0.9950x params=1
+G8_2048_1536/train_mb4_rc      stock_sep      median=  10040.2us [p25=  9983.3 p75= 10209.1] /big_leaf= 1.2743x params=8
+G8_2048_1536/train_mb4_rc      stock_contig   median=   9846.3us [p25=  9768.4 p75=  9993.2] /big_leaf= 1.2497x params=8
+G8_2048_1536/train_mb4_rc      lw1_pin        median=   8239.6us [p25=  8193.3 p75=  8353.6] /big_leaf= 1.0458x params=1
+G8_2048_1536/train_mb4_rc      lw1_nopin      median=   7995.5us [p25=  7934.8 p75=  8085.1] /big_leaf= 1.0148x params=1
+G8_2048_1536/train_mb4_rc      big_leaf       median=   7878.8us [p25=  7832.8 p75=  7937.8] /big_leaf= 1.0000x params=1
+G8_2048_1536/train_mb4_rc      big_leaf_nocheck median=   7737.5us [p25=  7704.7 p75=  7831.4] /big_leaf= 0.9821x params=1
+G8_2048_1536/frozen_fwdbwd     stock_sep      median=   1459.8us [p25=  1451.2 p75=  1472.3] /big_leaf= 1.0846x params=0
+G8_2048_1536/frozen_fwdbwd     stock_contig   median=   1427.4us [p25=  1420.3 p75=  1436.7] /big_leaf= 1.0605x params=0
+G8_2048_1536/frozen_fwdbwd     lw1_pin        median=   1220.4us [p25=  1216.6 p75=  1234.4] /big_leaf= 0.9068x params=0
+G8_2048_1536/frozen_fwdbwd     lw1_nopin      median=   1193.4us [p25=  1190.1 p75=  1206.7] /big_leaf= 0.8867x params=0
+G8_2048_1536/frozen_fwdbwd     big_leaf       median=   1346.0us [p25=  1342.1 p75=  1360.6] /big_leaf= 1.0000x params=0
+G8_2048_1536/frozen_fwdbwd     big_leaf_nocheck median=   1336.5us [p25=  1333.3 p75=  1349.1] /big_leaf= 0.9929x params=0
+G8_2048_1536/frozen_mb4_rc     stock_sep      median=   6965.2us [p25=  6620.9 p75=  7434.7] /big_leaf= 1.2111x params=0
+G8_2048_1536/frozen_mb4_rc     stock_contig   median=   6443.7us [p25=  6030.1 p75=  6779.1] /big_leaf= 1.1204x params=0
+G8_2048_1536/frozen_mb4_rc     lw1_pin        median=   5662.6us [p25=  5334.6 p75=  6022.3] /big_leaf= 0.9846x params=0
+G8_2048_1536/frozen_mb4_rc     lw1_nopin      median=   5498.7us [p25=  5217.1 p75=  5895.8] /big_leaf= 0.9561x params=0
+G8_2048_1536/frozen_mb4_rc     big_leaf       median=   5751.1us [p25=  5387.1 p75=  6067.1] /big_leaf= 1.0000x params=0
+G8_2048_1536/frozen_mb4_rc     big_leaf_nocheck median=   5501.6us [p25=  5195.0 p75=  5838.5] /big_leaf= 0.9566x params=0
+G32_2048_1024/train_mb1        stock_sep      median=   5860.7us [p25=  5762.1 p75=  6020.4] /big_leaf= 1.3297x params=32
+G32_2048_1024/train_mb1        stock_contig   median=   5781.7us [p25=  5625.5 p75=  5876.4] /big_leaf= 1.3118x params=32
+G32_2048_1024/train_mb1        lw1_pin        median=   4422.8us [p25=  4363.9 p75=  4497.8] /big_leaf= 1.0035x params=1
+G32_2048_1024/train_mb1        lw1_nopin      median=   4370.4us [p25=  4322.7 p75=  4444.4] /big_leaf= 0.9916x params=1
+G32_2048_1024/train_mb1        big_leaf       median=   4407.4us [p25=  4353.6 p75=  4494.4] /big_leaf= 1.0000x params=1
+G32_2048_1024/train_mb1        big_leaf_nocheck median=   4377.3us [p25=  4305.4 p75=  4473.4] /big_leaf= 0.9932x params=1
+G32_2048_1024/train_mb4        stock_sep      median=  19910.4us [p25= 18978.2 p75= 21268.3] /big_leaf= 1.4474x params=32
+G32_2048_1024/train_mb4        stock_contig   median=  19413.4us [p25= 18684.7 p75= 20737.6] /big_leaf= 1.4113x params=32
+G32_2048_1024/train_mb4        lw1_pin        median=  14096.5us [p25= 13518.4 p75= 14853.3] /big_leaf= 1.0248x params=1
+G32_2048_1024/train_mb4        lw1_nopin      median=  13831.7us [p25= 13416.3 p75= 14604.4] /big_leaf= 1.0055x params=1
+G32_2048_1024/train_mb4        big_leaf       median=  13755.7us [p25= 13295.5 p75= 14321.2] /big_leaf= 1.0000x params=1
+G32_2048_1024/train_mb4        big_leaf_nocheck median=  13575.0us [p25= 13079.9 p75= 14280.5] /big_leaf= 0.9869x params=1
+G32_2048_1024/train_mb1_rc     stock_sep      median=   7299.7us [p25=  6927.6 p75=  8064.2] /big_leaf= 1.3905x params=32
+G32_2048_1024/train_mb1_rc     stock_contig   median=   7071.9us [p25=  6792.9 p75=  8072.9] /big_leaf= 1.3471x params=32
+G32_2048_1024/train_mb1_rc     lw1_pin        median=   5439.6us [p25=  5172.6 p75=  6191.9] /big_leaf= 1.0362x params=1
+G32_2048_1024/train_mb1_rc     lw1_nopin      median=   5238.9us [p25=  5047.9 p75=  5915.8] /big_leaf= 0.9980x params=1
+G32_2048_1024/train_mb1_rc     big_leaf       median=   5249.5us [p25=  5048.8 p75=  5876.8] /big_leaf= 1.0000x params=1
+G32_2048_1024/train_mb1_rc     big_leaf_nocheck median=   5126.4us [p25=  4958.1 p75=  5714.8] /big_leaf= 0.9765x params=1
+G32_2048_1024/train_mb4_rc     stock_sep      median=  21741.2us [p25= 21046.8 p75= 22986.5] /big_leaf= 1.3973x params=32
+G32_2048_1024/train_mb4_rc     stock_contig   median=  21215.8us [p25= 20755.3 p75= 22344.7] /big_leaf= 1.3635x params=32
+G32_2048_1024/train_mb4_rc     lw1_pin        median=  15891.0us [p25= 15237.8 p75= 16743.2] /big_leaf= 1.0213x params=1
+G32_2048_1024/train_mb4_rc     lw1_nopin      median=  15500.1us [p25= 14996.2 p75= 16452.0] /big_leaf= 0.9962x params=1
+G32_2048_1024/train_mb4_rc     big_leaf       median=  15559.8us [p25= 15058.6 p75= 16580.1] /big_leaf= 1.0000x params=1
+G32_2048_1024/train_mb4_rc     big_leaf_nocheck median=  15206.8us [p25= 14733.6 p75= 15858.2] /big_leaf= 0.9773x params=1
+G32_2048_1024/frozen_fwdbwd    stock_sep      median=   1315.1us [p25=  1299.6 p75=  1360.6] /big_leaf= 1.1631x params=0
+G32_2048_1024/frozen_fwdbwd    stock_contig   median=   1290.8us [p25=  1271.5 p75=  1344.4] /big_leaf= 1.1416x params=0
+G32_2048_1024/frozen_fwdbwd    lw1_pin        median=    888.3us [p25=   833.2 p75=   919.0] /big_leaf= 0.7856x params=0
+G32_2048_1024/frozen_fwdbwd    lw1_nopin      median=    852.0us [p25=   807.1 p75=   878.9] /big_leaf= 0.7535x params=0
+G32_2048_1024/frozen_fwdbwd    big_leaf       median=   1130.7us [p25=  1117.7 p75=  1152.0] /big_leaf= 1.0000x params=0
+G32_2048_1024/frozen_fwdbwd    big_leaf_nocheck median=   1100.9us [p25=  1090.5 p75=  1132.9] /big_leaf= 0.9736x params=0
+G32_2048_1024/frozen_mb4_rc    stock_sep      median=   9077.1us [p25=  8391.5 p75=  9731.7] /big_leaf= 1.3680x params=0
+G32_2048_1024/frozen_mb4_rc    stock_contig   median=   8477.8us [p25=  7929.9 p75=  9024.0] /big_leaf= 1.2776x params=0
+G32_2048_1024/frozen_mb4_rc    lw1_pin        median=   6357.0us [p25=  5907.5 p75=  6789.1] /big_leaf= 0.9580x params=0
+G32_2048_1024/frozen_mb4_rc    lw1_nopin      median=   6087.4us [p25=  5654.2 p75=  6396.5] /big_leaf= 0.9174x params=0
+G32_2048_1024/frozen_mb4_rc    big_leaf       median=   6635.5us [p25=  6152.6 p75=  7058.0] /big_leaf= 1.0000x params=0
+G32_2048_1024/frozen_mb4_rc    big_leaf_nocheck median=   6245.2us [p25=  5819.6 p75=  6567.6] /big_leaf= 0.9412x params=0
+written experiments/big_leaf_lw_gap/out/module_gap.json
