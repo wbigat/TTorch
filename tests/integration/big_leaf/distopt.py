@@ -1,6 +1,12 @@
-"""真实 Megatron DDP + DistributedOptimizer 的 big_leaf DP 测试。
+"""真实 Megatron DDP + DistributedOptimizer 的 big_leaf 双线实体 DP 测试。
 
 用法：torchrun --standalone --nproc-per-node={1,2} tests/integration/big_leaf/distopt.py [--overlap]
+
+与旧版（per-weight{i} 实体 + flush）的差异（2026-11-19 双线改版）：
+- DDP/dist-opt 的参数实体是内部线 big/big_b（独立 nn.Parameter），外部线
+  weight{i}/bias{i} 为其存储切片视图——optimizer 单实体与 DDP 元数据收益；
+- 不再有 flush hook：big.grad 走标准 DDP main_grad/reduce 路径；
+- restore 后不能继续训练（DDP 梯度实体是内部线），只验证 eval 可用与值完好。
 """
 import argparse
 import json
@@ -37,6 +43,31 @@ def init_model(seed=1234):
         for p in model.parameters():
             p.copy_(torch.randn(p.shape, device=p.device, dtype=p.dtype) * 0.03)
     return model
+
+
+def _reference_grads(plan, reference):
+    """内部线实体对应的 stock 参考梯度（按实体顺序拼接 per-kind 梯度）。"""
+    mod_names = {id(m): n for n, m in plan.model.named_modules()}
+    ref = dict(reference.named_parameters())
+    out = {}
+    for module in plan.modules_to_bind:
+        base = mod_names[id(module)]
+        out[id(plan.proxies[id(module)][0])] = torch.cat(
+            [ref[f"{base}.weight{i}"].grad.float().view(-1)
+             for i in range(module.num_gemms)])
+        if module.use_bias:
+            out[id(plan.proxies[id(module)][1])] = torch.cat(
+                [ref[f"{base}.bias{i}"].grad.float().view(-1)
+                 for i in range(module.num_gemms)])
+    return out
+
+
+def _owned_range(optimizer, param):
+    optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
+    owner = next((opt for opt in optimizers if param in opt.model_param_gbuf_map), None)
+    if owner is None:
+        return None
+    return owner._get_model_param_range_map(param)["param"]
 
 
 def main():
@@ -77,28 +108,54 @@ def main():
     else:
         plan = BigLeafMegatronPlan.prepare(model, forward_mode=args.forward_mode)
         layout = plan.compute_full_param_layout(
-            list(model.parameters()), ddp_config.bucket_size, world_size, ddp_config, world_size)
-        ddp = DistributedDataParallel(
-            config=config, ddp_config=ddp_config, module=model, full_param_layout=layout)
+            plan.entities(), ddp_config.bucket_size, world_size, ddp_config, world_size)
+        with plan.entity_swap():
+            ddp = DistributedDataParallel(
+                config=config, ddp_config=ddp_config, module=model, full_param_layout=layout)
         plan.attach_ddp(ddp)
     if args.overlap:
         bucket_counts = [len(group.buckets) for group in
                          ddp.bucket_groups + ddp.expert_parallel_bucket_groups]
         assert sum(bucket_counts) >= 2, bucket_counts
 
+    # 结构断言：外部线 weight{i} 是内部线实体存储的切片视图。
     for binding in plan.bindings:
         for i in range(binding.module.num_gemms):
             w = getattr(binding.module, f"weight{i}")
             assert w.data.data_ptr() == binding.buf[i].data_ptr()
         assert binding.big.data_ptr() == binding.buf.data_ptr()
-
-    optimizer = get_megatron_optimizer(
-        config=OptimizerConfig(
-            optimizer="adam", lr=1e-3, bf16=True, use_distributed_optimizer=True,
-            adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8, weight_decay=0.01,
-        ),
-        model_chunks=[ddp],
-    )
+    # 结构断言：dist-opt 参数实体是内部线 + 其余参数，外部线 weight{i} 不在其列。
+    with plan.entity_swap():
+        optimizer = get_megatron_optimizer(
+            config=OptimizerConfig(
+                optimizer="adam", lr=1e-3, bf16=True, use_distributed_optimizer=True,
+                adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8, weight_decay=0.01,
+            ),
+            model_chunks=[ddp],
+        )
+    # 结构断言：dist-opt 的 model 侧参数实体全是内部线；外部线 weight{i} 不进入
+    # optimizer；shard 按实体级建立（G 倍缩减）。
+    # （optimizer.param_groups 里是本 rank 拥有的 shard 张量；model_param_gbuf_map
+    # 在 overlap 形态会含 gbuf=None 的簿记条目，拥有判据用 shard range 可取性。）
+    optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
+    map_keys = set()
+    for opt in optimizers:
+        map_keys.update(opt.model_param_gbuf_map.keys())
+    entities = set(plan.entities())
+    expert_ids = {id(p) for p in model.parameters()}
+    assert map_keys and map_keys <= entities, "optimizer 参数实体必须全部是内部线"
+    assert not (map_keys & expert_ids), "外部线 weight{i} 混入 optimizer 参数实体"
+    # G 倍缩减判据：shard 按实体级建立。非 overlap 形态 world 合计 == 实体数；
+    # overlap 形态 mcore 对 first/rest chunk 的簿记会多出少量 shard 张量
+    # （2026-11-19 实测 6 vs 4），只断言严格少于 stock 口径（G× 专家参数数）。
+    count = torch.tensor(
+        [sum(len(g["params"]) for g in optimizer.param_groups)], device="cuda")
+    dist.all_reduce(count)
+    stock_parity = G * len(plan.modules_to_bind) * 2
+    if args.overlap:
+        assert count.item() < stock_parity, (rank, count.item(), stock_parity)
+    else:
+        assert count.item() == len(entities), (rank, count.item(), len(entities))
 
     torch.manual_seed(5678)
     x = torch.randn(G * TOK, FIN, device="cuda", dtype=torch.bfloat16)
@@ -117,32 +174,28 @@ def main():
         loss.backward()
         ddp.finish_grad_sync()
         plan.assert_healthy()
-        assert all(count == iteration + 1 for count in plan.flush_counts.values()), plan.flush_counts
         assert all(b.big.grad is None for b in plan.bindings)
         assert all(b.big_b.grad is None for b in plan.bindings)
-        assert all(p.grad is None for p in model.parameters())
 
         if iteration == 0:
-            reference_params = dict(reference.named_parameters())
+            expected_grads = _reference_grads(plan, reference)
             compared_elements = 0
-            for name, p in model.named_parameters():
-                expected_grad = reference_params[name].grad.float().view(-1)
-                # dist-opt reduce-scatter 后仅本 rank 拥有的 param 子区间有效。
-                optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
-                owner = next((opt for opt in optimizers if p in opt.model_param_gbuf_map), None)
-                if owner is None:  # 本 rank 不拥有该参数的任何 shard
+            for proxy in plan.entities():
+                param_range = _owned_range(optimizer, proxy)
+                if param_range is None:
                     continue
-                param_range = owner._get_model_param_range_map(p)["param"]
-                actual = p.main_grad.view(-1)[param_range.start:param_range.end]
-                expected = expected_grad[param_range.start:param_range.end]
+                actual = proxy.main_grad.view(-1)[param_range.start:param_range.end]
+                expected = expected_grads[id(proxy)][param_range.start:param_range.end]
                 assert torch.equal(actual, expected), (
-                    rank, name, param_range, (actual - expected).abs().max())
+                    rank, param_range, (actual - expected).abs().max())
                 compared_elements += actual.numel()
             assert compared_elements > 0
 
         before = [b.buf.clone() for b in plan.bindings]
         optimizer.step()
-        ddp.start_param_sync()
+        # overlap 形态 gather 在 zero_grad 时已异步启动，handle 可能残留——
+        # force_sync 是 mcore 文档化安全路径（与 save_checkpoint_wrapper 一致）。
+        ddp.start_param_sync(force_sync=args.overlap)
         plan.assert_healthy()
         for binding, old in zip(plan.bindings, before):
             assert not torch.equal(binding.buf, old), (rank, iteration, "权重未更新")
@@ -151,17 +204,14 @@ def main():
                 assert w.data.data_ptr() == binding.buf[i].data_ptr()
         torch.cuda.synchronize()
 
-    # no_sync 梯度累积：在当前权重上先建立 stock 两次 backward 的参考。
+    # no_sync 梯度累积：两次 backward 后 main_grad 应等于单次参考的 2 倍。
     reference_current = init_model()
     reference_current.load_state_dict(model.state_dict())
     reference_current(x, m_splits).float().square().mean().backward()
-    reference_single = {name: p.grad.clone() for name, p in reference_current.named_parameters()}
+    reference_current.zero_grad()
     reference_current(x, m_splits).float().square().mean().backward()
-    for name, p in reference_current.named_parameters():
-        assert torch.equal(p.grad, 2 * reference_single[name])
     ddp.zero_grad_buffer()
     optimizer.zero_grad()
-    counts_before = dict(plan.flush_counts)
     with ddp.no_sync():
         ddp(x, m_splits).float().square().mean().backward()
     if args.overlap:
@@ -169,30 +219,29 @@ def main():
         assert all(group.grad_reduce_handle is None for group in groups)
     ddp(x, m_splits).float().square().mean().backward()
     ddp.finish_grad_sync()
-    assert all(plan.flush_counts[key] == counts_before[key] + 2 for key in counts_before)
-    for name, p in model.named_parameters():
-        optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
-        owner = next((opt for opt in optimizers if p in opt.model_param_gbuf_map), None)
-        if owner is None:
+    single_grads = _reference_grads(plan, reference_current)
+    for proxy in plan.entities():
+        param_range = _owned_range(optimizer, proxy)
+        if param_range is None:
             continue
-        param_range = owner._get_model_param_range_map(p)["param"]
-        actual = p.main_grad.view(-1)[param_range.start:param_range.end]
-        expected = dict(reference_current.named_parameters())[name].grad.float().view(-1)[
-            param_range.start:param_range.end]
-        assert torch.equal(actual, expected), (rank, "no_sync", name)
+        actual = proxy.main_grad.view(-1)[param_range.start:param_range.end]
+        expected = single_grads[id(proxy)][param_range.start:param_range.end]
+        assert torch.equal(actual, 2 * expected), (rank, "no_sync 累积")
 
+    # restore 语义（2026-11-19 收紧）：摘除后 eval forward 可用、值完好；
+    # 不再支持 restore 后继续训练（DDP 梯度实体是内部线）。
+    entity_count = len(plan.entities())
+    before_pairs = [(b.buf, b.buf.clone()) for b in plan.bindings]
     plan.restore()
-    # restore 只摘 big_leaf，DDP 原参数与 optimizer 仍可用。
-    ddp.zero_grad_buffer()
-    out = ddp(x, m_splits)
-    out.float().square().mean().backward()
-    ddp.finish_grad_sync()
-    assert all(p.grad is None for p in model.parameters())
+    with torch.no_grad():
+        out = model(x, m_splits)
+    for buf, old in before_pairs:
+        assert torch.equal(buf, old), (rank, "restore 后权重值漂移")
     dist.barrier()
     if rank == 0:
         print("BIG_LEAF_DISTOPT PASS " + json.dumps({
             "dp": world_size, "overlap": args.overlap, "forward_mode": args.forward_mode,
-            "flush_counts": {str(k): v for k, v in plan.flush_counts.items()},
+            "entities": entity_count,
         }), flush=True)
     mpu.destroy_model_parallel()
     dist.destroy_process_group()

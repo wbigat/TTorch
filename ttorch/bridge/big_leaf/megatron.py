@@ -1,13 +1,44 @@
-"""big_leaf 的 Megatron DDP / DistributedOptimizer 适配。
+"""big_leaf 的 Megatron DDP / DistributedOptimizer 适配（双线实体版）。
 
 两阶段使用：
-1. DDP 前 prepare + compute_full_param_layout，并把 layout 传给 DDP；
-2. DDP 后 attach_ddp，建立 big_leaf 视图和 main_grad flush hook。
+1. DDP 前 prepare（构造内部线实体）+ compute_full_param_layout，并把 layout 传给 DDP；
+2. DDP 后 attach_ddp，把外部线 weight{i}/bias{i} 重绑为内部线实体的存储切片视图。
 
-dist-opt 保留原专家 Parameter 作为 optimizer/checkpoint 逻辑实体；大叶子只负责
-forward/backward 粒度，不替换 DistributedOptimizer 的 shard 参数列表。
+**双线设计（2026-11-19，§13 绩效回收）**：
+
+- 外部线 = 模块注册的 `weight{i}`/`bias{i}`（`state_dict` 键、查询、HF/模型 ckpt
+  导出全部无感知，读到的永远是内部线存储的最新值）；
+- 内部线 = 每个 GroupedLinear 一个 `big`/`big_b` 实体（独立 `nn.Parameter`，
+  **不注册进任何 module**）。它同时是：
+  DDP buffer 的参数实体（梯度整体 accumulate、reduce-scatter 一次完成）、
+  DistributedOptimizer 的参数实体（Adam 状态按大实体建，shard 数比
+  per-weight{i} 少 G 倍）——optimizer 单实体与 DDP 元数据缩减两项收益由此回收。
+- 两线共享同一 param_data 存储：DDP 构造期间经 `entity_swap()` 临时让
+  GroupedLinear 的 `parameters()`/`named_parameters()` 产出内部线实体（mcore
+  的 DDP 一致性断言与 `get_megatron_optimizer` 都从 `module.named_parameters()`
+  收集参数，2026-11-19 核实源码），边界调用结束后恢复——外部世界零感知。
+- 实体必须是 `nn.Parameter` 而非 plain tensor：mcore buffer 用
+  `param.data = 视图` 重绑存储（`param_and_grad_buffer.py`），只有 Parameter 的
+  `.data` setter 才真正换 storage。它不注册进任何 module，因此不会进入 TE 的
+  kernel pin 路径（pin 遍历模块 `_parameters`），原 plain-tensor 的安全理由保持。
+
+与旧版（per-weight{i} 实体 + main_grad flush）相比：
+- 删除 flush hook 全套（big.grad 走标准 DDP 路径，overlap_grad_reduce 原样兼容）；
+- `restore()` 语义收紧：只摘 forward 与守卫，`weight{i}` 保持 param_data 视图
+  （值持续最新）；**restore 后不能继续训练**（DDP 梯度实体是内部线，重建需
+  新进程/新 DDP——与生产回滚策略"优先新进程"一致）。
+- optimizer checkpoint 状态改按内部线实体保存；旧 per-weight{i} 格式的迁移见
+  `.checkpoint.convert_distopt_state_layout()`。
+
+**冻结模块（full/LoRA base）**：`prepare()` 把整模块冻结的 GroupedLinear 归入
+`frozen_modules`，`attach_ddp` 用独立 buf（`_repack_one`）绑定，只拿 forward
+收益（forward 直取 + 免 cat），不进 DDP buffer / optimizer（无梯度、无 Adam
+状态）。LoRA base 即此形态；restore 时冻结权重脱离独立 buf 视图（克隆回独立
+存储，避免悬空 storage）。
 """
+import contextlib
 import dataclasses
+
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -25,6 +56,7 @@ from .core import (
     _LeafBinding,
     _assert_supported_vendor_forward,
     _install_forward,
+    _repack_one,
     _require,
     _uninstall_forward,
     _validate_patch_module,
@@ -54,11 +86,14 @@ def _validate_megatron_module(module: GroupedLinear, forward_mode: str,
 class BigLeafMegatronPlan(BigLeafPlan):
     ddp: Optional[object] = None
     modules_to_bind: List[GroupedLinear] = dataclasses.field(default_factory=list)
-    grad_accs: List[object] = dataclasses.field(default_factory=list)
-    grad_hook_handles: List[object] = dataclasses.field(default_factory=list)
-    main_grad_views: Dict[Tuple[int, str], Optional[torch.Tensor]] = dataclasses.field(
-        default_factory=dict)
-    flush_counts: Dict[Tuple[int, str], int] = dataclasses.field(default_factory=dict)
+    # 整模块冻结的 GroupedLinear：不进 DDP buffer / optimizer（无梯度），只用
+    # 独立 buf 绑定拿 forward 收益（forward 直取 + 免 cat）。LoRA base 即此形态。
+    frozen_modules: List[GroupedLinear] = dataclasses.field(default_factory=list)
+    # 内部线实体：module id -> (big, big_b)。独立 nn.Parameter，不注册进 module；
+    # prepare 时把 G 份权重值搬入（唯一一次真拷贝），DDP 构造时再被 buffer 重绑
+    # 到 param_data 视图，旧存储随即释放。
+    proxies: Dict[int, Tuple[torch.nn.Parameter, Optional[torch.nn.Parameter]]] = \
+        dataclasses.field(default_factory=dict)
 
     @classmethod
     def prepare(cls, model: torch.nn.Module,
@@ -72,6 +107,7 @@ class BigLeafMegatronPlan(BigLeafPlan):
         elif xte_env.get_bool("XTE_USE_GROUPED_FC_FUSION"):
             raise ValueError("big_leaf switch 模式不支持 XTE_USE_GROUPED_FC_FUSION=1")
         modules = []
+        frozen_modules = []
         found_grouped = False
         for module in model.modules():
             if not isinstance(module, GroupedLinear):
@@ -79,26 +115,106 @@ class BigLeafMegatronPlan(BigLeafPlan):
             found_grouped = True
             if getattr(module, "large_weight_switch", False):
                 raise ValueError("big_leaf DDP prepare 需要原生 LW=0 模型，不能接 LW=1")
-            _validate_megatron_module(module, forward_mode)
             params = [p for p in module.parameters(recurse=False)]
-            if not any(p.requires_grad for p in params):
-                continue
-            if not all(p.requires_grad for p in params):
+            frozen = not any(p.requires_grad for p in params)
+            if not frozen and not all(p.requires_grad for p in params):
                 raise ValueError(
-                    f"{module}: dist-opt 首版只支持整模块可训或整模块冻结，不支持部分参数冻结")
-            modules.append(module)
+                    f"{module}: 只支持整模块可训或整模块冻结，不支持部分参数冻结")
+            _validate_megatron_module(module, forward_mode,
+                                      allow_module_hooks=frozen)
+            (frozen_modules if frozen else modules).append(module)
         if not found_grouped:
             raise ValueError("model 内未发现 GroupedLinear 模块")
-        return cls(bindings=[], model=model, forward_mode=forward_mode,
-                   modules_to_bind=modules)
+        plan = cls(bindings=[], model=model, forward_mode=forward_mode,
+                   modules_to_bind=modules, frozen_modules=frozen_modules)
+        plan._build_proxies()
+        return plan
+
+    def _build_proxies(self) -> None:
+        """构造内部线实体并把 G 份权重值搬入（DDP 会按 param.data 拷贝进 param_data）。"""
+        for module in self.modules_to_bind:
+            w0 = module.weight0.data
+            big = torch.nn.Parameter(
+                w0.new_empty((module.num_gemms, *w0.shape)), requires_grad=True)
+            with torch.no_grad():
+                for i in range(module.num_gemms):
+                    big[i].copy_(getattr(module, f"weight{i}").data)
+            big.allreduce = getattr(module.weight0, "allreduce", True)
+            if module.use_bias:
+                b0 = module.bias0.data
+                big_b = torch.nn.Parameter(
+                    b0.new_empty((module.num_gemms, *b0.shape)), requires_grad=True)
+                with torch.no_grad():
+                    for i in range(module.num_gemms):
+                        big_b[i].copy_(getattr(module, f"bias{i}").data)
+                big_b.allreduce = getattr(module.bias0, "allreduce", True)
+            else:
+                big_b = None
+            self.proxies[id(module)] = (big, big_b)
+
+    def entities(self) -> List[torch.nn.Parameter]:
+        """DDP / dist-opt 可见的参数实体：非 GroupedLinear 可训参数原样 + 内部线实体。
+
+        外部线 weight{i}/bias{i} 被排除（不进 autograd、无 main_grad，由内部线
+        共享存储原地更新）。layout 与 `entity_swap()` 的产出必须与此集合一致。
+        """
+        expert_ids = set()
+        for module in self.modules_to_bind:
+            for kind in (("weight", "bias") if module.use_bias else ("weight",)):
+                for i in range(module.num_gemms):
+                    expert_ids.add(id(getattr(module, f"{kind}{i}")))
+        others = [p for p in self.model.parameters()
+                  if id(p) not in expert_ids and p.requires_grad]
+        leafs = []
+        for module in self.modules_to_bind:
+            big, big_b = self.proxies[id(module)]
+            leafs.append(big)
+            if big_b is not None:
+                leafs.append(big_b)
+        return others + leafs
+
+    @contextlib.contextmanager
+    def entity_swap(self):
+        """临时把 GroupedLinear 注册字典里的 weight{i}/bias{i} 换成内部线实体。
+
+        mcore 的 DDP 参数收集（`distributed_data_parallel.py` 的 all_params 与
+        grad hook 注册）与 `get_megatron_optimizer` 的 param_groups 收集都从
+        `module.named_parameters()` 读参数，而 `nn.Module.named_parameters()`
+        的递归实现**直读子模块的 `_parameters` 字典**、不调用子模块同名方法
+        （2026-11-19 实测：方法级覆盖完全无效）——因此换装必须发生在
+        `_parameters` 层，这正是 TE LW=1"天然生效"的原因。DDP 的一致性断言
+        要求 layout 键 == 该集合，换装窗口必须覆盖这两个边界调用的全过程。
+
+        窗口内 `_parameters` 不含 weight{i}（若被访问会 AttributeError），
+        但 DDP 构造与 optimizer 构造都只做泛型参数遍历；`state_dict()` 只在
+        窗口外被调用，外部查询/导出/键契约零影响。窗口外恢复原字典。
+        """
+        saved = []
+        for module in self.modules_to_bind:
+            big, big_b = self.proxies[id(module)]
+            orig_params = module._parameters
+            swapped = {}
+            for name, p in orig_params.items():
+                if name.startswith("weight") or name.startswith("bias"):
+                    continue
+                swapped[name] = p
+            swapped["weight"] = big
+            if big_b is not None:
+                swapped["bias"] = big_b
+            module._parameters = swapped
+            saved.append((module, orig_params))
+        try:
+            yield
+        finally:
+            for module, orig_params in saved:
+                module._parameters = orig_params
 
     def _owner_map(self):
         owners = {}
         for module in self.modules_to_bind:
             for kind in (("weight", "bias") if module.use_bias else ("weight",)):
-                for i in range(module.num_gemms):
-                    p = getattr(module, f"{kind}{i}")
-                    owners[id(p)] = (module, kind, i)
+                big = self.proxies[id(module)][0 if kind == "weight" else 1]
+                owners[id(big)] = (module, kind, 0)
         return owners
 
     def compute_full_param_layout(
@@ -109,8 +225,8 @@ class BigLeafMegatronPlan(BigLeafPlan):
         ddp_config,
         expert_data_parallel_world_size: Optional[int] = None,
     ) -> FullParamLayout:
-        if set(params) != set(self.model.parameters()):
-            raise ValueError("compute_full_param_layout 的 params 必须恰好是 model.parameters()")
+        if set(params) != set(self.entities()):
+            raise ValueError("compute_full_param_layout 的 params 必须恰好是 plan.entities()")
         if (getattr(ddp_config, "delay_wgrad_compute", False)
                 or getattr(ddp_config, "overlap_dispatch_backward_with_experts_wgrad", False)):
             raise ValueError("big_leaf 不支持 delayed-wgrad/dispatch-wgrad overlap")
@@ -147,7 +263,7 @@ class BigLeafMegatronPlan(BigLeafPlan):
                 members.sort(key=lambda q: (0 if owners[id(q)][1] == "weight" else 1,
                                             owners[id(q)][2]))
                 _require(all(id(q) in present for q in members),
-                         f"{module}: big_leaf 成员未全部进入 canonical layout")
+                         f"{module}: big_leaf 实体未全部进入 canonical layout")
                 desired_physical.extend(members)
                 emitted_modules.add(id(module))
             layouts[buffer_key] = self._atomic_group_layout(
@@ -219,66 +335,6 @@ class BigLeafMegatronPlan(BigLeafPlan):
             raise RuntimeError(f"参数必须恰好属于一个 DDP buffer，实际 {len(matches)}")
         return matches[0]
 
-    def _contiguous_buf(self, buffer, module, kind) -> torch.Tensor:
-        params = [getattr(module, f"{kind}{i}") for i in range(module.num_gemms)]
-        ranges = [buffer.param_index_map[p] for p in params]
-        for i, p in enumerate(params):
-            if i and ranges[i][0] != ranges[i - 1][1]:
-                raise RuntimeError(f"{module}: {kind} 在 DDP layout 中不连续；请传入自定义 layout")
-            start, end, _ = ranges[i]
-            if end - start != p.numel():
-                raise RuntimeError(f"{module}: {kind}{i} range 与参数 numel 不一致")
-        flat = buffer.param_data
-        start, end = ranges[0][0], ranges[-1][1]
-        return flat[start:end].view(module.num_gemms, *params[0].shape)
-
-    def _main_grad_view(self, params, big):
-        first = params[0].main_grad
-        offset = 0
-        contiguous = True
-        for p in params:
-            expected = first.data_ptr() + offset * first.element_size()
-            if p.main_grad.data_ptr() != expected:
-                contiguous = False
-                break
-            offset += p.numel()
-        if contiguous:
-            try:
-                return first.as_strided(big.shape, big.stride())
-            except RuntimeError:
-                pass
-        return None
-
-    def _register_flush(self, binding_index: int, kind: str, big, params, buffer):
-        key = (binding_index, kind)
-        main_view = self._main_grad_view(params, big)
-        self.main_grad_views[key] = main_view
-        self.flush_counts[key] = 0
-
-        def flush(*unused):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("big_leaf 暂不支持 CUDA graph capture 中的 main_grad flush")
-            if big.grad is None:
-                raise RuntimeError(f"big_leaf {key} flush 时 grad=None")
-            with torch.no_grad():
-                if main_view is not None:
-                    main_view.add_(big.grad)
-                else:
-                    for i, p in enumerate(params):
-                        p.main_grad.add_(big.grad[i])
-                big.grad = None
-                for p in params:
-                    p.grad = None
-                    if self.ddp.ddp_config.overlap_grad_reduce:
-                        self.ddp.param_to_bucket_group[p].register_grad_ready(
-                            p, self.ddp.force_all_reduce)
-            self.flush_counts[key] += 1
-
-        grad_acc = big.expand_as(big).grad_fn.next_functions[0][0]
-        handle = grad_acc.register_hook(flush)
-        self.grad_accs.append(grad_acc)
-        self.grad_hook_handles.append(handle)
-
     def attach_ddp(self, ddp) -> "BigLeafMegatronPlan":
         if not self._active:
             raise ValueError("plan 已 restore，不能重复 attach；请重新 prepare")
@@ -294,25 +350,46 @@ class BigLeafMegatronPlan(BigLeafPlan):
                 _validate_megatron_module(
                     module, self.forward_mode,
                     allow_module_hooks=True, allow_main_grad=True)
-                weight0 = module.weight0
-                buffer = self._find_buffer(weight0)
-                params = [p for p in module.parameters(recurse=False)]
-                if any(self._find_buffer(p) is not buffer for p in params):
-                    raise RuntimeError(f"{module}: weight/bias 跨 buffer，无法构造 big_leaf")
-                buf = self._contiguous_buf(buffer, module, "weight")
-                bbuf = self._contiguous_buf(buffer, module, "bias") if module.use_bias else None
-                big = buf.detach().requires_grad_(True)
-                big_b = bbuf.detach().requires_grad_(True) if bbuf is not None else None
-                binding = _LeafBinding(module=module, buf=buf, bbuf=bbuf, big=big, big_b=big_b)
+                big, big_b = self.proxies[id(module)]
+                weights = [getattr(module, f"weight{i}")
+                           for i in range(module.num_gemms)]
+                _require(big.data.shape == (module.num_gemms, *weights[0].shape),
+                         f"{module}: 内部线实体形状漂移")
+                buffer = self._find_buffer(big)
+                if big_b is not None:
+                    _require(self._find_buffer(big_b) is buffer,
+                             f"{module}: weight/bias 实体跨 buffer，无法构造 big_leaf")
+                    _require(big_b.data.shape == (
+                        module.num_gemms, *getattr(module, "bias0").shape),
+                        f"{module}: bias 实体形状漂移")
+                # 外部线重绑：weight{i}/bias{i}.data → 内部线实体存储的切片视图。
+                # DDP 构造期间已把实体值拷进 param_data 并把实体 .data 重绑到
+                # param_data 视图，因此这里既拿值又共享存储。
+                for i, w in enumerate(weights):
+                    w.data = big.data[i]
+                if big_b is not None:
+                    for i in range(module.num_gemms):
+                        p = getattr(module, f"bias{i}")
+                        p.data = big_b.data[i]
+                binding = _LeafBinding(
+                    module=module,
+                    buf=big.data,
+                    bbuf=big_b.data if big_b is not None else None,
+                    big=big,
+                    big_b=big_b,
+                )
                 binding.plan = self
                 self.bindings.append(binding)
                 _install_forward(binding, self.forward_mode)
-                bi = len(self.bindings) - 1
-                weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
-                self._register_flush(bi, "weight", big, weights, buffer)
-                if big_b is not None:
-                    biases = [getattr(module, f"bias{i}") for i in range(module.num_gemms)]
-                    self._register_flush(bi, "bias", big_b, biases, buffer)
+            # 冻结模块：独立 buf 绑定，只拿 forward 收益（不进 DDP/optimizer）。
+            for module in self.frozen_modules:
+                _validate_megatron_module(module, self.forward_mode,
+                                          allow_module_hooks=True,
+                                          allow_main_grad=False)
+                binding = _repack_one(module, allow_module_hooks=True)
+                binding.plan = self
+                self.bindings.append(binding)
+                _install_forward(binding, self.forward_mode)
             self.model._big_leaf_plan = self
             self.assert_healthy()
             self._patch_lora_merges()
@@ -324,40 +401,52 @@ class BigLeafMegatronPlan(BigLeafPlan):
 
     def optimizer_params(self, model):
         raise RuntimeError(
-            "dist-opt 模式必须保留 DDP 原参数并调用 get_megatron_optimizer；"
+            "dist-opt 模式必须保留 DDP 参数实体并调用 get_megatron_optimizer；"
             "不能使用非 dist-opt 的 plan.optimizer_params()")
 
-    def assert_healthy(self):
-        super().assert_healthy()
-        if self.ddp is not None:
-            for key, view in self.main_grad_views.items():
-                if view is None:
-                    continue
-                binding = self.bindings[key[0]]
-                big = binding.big if key[1] == "weight" else binding.big_b
-                _require(view.shape == big.shape, f"{key}: main_grad 大视图 shape 漂移")
+    def restore(self, detach_storage: bool = False):
+        """幂等摘除 big_leaf；weight{i} 保持 param_data 视图（值持续最新）。
 
-    def restore(self):
-        """幂等摘除 big_leaf，不破坏 DDP 已建立的参数视图和 optimizer。"""
+        **存储生命周期契约（重要）**：默认 restore **不解除**可训模块
+        `weight{i}` 对 DDP buffer 存储的依赖——`weight{i}.data` 仍是内部线
+        `big` 实体（即 DDP param_data）的切片视图。因此调用方必须保证
+        **DDP 对象存活期 ⩾ restore 后 weight{i} 的使用期**；若 restore 后释放
+        了 DDP，可训 `weight{i}` 会悬空。
+
+        restore 后**不能继续训练**：DDP 的梯度实体是内部线，标准反向会落到
+        外部线 weight{i} 上而无人规约。与生产回滚策略一致（优先新进程）。
+
+        detach_storage=True：可训模块的 `weight{i}` 也 clone 回独立存储，解除
+        对 DDP buffer 的依赖，用于"导出后立即释放 DDP"的场景。代价是每个可训
+        GroupedLinear 瞬时多占一份本地专家权重显存。冻结模块用独立 buf，无论
+        该开关都必须 clone（否则 buf 随 bindings 释放后 weight{i} 悬空）。
+        """
         if not self._active:
             return
         if self._broken:
             raise RuntimeError("big_leaf Megatron plan 此前 restore 失败，请重建模型")
+        frozen_ids = {id(m) for m in self.frozen_modules}
         try:
-            for handle in self.grad_hook_handles:
-                if hasattr(handle, "remove"):
-                    handle.remove()
             for binding in self.bindings:
                 _uninstall_forward(binding)
+                # 冻结绑定的独立 buf 会随 bindings 释放，weight{i} 必须脱离视图；
+                # 可训绑定仅在显式 detach_storage 时脱离 DDP param_data 视图。
+                if detach_storage or id(binding.module) in frozen_ids:
+                    with torch.no_grad():
+                        for i in range(binding.module.num_gemms):
+                            p = getattr(binding.module, f"weight{i}")
+                            p.data = p.data.clone()
+                        if binding.bbuf is not None:
+                            for i in range(binding.module.num_gemms):
+                                p = getattr(binding.module, f"bias{i}")
+                                p.data = p.data.clone()
         except Exception:
             self._broken = True
             raise
-        self.grad_hook_handles.clear()
-        self.grad_accs.clear()
         self._restore_lora_merges()
         self._restore_load_state_dict()
         self.bindings.clear()
-        self.main_grad_views.clear()
+        self.proxies.clear()
         if self.model is not None and "_big_leaf_plan" in self.model.__dict__:
             delattr(self.model, "_big_leaf_plan")
         self._active = False

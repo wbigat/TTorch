@@ -33,6 +33,13 @@ class _Plan:
         self.layout_args = args
         return "canonical-layout"
 
+    def entities(self):
+        return ["p0", "p1"]
+
+    def entity_swap(self):
+        import contextlib
+        return contextlib.nullcontext()
+
     def attach_ddp(self, ddp):
         self.attached = ddp
 

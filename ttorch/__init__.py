@@ -68,6 +68,13 @@ def activate(platform="auto", sweep_packages=None, skip_conformance=False):
     _fw_patches.register_all()
     from ttorch.bridge import framework_patch as _fw
     _fw.install(verbose=not skip_conformance)
+    # checkpoint 导出安全契约（B22，退役文档 §16.3）：厂商插件退役后，三个开关
+    # 缺任一都会在 exit=0 + loss 逐位一致的情况下导出 ~3.7e33 垃圾权重。
+    # 唯一挂载点，判据只有 worker gate（RANK/LOCAL_RANK，见 vendor_retire）——
+    # 不与 skip_conformance 耦合：派生进程继承父进程已兜底的环境、幂等通过；
+    # 显式跳过一致性门禁也不能静默失去导出保护。XSwift 在场时契约不动作。
+    from ttorch.bridge import vendor_retire as _vendor_retire
+    _vendor_retire.assert_export_safe_for_worker()
     # Swift 会在父进程之外再执行 torchrun worker 的 sft.py。显式设置总开关
     # （含 0 的 stock A/B）时，每个 worker 都安装同一套 fast-FC 生命周期；
     # 派生 DataLoader 进程不建模，保持轻量且不安装训练补丁。

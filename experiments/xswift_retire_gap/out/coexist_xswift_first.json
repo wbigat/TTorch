@@ -1,0 +1,81 @@
+{
+  "order": "xswift_first",
+  "xswift_plugin_enable": "1",
+  "xme_plugin_enable": "0",
+  "large_weight": "1",
+  "after_xswift": {
+    "swift.megatron.utils.megatron_lm_utils.wrap_model": {
+      "state": "present",
+      "impl_module": "xswift_ext.components.swift.megatron.utils.megatron_lm_utils",
+      "impl_qualname": "wrap_model",
+      "tt_origin_trace_present": false,
+      "has_functools_wrapped": false,
+      "wrapped_module": null,
+      "is_xswift_impl": true,
+      "closure_marker_tt_cp_group_fixed": null
+    },
+    "swift.loss.embedding.gather_object": {
+      "state": "present",
+      "impl_module": "xswift_ext.components.swift.loss.embedding",
+      "impl_qualname": "gather_object_cpu",
+      "tt_origin_trace_present": false,
+      "has_functools_wrapped": false,
+      "wrapped_module": null,
+      "is_xswift_impl": true,
+      "closure_marker_tt_cp_group_fixed": null
+    },
+    "mcore_bridge.patcher.rope_utils._apply_rotary_pos_emb_thd": {
+      "state": "present",
+      "impl_module": "mcore_bridge.patcher",
+      "impl_qualname": "_patch_mrope.<locals>._apply_rotary_pos_emb_thd",
+      "tt_origin_trace_present": false,
+      "has_functools_wrapped": true,
+      "wrapped_module": "mcore_bridge.patcher",
+      "is_xswift_impl": false,
+      "closure_marker_tt_cp_group_fixed": "marker_absent"
+    }
+  },
+  "after_tt": {
+    "swift.megatron.utils.megatron_lm_utils.wrap_model": {
+      "state": "present",
+      "impl_module": "xswift_ext.components.swift.megatron.utils.megatron_lm_utils",
+      "impl_qualname": "wrap_model",
+      "tt_origin_trace_present": false,
+      "has_functools_wrapped": false,
+      "wrapped_module": null,
+      "is_xswift_impl": true,
+      "closure_marker_tt_cp_group_fixed": null
+    },
+    "swift.loss.embedding.gather_object": {
+      "state": "present",
+      "impl_module": "xswift_ext.components.swift.loss.embedding",
+      "impl_qualname": "gather_object_cpu",
+      "tt_origin_trace_present": true,
+      "has_functools_wrapped": true,
+      "wrapped_module": "xswift_ext.components.swift.loss.embedding",
+      "is_xswift_impl": true,
+      "closure_marker_tt_cp_group_fixed": null
+    },
+    "mcore_bridge.patcher.rope_utils._apply_rotary_pos_emb_thd": {
+      "state": "present",
+      "impl_module": "mcore_bridge.patcher",
+      "impl_qualname": "_patch_mrope.<locals>._apply_rotary_pos_emb_thd",
+      "tt_origin_trace_present": true,
+      "has_functools_wrapped": true,
+      "wrapped_module": "mcore_bridge.patcher",
+      "is_xswift_impl": false,
+      "closure_marker_tt_cp_group_fixed": "marker_absent"
+    }
+  },
+  "tt_active": true,
+  "tt_patch_status": {
+    "swift.megatron.utils.megatron_lm_utils.wrap_model": "skipped(前置条件不满足)",
+    "swift.loss.embedding.gather_object": "applied",
+    "megatron.core.models.common.embeddings.rope_utils._apply_rotary_pos_emb_thd": "applied"
+  },
+  "tt_bindings_intact": {
+    "raised": false,
+    "tampered": "(0, [(True, 'torch.cuda.set_device'), (True, 'torch.cuda.synchronize'), (True, 'torch.cuda.Stream'), (True, 'torch.cuda.current_stream'), (True, 'torch.cuda.set_stream'), (True, 'torch.cuda.stream'), (True, 'torch.cuda.Event'), (True, 'torch.cuda.manual_seed'), (True, 'torch.cuda.set_rng_state'), (T"
+  },
+  "xswift_initialized": true
+}

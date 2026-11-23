@@ -491,9 +491,40 @@ ttorch.activate()
 
 **失效必须可见**：`patch_status()` 给每条补丁的状态
 （`applied` / `skipped(符号不存在)` / `skipped(前置条件不满足)` /
-`skipped(wrapper 判定不需要接管)` / `error(XxxError)` / `pending(模块未到场)`），
-`install(verbose=True)` 打印 `applied/total` 摘要。静默失效是最危险的状态
-——训练照跑，但缺陷依旧。
+`skipped(wrapper 判定不需要接管)` / `error(XxxError)` / `pending(模块未到场)` /
+**`overwritten(<篡夺者>)`**），`install(verbose=True)` 打印 `applied/total` 摘要。
+静默失效是最危险的状态——训练照跑，但缺陷依旧。
+
+**`overwritten` 是运行期复核的结果（2026-11-19 新增，B17）**：`_APPLIED` 只是
+**安装那一刻**的结论，而第三方（厂商插件 XSwift 的 `KlxSymbolRewriter.replace()`
+是整函数替换）可以在之后把同一符号整体顶掉——**生产的真实顺序正是
+`activate()` 先打补丁、再 import swift 触发厂商 lazy hook**。三条设计约束：
+
+1. **基准取自 `_rebind.snapshot()`**，不是本模块私藏的对象引用——它是替换动作的
+   唯一快照，也是 `assert_bindings_intact()` 的基准；同源才能保证两个报告不会
+   互相矛盾（此前实测 `patch_status()` 报全 applied 而 tampered=4，各说各话）；
+2. **复核不改写 `_APPLIED`、不自动重打**——"被顶掉后谁该赢"是语义决策，
+   不该由一次状态查询顺手做掉；
+3. **第三方在外层包装不算覆盖**（`__wrapped__` 链上仍能找到我们）——TT 的修正
+   此时真实生效，报 overwritten 是假警报，而 big_leaf 入口的 fail-fast 直接读
+   这个状态。另提供 `overwritten_patches()` 给"框架 import 之后"的复核点
+   （`big_leaf/swift.py:main()` 用它打印篡夺者，**刻意不 raise**）。
+
+**`patch_status()` 与 `assert_bindings_intact()` 是两个口径**（2026-11-19 实测
+澄清）：前者问"TT 的修正是否仍在调用链上生效"（身份相等**或**被包在
+`__wrapped__` 链里），后者问"落点对象是否还是绑定那一刻那个"（严格身份相等）。
+两者给出不同结论是**正常且必要**的——实测形态：`mcore_bridge.patcher._patch_mrope()`
+在 TT 打完 THD 补丁之后又被调用一次，用 `functools.wraps` 把 TT 的 wrapper 包了
+一层。此时 bindings 报 tampered（对象确实换了），patch_status 报 applied
+（修正仍在链上）。**上面第 3 条守卫就是为这个场景存在的**，去掉它会把一个完全
+正常的训练打挂。
+
+**升级安全探测必须先判实现来源（2026-11-19，B18）**：`_vendor_provides()` 先看
+`__module__` / `__code__.co_filename` 是否来自 `xswift_ext`/`xmegatron_ext`，
+再落回源码 needle。起因是实测踩到的归因错误——XSwift 的 `wrap_model` 替换实现
+是 swift ≥4.3.2 的**逐字拷贝**、变量名恰好就叫 `ddp_stream`，旧判据据此记成
+「上游已修复」。两者的退役含义完全相反：厂商在场 = 退役后缺口回归，
+上游已修复 = 补丁可以永久删。
 
 **所有机制异常收敛为"不接管" + provenance 留痕，绝不向上抛**：功能补丁失败应退回
 框架原实现（可能有缺陷但能跑），不能让 TT 把训练搞崩。
@@ -739,3 +770,51 @@ B1 12 + B5 6 + B7 6 + hook 3 + finder 互递归 2。
 `XTE_GROUPED_GEMM_LARGE_WEIGHT=1`。撤出后 LW=1 下的 `AttributeError` 会**回归**
 （此前靠 XSwift 插件挡，插件退役后靠这两条补丁挡）。按 2026-11-04 决策，
 **TT 侧不加告警也不接管**，该风险由生产侧把控。
+
+> **2026-11-18/19 修正**：失败模式**不是** `AttributeError` —— XME 的
+> `__getattr__` 视图让 `weight{i}` 可读但值错，整网实测是**静默导出 180 个
+> ~3.7e33 的专家权重**（退役文档 §16.4-B），比 fail-fast 危险得多。
+> 「不加告警」这条随之改为 **加闸但不接管**，见 §9.6。
+
+### 9.6 `vendor_retire`：厂商插件退役的前置检查（2026-11-19 落地）
+
+**定位**：bridge 层的只读探针 + 一道环境契约闸门。**不承接任何厂商功能**
+（§9.5 的决策不变），只负责"厂商插件不在场时，别让它静默损坏 checkpoint"。
+
+| 能力 | 用途 |
+|---|---|
+| `implementation_owner(fn)` | 实现是否来自 `xswift_ext`/`xmegatron_ext`（`__module__` + `co_filename`，沿 `__wrapped__` 链）。B18 的升级安全探测消费它 |
+| `plugin_presence()` / `plugin_protection_expected()` | 在场画像；后者判「包可 import **且** `XSWIFT_PLUGIN_ENABLE` 为真」，默认取 0（与厂商 `auto_init.py:25` 一致） |
+| `dummy_module_traces()` | 扫 XSwift `import_module_safe` 注入的 `/klx_dummy_lib/...` 假模块（会掩盖真实 import 失败、污染无包验证的 `sys.modules` 审计） |
+| `export_safety_issues()` / `assert_export_safe()` | 三开关的 checkpoint 导出安全契约（见下） |
+| `retirement_report()` | 一次性画像，给退役检查与实验脚本用 |
+
+**导出安全契约的分级处置**（整网实测来源：退役文档 §16.3）：
+
+| 开关 | 安全值 | 处置 | 为什么这样分级 |
+|---|---|---|---|
+| `XTE_GROUPED_GEMM_LARGE_WEIGHT` | 0 | **只 fail-fast，不自动改** | LW=1 是显式性能决策（MoE 层 ~12-14%），悄悄翻成 0 等于让性能无声退化 |
+| `HYDRA_DISABLE_FAST_FC_MEMORY_EFFICIENT` | 1 | 未设则 setdefault；显式设 0 则 fail-fast | 代价是峰值 +224/448 MiB，远小于一个静默损坏的 checkpoint |
+| `XTE_DISABLE_FAST_BF16_CACHE` | 1 | 同上 | big_leaf 本就要求关 pin，契约与之一致 |
+
+**XSwift 在场时整个契约不动作**——这三条问题此时由插件挡着，当前生产形态
+（LW=1 + 插件开）零影响。消费点只有一个：`ttorch.activate()`，对**训练 worker**
+（`RANK`/`LOCAL_RANK` 在场）执行，其余进程原样放行、不改它们的环境变量。
+
+**挂载点收敛**（2026-11-19，两次修正的净结果）：
+
+1. 第一次：闸门从"只挂 `big_leaf/swift.py::enable()`"挪进 `activate()`——
+   `activate()` 只有在显式设置 `TT_BIG_LEAF` 时才调 `enable()`，而生产退役路径
+   是 `megatron sft` + `.pth` 自动激活且不设该变量，只挂那里等于装饰品。
+2. 第二次：`enable()` 里那份不带 worker gate 的契约被撤掉（裸调它的工具/单测
+   进程会被拦、被改环境，与 worker gate 的设计理由直接冲突）；`activate()` 里
+   的契约同时与 `skip_conformance` 解耦（显式跳过一致性门禁不能静默失去导出
+   保护）。收敛后判据单一（`RANK`/`LOCAL_RANK`），派生进程继承父进程已兜底的
+   环境、幂等通过。
+
+契约失败抛 `ExportUnsafeError`，`utils/_auto_init` 把它转成 `SystemExit`：
+`.pth` 路径的普通异常会被 `site` 吞成一行警告、训练照跑，那正是回到静默损坏；
+`SystemExit` 是 `BaseException`，能穿透。
+
+依赖方向：只读 `os.environ` / `sys.modules` / `find_spec`，**不 import 厂商包**
+（探测本身不能把被探测对象拉起来）。

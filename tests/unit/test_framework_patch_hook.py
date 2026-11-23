@@ -37,6 +37,8 @@ def _cleanup(p, module_name):
     fw._PATCHES.remove(p)
     fw.uninstall()
     fw._APPLIED.pop(p.dotted, None)
+    fw._BOUND.pop(p.dotted, None)
+    fw._OVERWRITE_SEEN.pop(p.dotted, None)
     mod = sys.modules.get(module_name)
     if mod is not None:
         from ttorch.utils import _rebind
@@ -72,6 +74,46 @@ def test_late_import_gets_patched_version_via_from_import(post_module):
 
         assert via_from_import is mod.wrap_model
         assert getattr(via_from_import, "_tt_patched", False) is True
+    finally:
+        _cleanup(p, post_module)
+
+
+def test_builtins_import_hijack_stacked_on_meta_path_finder(post_module, monkeypatch):
+    """B21②：`builtins.__import__` 劫持（XSwift 机制）× meta-path finder（TT 机制）。
+
+    两种机制叠放的时序此前**零覆盖**（同域已出过真机 `RecursionError`：
+    `_PatchFinder` 与 `_PostImportFinder` 互委托）。真实栈的顺序是：
+    TT 的 finder 在 `exec_module` 完成时打补丁 → 外层的 `__import__` 劫持
+    **在其之后**拿到模块并整体替换符号 → TT 的补丁被顶掉。
+
+    两条断言：① 不炸（无互递归 / 无 import 失败）；② 覆盖必须被 B17 的运行期
+    复核看见——安装时 `applied`、复核后 `overwritten`。
+    """
+    import builtins
+
+    p = _tmp_patch(post_module)
+    try:
+        fw.install(verbose=False)
+        real_import = builtins.__import__
+
+        def hijacked(name, *args, **kwargs):
+            module = real_import(name, *args, **kwargs)
+            if name == post_module:          # 厂商形态：import 完成后整函数替换
+                def vendor_impl(args_, models):
+                    return models
+                vendor_impl.__module__ = "xswift_ext.components.fake"
+                setattr(sys.modules[name], "wrap_model", vendor_impl)
+            return module
+
+        monkeypatch.setattr(builtins, "__import__", hijacked)
+        # 必须走 builtins.__import__（importlib.import_module 不经过它）
+        exec(f"import {post_module}", {})
+
+        assert fw.patch_status(recheck=False)[p.dotted] == "applied", \
+            "finder 应在 exec 完成时就打上补丁"
+        state = fw.patch_status()[p.dotted]
+        assert state.startswith("overwritten("), f"劫持覆盖未被察觉: {state}"
+        assert "xswift_ext" in state
     finally:
         _cleanup(p, post_module)
 

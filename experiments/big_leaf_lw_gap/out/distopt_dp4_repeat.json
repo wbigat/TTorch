@@ -1,0 +1,88 @@
+{
+  "config": {
+    "layers": 4,
+    "G": 32,
+    "fin": 2048,
+    "fout": 1024,
+    "tokens": 4096
+  },
+  "iters": 30,
+  "warmup": 10,
+  "arms": {
+    "stock": {
+      "structure": {
+        "ddp_buffer_params": 256,
+        "ddp_buckets": 1,
+        "optimizer_shard_tensors": 64,
+        "model_params": 256,
+        "big_leaf_bindings": 0
+      },
+      "phases": {
+        "forward_us": 4788.820398971438,
+        "backward_us": 27813.998516649008,
+        "grad_sync_us": 24456.575512886047,
+        "optimizer_us": 14923.377428203821,
+        "total_us": 71932.38823674619
+      }
+    },
+    "big_leaf": {
+      "structure": {
+        "ddp_buffer_params": 256,
+        "ddp_buckets": 1,
+        "optimizer_shard_tensors": 64,
+        "model_params": 256,
+        "big_leaf_bindings": 8
+      },
+      "phases": {
+        "forward_us": 3609.071485698223,
+        "backward_us": 25231.95557296276,
+        "grad_sync_us": 21326.906280592084,
+        "optimizer_us": 14977.490995079279,
+        "total_us": 65278.426045551896
+      }
+    },
+    "lw1": {
+      "structure": {
+        "ddp_buffer_params": 8,
+        "ddp_buckets": 1,
+        "optimizer_shard_tensors": 2,
+        "model_params": 8,
+        "big_leaf_bindings": 0
+      },
+      "phases": {
+        "forward_us": 3617.2608379274607,
+        "backward_us": 25229.785591363907,
+        "grad_sync_us": 21390.015492215753,
+        "optimizer_us": 13255.050871521235,
+        "total_us": 63509.041676297784
+      }
+    }
+  },
+  "gap_vs_lw1": {
+    "forward_us": {
+      "big_minus_lw1_us": -8.189352229237556,
+      "stock_minus_lw1_us": 1171.5595610439777,
+      "big_over_lw1": 0.9977360349180875
+    },
+    "backward_us": {
+      "big_minus_lw1_us": 2.169981598854065,
+      "stock_minus_lw1_us": 2584.212925285101,
+      "big_over_lw1": 1.000086008721358
+    },
+    "grad_sync_us": {
+      "big_minus_lw1_us": -63.10921162366867,
+      "stock_minus_lw1_us": 3066.5600206702948,
+      "big_over_lw1": 0.9970495948613672
+    },
+    "optimizer_us": {
+      "big_minus_lw1_us": 1722.4401235580444,
+      "stock_minus_lw1_us": 1668.3265566825867,
+      "big_over_lw1": 1.1299459459079666
+    },
+    "total_us": {
+      "big_minus_lw1_us": 1769.3843692541122,
+      "stock_minus_lw1_us": 8423.346560448408,
+      "big_over_lw1": 1.0278603537787985
+    }
+  }
+}

@@ -32,6 +32,33 @@ _WRAP_MODEL_ATTR = "wrap_model"
 _WRAP_MODEL_DOTTED = f"{_WRAP_MODEL_MODULE}.{_WRAP_MODEL_ATTR}"
 
 
+def _vendor_provides(dotted, fn):
+    """厂商插件是否已经提供了这个符号的实现（提供则 TT 不接管并**如实留痕**）。
+
+    **为什么必须先问这一句**（2026-11-18 实测，退役文档 §15.3-A②）：
+    XSwift 的 `wrap_model` 替换实现是 swift ≥4.3.2 的**逐字拷贝**，变量名恰好
+    就叫 `ddp_stream` —— 只看源码 needle 的旧实现会判「上游已修复 → 不接管」，
+    于是 provenance 把"依赖厂商插件"记成"上游已修复"。两者的退役含义完全相反：
+    前者是**退役后缺口会回归**，后者是补丁可以永久删除。
+
+    对 XSwift 的**实际**实现，净行为与旧实现一致（都不接管——旧实现靠 needle
+    恰好命中，本实现靠显式判据）。差别只出现在假想的"厂商实现里没有那个
+    needle"的情形：此时本实现仍不接管，把该符号的所有权完整留给厂商插件，
+    而不是在厂商实现外面再悄悄叠一层——过渡期的所有权必须单一且可追溯。
+    """
+    from ttorch.bridge.vendor_retire import implementation_owner
+    from ttorch.witness import provenance
+
+    owner = implementation_owner(fn)
+    if owner is None:
+        return False
+    provenance.record(provenance.LAYER_BRIDGE, "patch", dotted, "skipped",
+                      reason="vendor_plugin_present", vendor=owner,
+                      detail=f"该符号当前实现来自 {owner}，TT 不叠加。"
+                             "注意这**不是**上游修复：厂商插件退役后缺口会回归")
+    return True
+
+
 def _fn_source_contains(fn, needle):
     """源码形态探测：fn 的源码里是否出现 needle。
 
@@ -94,6 +121,8 @@ def _ddp_fence_applies():
 
     升级安全：源码检出 ``ddp_stream``（≥4.3.2 修复引入的命名流变量）→
     整个补丁不接管（skipped + 留痕），保证社区更新后零影响。
+    **先判厂商插件在场**（见 ``_vendor_provides``）——XSwift 的替换实现是
+    4.3.2 的逐字拷贝，needle 会命中，只看 needle 会把它误记成上游修复。
     """
     import sys
 
@@ -102,6 +131,8 @@ def _ddp_fence_applies():
         return False
     fn = getattr(mod, _WRAP_MODEL_ATTR, None)
     if fn is None:
+        return False
+    if _vendor_provides(_WRAP_MODEL_DOTTED, fn):
         return False
     # needle 用 "ddp_stream" 而非 "wait_stream"：前者是 4.3.2 修复引入的
     # 命名流变量，特异性高；后者是通用 API 名，上游无关改动含它就误判
@@ -307,6 +338,8 @@ def _thd_rope_applies():
     fn = getattr(mod, _THD_ATTR, None)
     if fn is None:
         return False
+    if _vendor_provides(_THD_DOTTED, fn):
+        return False   # 厂商插件已替换该符号：不叠加，且不记成"上游修复"
     if _upstream_has_fix(fn):
         return False   # 上游已修复（≥1.6.0）：不接管
     return _find_origin_cell(fn) is not None
