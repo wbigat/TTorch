@@ -107,22 +107,28 @@ class Arm:
             from ttorch.bridge.big_leaf import BigLeafMegatronPlan
             self.plan = BigLeafMegatronPlan.prepare(self.model, forward_mode="patch")
             layout = self.plan.compute_full_param_layout(
-                list(self.model.parameters()), ddp_config.bucket_size, world,
+                self.plan.entities(), ddp_config.bucket_size, world,
                 ddp_config, world)
-            self.ddp = DistributedDataParallel(
-                config=config, ddp_config=ddp_config, module=self.model,
-                full_param_layout=layout)
+            # 双线实体版：DDP 构造与 optimizer 构造都必须在换装窗口内。
+            with self.plan.entity_swap():
+                self.ddp = DistributedDataParallel(
+                    config=config, ddp_config=ddp_config, module=self.model,
+                    full_param_layout=layout)
             self.plan.attach_ddp(self.ddp)
         else:
             self.ddp = DistributedDataParallel(
                 config=config, ddp_config=ddp_config, module=self.model)
-        self.optimizer = get_megatron_optimizer(
-            config=OptimizerConfig(
-                optimizer="adam", lr=1e-4, bf16=True, use_distributed_optimizer=True,
-                adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8, weight_decay=0.01,
-            ),
-            model_chunks=[self.ddp],
+        opt_config = OptimizerConfig(
+            optimizer="adam", lr=1e-4, bf16=True, use_distributed_optimizer=True,
+            adam_beta1=0.9, adam_beta2=0.95, adam_eps=1e-8, weight_decay=0.01,
         )
+        if self.plan is not None:
+            with self.plan.entity_swap():
+                self.optimizer = get_megatron_optimizer(
+                    config=opt_config, model_chunks=[self.ddp])
+        else:
+            self.optimizer = get_megatron_optimizer(
+                config=opt_config, model_chunks=[self.ddp])
         torch.manual_seed(99)
         tokens = cfg["tokens"]
         self.x = torch.randn(tokens, cfg["fin"], device="cuda", dtype=torch.bfloat16)

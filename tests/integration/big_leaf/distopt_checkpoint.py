@@ -18,6 +18,16 @@ from ttorch.bridge.big_leaf import BigLeafMegatronPlan
 from distopt import G, FIN, FOUT, TOK, Model, init_model
 
 
+def optimizer_model_sd(model, plan):
+    """optimizer 侧 sharded state dict：big_leaf 时必须在换装窗口内构造，
+    使 `param_to_sharded_metadata` 的键 == 内部线实体（mcore 按参数对象查表）。
+    模型侧 checkpoint 仍用外部线 dict（weight{i} 键契约不变）。"""
+    if plan is None:
+        return sharded_state_dict_default(model)
+    with plan.entity_swap():
+        return sharded_state_dict_default(model)
+
+
 def build_instance(big_leaf=True):
     model = init_model()
     plan = BigLeafMegatronPlan.prepare(model, forward_mode="patch") if big_leaf else None
@@ -27,19 +37,30 @@ def build_instance(big_leaf=True):
     )
     world_size = dist.get_world_size()
     layout = plan.compute_full_param_layout(
-        list(model.parameters()), None, world_size, ddp_config, world_size) if big_leaf else None
+        plan.entities(), None, world_size, ddp_config, world_size) if big_leaf else None
     config = TransformerConfig(
         num_layers=1, hidden_size=FIN, num_attention_heads=1,
         num_moe_experts=G, moe_ffn_hidden_size=FOUT,
         bf16=True, params_dtype=torch.bfloat16,
     )
-    ddp = DistributedDataParallel(config, ddp_config, model, full_param_layout=layout)
     if big_leaf:
+        with plan.entity_swap():
+            ddp = DistributedDataParallel(
+                config, ddp_config, model, full_param_layout=layout)
         plan.attach_ddp(ddp)
-    optimizer = get_megatron_optimizer(
-        OptimizerConfig(optimizer="adam", lr=1e-3, bf16=True,
-                        use_distributed_optimizer=True, weight_decay=0.01),
-        model_chunks=[ddp])
+    else:
+        ddp = DistributedDataParallel(config, ddp_config, model, full_param_layout=layout)
+    if big_leaf:
+        with plan.entity_swap():
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(optimizer="adam", lr=1e-3, bf16=True,
+                                use_distributed_optimizer=True, weight_decay=0.01),
+                model_chunks=[ddp])
+    else:
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(optimizer="adam", lr=1e-3, bf16=True,
+                            use_distributed_optimizer=True, weight_decay=0.01),
+            model_chunks=[ddp])
     return model, plan, ddp, optimizer
 
 
@@ -87,7 +108,8 @@ def main():
         os.makedirs(ckpt_dir, exist_ok=True)
     dist.barrier()
     model_sd = sharded_state_dict_default(model)
-    optimizer_sd = optimizer.sharded_state_dict(model_sd, metadata=metadata)
+    optimizer_sd = optimizer.sharded_state_dict(
+        optimizer_model_sd(model, plan), metadata=metadata)
     dist_checkpointing.save({"model": model_sd, "optimizer": optimizer_sd},
                             ckpt_dir, async_sharded_save=False)
     dist.barrier()
@@ -99,11 +121,54 @@ def main():
         big_leaf=not args.target_stock)
     resumed_model_sd = sharded_state_dict_default(resumed)
     resumed_optimizer_sd = resumed_optimizer.sharded_state_dict(
-        resumed_model_sd, is_loading=True, metadata=metadata)
-    loaded = dist_checkpointing.load(
-        {"model": resumed_model_sd, "optimizer": resumed_optimizer_sd}, ckpt_dir)
-    resumed.load_state_dict(loaded["model"])
-    resumed_optimizer.load_state_dict(loaded["optimizer"])
+        optimizer_model_sd(resumed, resumed_plan), is_loading=True, metadata=metadata)
+    cross_format = args.source_stock != args.target_stock
+    if cross_format:
+        # 跨格式：模型先行加载（键契约与格式无关），optimizer 状态走转换路径。
+        loaded = dist_checkpointing.load({"model": resumed_model_sd}, ckpt_dir)
+        resumed.load_state_dict(loaded["model"])
+    else:
+        loaded = dist_checkpointing.load(
+            {"model": resumed_model_sd, "optimizer": resumed_optimizer_sd}, ckpt_dir)
+        resumed.load_state_dict(loaded["model"])
+        resumed_optimizer.load_state_dict(loaded["optimizer"])
+    if cross_format:
+        # 双线格式转换（expert ↔ entity）：按源格式位置序读原始 param_state，
+        # 转换到目标位置序/粒度，再走 load_state_dict 的 fully-reshardable 路径。
+        from ttorch.bridge.big_leaf import distopt_state as dstate
+        ddp_config = resumed_ddp.ddp_config
+        world = dist.get_world_size()
+        if args.source_stock:
+            src_positions = dstate.stock_positions(resumed, ddp_config, world, world)
+        else:
+            src_positions = dstate.entity_positions(
+                plan, ddp_config, world, world)  # 源 big 实例仍在场
+        if args.target_stock:
+            tgt_positions = dstate.stock_positions(resumed, ddp_config, world, world)
+        else:
+            tgt_positions = dstate.entity_positions(
+                resumed_plan, ddp_config, world, world)
+        # 用源 optimizer 的 is_loading 模板按源格式读原始 param_state 与 param_groups
+        # （mcore 自身机制，键/形状与磁盘必然一致）。
+        src_osd = optimizer.sharded_state_dict(
+            optimizer_model_sd(model, plan), is_loading=True, metadata=metadata)
+        # 生产迁移（源实例不在场）用 build_param_state_template 按位置序重建模板；
+        # 这里对照它与源实例模板的键/形状完全一致（形状随 positions 走，键随 fqn）。
+        built = dstate.build_param_state_template(src_positions)
+        for idx, entry in src_osd["param_state"].items():
+            for sk, sh_t in entry.items():
+                assert sk in built[idx], (idx, sk, "key 缺失")
+                assert tuple(built[idx][sk].data.shape) == tuple(sh_t.data.shape), (
+                    idx, sk, "shape 不一致")
+                assert built[idx][sk].key == sh_t.key, (idx, sk, "key 不一致")
+        raw = dist_checkpointing.load({"optimizer": src_osd}, ckpt_dir)["optimizer"]
+        converted = dstate.convert_param_state(
+            raw["param_state"], src_positions, tgt_positions, plan=resumed_plan)
+        resumed_optimizer.load_state_dict({
+            "optimizer": raw["optimizer"],
+            "param_state": converted,
+            "param_state_sharding_type": "fully_reshardable",
+        })
     if resumed_plan is not None:
         resumed_plan.assert_healthy()
 

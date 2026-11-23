@@ -54,7 +54,7 @@ def test_single_switch_enables_safe_fast_fc_defaults(monkeypatch, big_leaf):
     assert swift.os.environ[swift.ENV_VAR] == str(int(big_leaf))
     assert swift.os.environ["XTE_DISABLE_FAST_BF16_CACHE"] == "1"
     assert swift.os.environ["XMLIR_ENABLE_FAST_FC"] == "1"
-    assert len(registered) == (4 if big_leaf else 3)
+    assert len(registered) == (6 if big_leaf else 3)  # +optimizer 边界 + state 序列化换装
     assert "TT_FAST_FC_LIFECYCLE" not in swift.os.environ
     assert "TT_BIG_LEAF_FORWARD_MODE" not in swift.os.environ
 

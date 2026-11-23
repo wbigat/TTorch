@@ -68,17 +68,19 @@ def main():
     dp_size = mpu.get_data_parallel_world_size()
     edp_size = mpu.get_expert_data_parallel_world_size()
     layout = plan.compute_full_param_layout(
-        list(model.parameters()), None, dp_size, ddp_config, edp_size)
-    ddp = DistributedDataParallel(
-        config=config, ddp_config=ddp_config, module=model, full_param_layout=layout)
+        plan.entities(), None, dp_size, ddp_config, edp_size)
+    with plan.entity_swap():
+        ddp = DistributedDataParallel(
+            config=config, ddp_config=ddp_config, module=model, full_param_layout=layout)
     plan.attach_ddp(ddp)
     if rank == 0:
         print("STAGE DDP attached; build optimizer", flush=True)
-    optimizer = get_megatron_optimizer(
-        config=OptimizerConfig(
-            optimizer="adam", lr=1e-4, bf16=True, use_distributed_optimizer=True,
-            weight_decay=0.01,
-        ), model_chunks=[ddp])
+    with plan.entity_swap():
+        optimizer = get_megatron_optimizer(
+            config=OptimizerConfig(
+                optimizer="adam", lr=1e-4, bf16=True, use_distributed_optimizer=True,
+                weight_decay=0.01,
+            ), model_chunks=[ddp])
     for name, p in model.named_parameters():
         expected_weight = dict(stock.named_parameters())[name]
         assert torch.equal(p, expected_weight), (rank, "DDP 后权重变化", name)

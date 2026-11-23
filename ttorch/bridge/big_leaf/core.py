@@ -33,7 +33,7 @@ import types
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
-from transformer_engine.pytorch.env_config import xte_env
+from transformer_engine.pytorch.env_config import accel_bf16_pin_enabled, xte_env
 from transformer_engine.pytorch.module.grouped_linear import (
     GroupedLinear,
     MoeFcFusionImpl,
@@ -425,8 +425,10 @@ def _validate_repack_module(mod: GroupedLinear, allow_module_hooks: bool = False
                 raise ValueError(f"{mod}: 原 weight/bias 上已有 per-param hook，请先迁移到 big_leaf")
 
 
-def _repack_one(mod: GroupedLinear) -> _LeafBinding:
-    _validate_repack_module(mod)
+def _repack_one(mod: GroupedLinear, allow_module_hooks: bool = False,
+                allow_main_grad: bool = False) -> _LeafBinding:
+    _validate_repack_module(mod, allow_module_hooks=allow_module_hooks,
+                            allow_main_grad=allow_main_grad)
     G = mod.num_gemms
     ws = [getattr(mod, f"weight{i}") for i in range(G)]
     bs = [getattr(mod, f"bias{i}") for i in range(G)] if mod.use_bias else []
@@ -442,6 +444,16 @@ def _repack_one(mod: GroupedLinear) -> _LeafBinding:
 
     big = buf.detach().requires_grad_(ws[0].requires_grad)
     big_b = bbuf.detach().requires_grad_(bs[0].requires_grad) if bs else None
+    # 冻结 + pin 关：大叶子做成 nn.Parameter（requires_grad=False）。交错实测
+    # （2026-11-20 frozen_param_interleaved：fwd+bwd −23%，param/plain=0.771，
+    # 与 LW=1 冻结量级持平）——TE 对 Parameter 权重走常驻转置缓存，plain tensor
+    # 每次 fresh pack。pin 关时不存在「原地覆写 Parameter 导出视图」的污染
+    # （§9.2 / 退役文档 §16.3），生产入口强制 pin 关；pin 开时保持 plain tensor
+    # ——宁可慢 23%，也不让 weight{i} 导出视图被污染。
+    if not ws[0].requires_grad and not accel_bf16_pin_enabled():
+        big = torch.nn.Parameter(big, requires_grad=False)
+        if big_b is not None:
+            big_b = torch.nn.Parameter(big_b, requires_grad=False)
     originals = [(p, p.data) for p in ws + bs]
     try:
         with torch.no_grad():

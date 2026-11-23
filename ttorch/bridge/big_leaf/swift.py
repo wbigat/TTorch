@@ -58,6 +58,7 @@ def enable(big_leaf=True):
 
     from ttorch.bridge import framework_patch as fw
     from ttorch.bridge.framework_patch import FunctionPatch
+    from . import optimizer as bl_optimizer
 
     patches = []
     if big_leaf:
@@ -67,6 +68,20 @@ def enable(big_leaf=True):
             attr=runtime.DDP_ATTR,
             wrapper=runtime.ddp_init_wrapper,
             intent="big_leaf canonical DDP layout and main_grad lifecycle",
+        ))
+        patches.append(FunctionPatch(
+            dotted=bl_optimizer.OPTIMIZER_DOTTED,
+            module=lifecycle.SWIFT_TRAINER_MODULE,
+            attr=bl_optimizer.OPTIMIZER_ATTR,
+            wrapper=bl_optimizer.optimizer_boundary_wrapper,
+            intent="dist-opt 构造边界换装内部线实体（双线：外部线零感知）",
+        ))
+        patches.append(FunctionPatch(
+            dotted=bl_optimizer.MCORE_SD_DOTTED,
+            module=bl_optimizer.MCORE_SD_MODULE,
+            attr=bl_optimizer.MCORE_SD_ATTR,
+            wrapper=bl_optimizer.mcore_sharded_state_dict_wrapper,
+            intent="optimizer state 序列化换装 + fully-reshardable 格式闸门",
         ))
     patches.extend([
         FunctionPatch(

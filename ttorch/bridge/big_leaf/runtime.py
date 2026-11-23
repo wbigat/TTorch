@@ -46,16 +46,20 @@ def ddp_init_wrapper(orig):
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         bucket_size = None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
         layout = plan.compute_full_param_layout(
-            list(module.parameters()),
+            plan.entities(),
             bucket_size,
             mpu.get_data_parallel_world_size(with_context_parallel=True),
             ddp_config,
             mpu.get_expert_data_parallel_world_size(),
         )
-        orig(self, config, ddp_config, module,
-             disable_bucketing=disable_bucketing,
-             pg_collection=pg_collection,
-             full_param_layout=layout)
+        # DDP 构造期间换装：mcore 的 DDP 从 module.named_parameters() 收集参数并
+        # 断言 layout 键与之相等，实体替换必须覆盖整个构造窗口（详见
+        # BigLeafMegatronPlan.entity_swap 的注释）。
+        with plan.entity_swap():
+            orig(self, config, ddp_config, module,
+                 disable_bucketing=disable_bucketing,
+                 pg_collection=pg_collection,
+                 full_param_layout=layout)
         plan.attach_ddp(self)
         self._tt_big_leaf_plan = plan
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:

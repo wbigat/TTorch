@@ -125,6 +125,9 @@ class Arm:
                 container = torch.nn.Module()
                 container.gl = self.module
                 self.container = container
+                # 复刻生产入口顺序：pin 在 repack 前已关（冻结大叶子的 Parameter 化
+                # 以 repack 时刻的 pin 状态为准，2026-11-20）。
+                _set("XTE_DISABLE_FAST_BF16_CACHE", "1")
                 self.plan = apply_big_leaf(container, forward_mode="patch")
         elif name in ("lw1_pin", "lw1_nopin"):
             self.module = build_module(True, shape)
