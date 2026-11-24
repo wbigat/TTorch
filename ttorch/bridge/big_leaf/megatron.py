@@ -33,8 +33,8 @@
 **冻结模块（full/LoRA base）**：`prepare()` 把整模块冻结的 GroupedLinear 归入
 `frozen_modules`，`attach_ddp` 用独立 buf（`_repack_one`）绑定，只拿 forward
 收益（forward 直取 + 免 cat），不进 DDP buffer / optimizer（无梯度、无 Adam
-状态）。LoRA base 即此形态；restore 时冻结权重脱离独立 buf 视图（克隆回独立
-存储，避免悬空 storage）。
+状态）。LoRA base 即此形态；restore 后冻结权重保持独立 buf 视图（视图 refcount
+保活 storage，不悬空、无需 clone）。
 """
 import contextlib
 import dataclasses
@@ -130,6 +130,35 @@ class BigLeafMegatronPlan(BigLeafPlan):
         plan._build_proxies()
         return plan
 
+    # 不照抄的维度分片属性：per-expert weight{i} 的 partition_dim/stride 是相对
+    # (out,in) 的分片语义，实体 shape=(G,out,in) 分片维度不同，照抄在 TP>1 下语义
+    # 错误（review 2026-11-23 问题 4）。实体的 TP 语义由其自身 layout 决定，TP>1
+    # 的 optimizer checkpoint 已在序列化边界 fail-fast（optimizer.py）。
+    _SHARDING_SPEC_ATTRS = ("tensor_model_parallel", "partition_dim", "partition_stride")
+
+    @classmethod
+    def _propagate_param_attrs(cls, entity, src) -> None:
+        """把影响行为的安全属性从原参数传播到内部线实体。
+
+        传播 `allreduce`（mcore buffer 按它分 expert/dense 组）与非分片的自定义
+        属性（attr-based lr/wd 分组标记等）；跳过维度分片 spec 与 dunder——见
+        `_SHARDING_SPEC_ATTRS` 的注释。
+        """
+        entity.allreduce = getattr(src, "allreduce", True)
+        for name in dir(src):
+            if name.startswith("_") or name in cls._SHARDING_SPEC_ATTRS:
+                continue
+            if name == "allreduce":
+                continue
+            try:
+                value = getattr(src, name)
+            except Exception:
+                continue
+            # 只传播标量/布尔/int 等分组标记，不传播 tensor/方法等对象。
+            if isinstance(value, (bool, int, float, str)):
+                if not hasattr(entity, name):
+                    setattr(entity, name, value)
+
     def _build_proxies(self) -> None:
         """构造内部线实体并把 G 份权重值搬入（DDP 会按 param.data 拷贝进 param_data）。"""
         for module in self.modules_to_bind:
@@ -139,7 +168,7 @@ class BigLeafMegatronPlan(BigLeafPlan):
             with torch.no_grad():
                 for i in range(module.num_gemms):
                     big[i].copy_(getattr(module, f"weight{i}").data)
-            big.allreduce = getattr(module.weight0, "allreduce", True)
+            self._propagate_param_attrs(big, module.weight0)
             if module.use_bias:
                 b0 = module.bias0.data
                 big_b = torch.nn.Parameter(
@@ -147,7 +176,7 @@ class BigLeafMegatronPlan(BigLeafPlan):
                 with torch.no_grad():
                     for i in range(module.num_gemms):
                         big_b[i].copy_(getattr(module, f"bias{i}").data)
-                big_b.allreduce = getattr(module.bias0, "allreduce", True)
+                self._propagate_param_attrs(big_b, module.bias0)
             else:
                 big_b = None
             self.proxies[id(module)] = (big, big_b)
@@ -188,6 +217,15 @@ class BigLeafMegatronPlan(BigLeafPlan):
         窗口内 `_parameters` 不含 weight{i}（若被访问会 AttributeError），
         但 DDP 构造与 optimizer 构造都只做泛型参数遍历；`state_dict()` 只在
         窗口外被调用，外部查询/导出/键契约零影响。窗口外恢复原字典。
+
+        **「外部无感」的边界（review 2026-11-23 问题 4）**：换装窗口内实体名从
+        `weight{i}`/`bias{i}` 收敛为单个 `weight`/`bias`，维数也从 per-expert
+        变为实体 (G,out,in)。因此 optimizer 构造窗口内，**按名字模式
+        （`weight{i}` 正则）或 per-expert shape 决定 lr/wd 分组的规则不会命中
+        实体**——这类规则需在实体层重写；**按参数属性**的分组规则有效（属性经
+        `_propagate_param_attrs` 传播到实体）。手工路径（`apply_big_leaf` +
+        `optimizer_param_groups`）有同组校验，生产换装路径不自动宣称同等保障，
+        自定义 lr/wd 分组需重新验证。
         """
         saved = []
         for module in self.modules_to_bind:
@@ -404,42 +442,27 @@ class BigLeafMegatronPlan(BigLeafPlan):
             "dist-opt 模式必须保留 DDP 参数实体并调用 get_megatron_optimizer；"
             "不能使用非 dist-opt 的 plan.optimizer_params()")
 
-    def restore(self, detach_storage: bool = False):
-        """幂等摘除 big_leaf；weight{i} 保持 param_data 视图（值持续最新）。
+    def restore(self):
+        """幂等摘除 big_leaf；weight{i} 保持内部线存储视图（值持续最新）。
 
-        **存储生命周期契约（重要）**：默认 restore **不解除**可训模块
-        `weight{i}` 对 DDP buffer 存储的依赖——`weight{i}.data` 仍是内部线
-        `big` 实体（即 DDP param_data）的切片视图。因此调用方必须保证
-        **DDP 对象存活期 ⩾ restore 后 weight{i} 的使用期**；若 restore 后释放
-        了 DDP，可训 `weight{i}` 会悬空。
+        **存储生命周期（review 2026-11-23 5b 澄清）**：`weight{i}.data` 是内部线
+        存储的切片视图（可训 = DDP param_data，冻结 = plan 独立 buf）。视图经
+        refcount 持有 storage——**即使 DDP / plan 之后被释放，weight{i} 依然可读
+        有效，不会悬空**（实测：`del buf` + `gc.collect()` 后视图可读、storage
+        指针不变）。因此 restore **不做 clone**——先前按「防悬空」clone 是对
+        `.data` 别名保活机制的误读，属过度设计。
 
-        restore 后**不能继续训练**：DDP 的梯度实体是内部线，标准反向会落到
-        外部线 weight{i} 上而无人规约。与生产回滚策略一致（优先新进程）。
-
-        detach_storage=True：可训模块的 `weight{i}` 也 clone 回独立存储，解除
-        对 DDP buffer 的依赖，用于"导出后立即释放 DDP"的场景。代价是每个可训
-        GroupedLinear 瞬时多占一份本地专家权重显存。冻结模块用独立 buf，无论
-        该开关都必须 clone（否则 buf 随 bindings 释放后 weight{i} 悬空）。
+        **restore 后不能继续训练**（这是训练有效性问题，与存储生命周期是两回事，
+        不要混淆）：DDP 的梯度实体是内部线 big，摘除后标准反向会落到外部线
+        weight{i} 上而无人规约，hook 与参数实体已不匹配。生产回滚策略=优先新进程。
         """
         if not self._active:
             return
         if self._broken:
             raise RuntimeError("big_leaf Megatron plan 此前 restore 失败，请重建模型")
-        frozen_ids = {id(m) for m in self.frozen_modules}
         try:
             for binding in self.bindings:
                 _uninstall_forward(binding)
-                # 冻结绑定的独立 buf 会随 bindings 释放，weight{i} 必须脱离视图；
-                # 可训绑定仅在显式 detach_storage 时脱离 DDP param_data 视图。
-                if detach_storage or id(binding.module) in frozen_ids:
-                    with torch.no_grad():
-                        for i in range(binding.module.num_gemms):
-                            p = getattr(binding.module, f"weight{i}")
-                            p.data = p.data.clone()
-                        if binding.bbuf is not None:
-                            for i in range(binding.module.num_gemms):
-                                p = getattr(binding.module, f"bias{i}")
-                                p.data = p.data.clone()
         except Exception:
             self._broken = True
             raise

@@ -225,6 +225,9 @@ class BigLeafPlan:
             with torch.no_grad():
                 buf[i].copy_(p.data)
                 p.data = buf[i]
+        # sanctioned 更新（merge/unmerge/load_state_dict）可能原地 bump weight{i}
+        # ._version；修复后重记基线，避免被 _check_binding_runtime 误判为未授权写。
+        _refresh_version_baseline(b, kind)
 
     def _patch_lora_merges(self) -> None:
         if self.model is None:
@@ -277,6 +280,13 @@ class BigLeafPlan:
             if bound.arguments.get("assign", False):
                 raise ValueError("big_leaf 禁止 load_state_dict(assign=True)；请使用默认 copy_ 路径")
             result = original(*args, **kwargs)
+            # load 的 copy_ 是 in-place 写进共享 buf，会 bump weight{i}._version。
+            # 这是 sanctioned 更新（加载 ckpt 本就改权重），必须重记版本基线，
+            # 否则 assert_healthy 的版本契约检查会误判为未授权外部写（review 5a）。
+            for b in self.bindings:
+                _refresh_version_baseline(b, "weight")
+                if b.bbuf is not None:
+                    _refresh_version_baseline(b, "bias")
             self.assert_healthy()
             return result
 
@@ -372,7 +382,7 @@ class BigLeafPlan:
 
 
 def _check_binding_runtime(binding: _LeafBinding) -> None:
-    """检测 plan 失败、动态冻结与新增原参数 hook，避免静默绕过。"""
+    """检测 plan 失败、动态冻结、新增原参数 hook 与未授权外部写权重，避免静默绕过。"""
     if binding.plan is not None and binding.plan._broken:
         raise RuntimeError("big_leaf plan 已处于 broken 状态，禁止继续 forward")
     module = binding.module
@@ -390,6 +400,47 @@ def _check_binding_runtime(binding: _LeafBinding) -> None:
         if leaf.requires_grad != expected:
             raise RuntimeError(
                 f"{module}: 检测到 apply 后动态冻结/解冻；当前 plan 不支持，请重建 plan")
+        # 版本契约（review 2026-11-23 问题 5a）：weight{i} 与内部 big 共享 storage
+        # 但不共享 _version。优化器经 big 更新时 weight{i}._version 不变；外部原地写
+        # weight{i} 会 bump 它——而 autograd 的版本检查查的是 big，查不到这种写，
+        # 会让 backward 静默用被改过的值（实测：w.copy_ 后 big._version 不变）。
+        # 这里显式检测：_version 偏离基线 = 有未经 external_weight_update 的外部写。
+        versions_attr = f"_bl_{kind}_versions"
+        baseline = getattr(binding, versions_attr, None)
+        current = [p._version for p in params]
+        if baseline is None:
+            setattr(binding, versions_attr, current)
+        elif current != baseline:
+            raise RuntimeError(
+                f"{module}: 检测到未经 plan.external_weight_update() 的外部 {kind}{{i}} "
+                "原地写（_version 漂移）。big_leaf 要求训练期外部权重只经 optimizer/big "
+                "更新——有未完成计算图时写外部权重会让 backward 静默用错值。"
+                "merge/unmerge/load_state_dict 等合法更新必须走 external_weight_update()")
+
+
+def _refresh_version_baseline(b: _LeafBinding, kind: str) -> None:
+    """重记某类参数的版本基线（sanctioned 外部更新后吸收其 _version 变化）。"""
+    params = [getattr(b.module, f"{kind}{i}") for i in range(b.module.num_gemms)]
+    setattr(b, f"_bl_{kind}_versions", [p._version for p in params])
+
+
+def _backward_version_guard(binding: _LeafBinding):
+    """返回挂在 forward 输出张量上的 backward 钩子（review 三轮 P2）。
+
+    版本检查原先只在 forward / 健康检查执行——forward→backward 之间的外部写要等
+    下一次 forward 才暴露，而错误的 weight 梯度早已被算出。把检查接到**真实
+    backward 入口**（输出张量的梯度被计算、即 weight Function.backward 即将运行
+    的那一刻），在 weight 梯度被算出前拦截。
+
+    **能力边界（如实）**：本守卫检测的是 **Parameter 级** in-place 写（会 bump
+    weight{i}._version）。经 `.data` 的写不改变任何 `_version`（实测），**原理上
+    不可经版本机制检测**——那是必须禁止的契约违规，不在本守卫覆盖范围。本守卫
+    是「检测常见外部写」，不是「阻止一切外部写」。
+    """
+    def hook(grad):
+        _check_binding_runtime(binding)
+        return grad
+    return hook
 
 
 def _validate_repack_module(mod: GroupedLinear, allow_module_hooks: bool = False,
@@ -597,6 +648,10 @@ def _big_leaf_forward(module: GroupedLinear, inp: torch.Tensor, m_splits: List[i
             for o, b in zip(
                 torch.split(out.view(-1, module.out_features), m_splits), bias_tensor_list)
         ]).view(out_shape)
+    if torch.is_grad_enabled() and out.requires_grad:
+        # 把版本契约检查接到真实 backward 入口（review 三轮 P2）：在 weight 梯度
+        # 被算出前拦截 forward→backward 之间的外部写（Parameter 级，见 guard 注释）。
+        out.register_hook(_backward_version_guard(binding))
     if module.return_bias:
         return out, [cast_if_needed(b, module.activation_dtype) for b in bias_tensor_list]
     return out

@@ -133,37 +133,37 @@ def main():
         resumed.load_state_dict(loaded["model"])
         resumed_optimizer.load_state_dict(loaded["optimizer"])
     if cross_format:
-        # 双线格式转换（expert ↔ entity）：按源格式位置序读原始 param_state，
-        # 转换到目标位置序/粒度，再走 load_state_dict 的 fully-reshardable 路径。
+        # 双线格式转换（expert ↔ entity）。读盘用**源格式参考实例**的
+        # sharded_state_dict（mcore 原生机制）——这是无源恢复的正道：不需要原始
+        # 训练实例，只需构造一个源格式的参考 model+DDP+optimizer 即可生成读模板。
+        # （review 1d 已确认：手搓 build_param_state_template 的裸 from_rank_offsets
+        # 缺 fully-reshardable 的真实分片元数据，驱动不了真实 load——本测试实测
+        # "Invalid access pattern" 复现。它降级为布局对照诊断，见 distopt_state。）
         from ttorch.bridge.big_leaf import distopt_state as dstate
         ddp_config = resumed_ddp.ddp_config
         world = dist.get_world_size()
+        # 布局对照诊断：position 推导的 FQN key/shape 必须与源格式参考实例的真实
+        # 键完全一致（保证 convert 的键推导正确），但不用于驱动 load。
         if args.source_stock:
             src_positions = dstate.stock_positions(resumed, ddp_config, world, world)
         else:
-            src_positions = dstate.entity_positions(
-                plan, ddp_config, world, world)  # 源 big 实例仍在场
-        if args.target_stock:
-            tgt_positions = dstate.stock_positions(resumed, ddp_config, world, world)
-        else:
-            tgt_positions = dstate.entity_positions(
-                resumed_plan, ddp_config, world, world)
-        # 用源 optimizer 的 is_loading 模板按源格式读原始 param_state 与 param_groups
-        # （mcore 自身机制，键/形状与磁盘必然一致）。
+            src_positions = dstate.entity_positions(plan, ddp_config, world, world)
         src_osd = optimizer.sharded_state_dict(
             optimizer_model_sd(model, plan), is_loading=True, metadata=metadata)
-        # 生产迁移（源实例不在场）用 build_param_state_template 按位置序重建模板；
-        # 这里对照它与源实例模板的键/形状完全一致（形状随 positions 走，键随 fqn）。
         built = dstate.build_param_state_template(src_positions)
         for idx, entry in src_osd["param_state"].items():
             for sk, sh_t in entry.items():
-                assert sk in built[idx], (idx, sk, "key 缺失")
-                assert tuple(built[idx][sk].data.shape) == tuple(sh_t.data.shape), (
-                    idx, sk, "shape 不一致")
-                assert built[idx][sk].key == sh_t.key, (idx, sk, "key 不一致")
+                assert sk in built[idx] and built[idx][sk].key == sh_t.key \
+                    and tuple(built[idx][sk].data.shape) == tuple(sh_t.data.shape), (
+                        idx, sk, "position 推导的 key/shape 与真实不符")
         raw = dist_checkpointing.load({"optimizer": src_osd}, ckpt_dir)["optimizer"]
-        converted = dstate.convert_param_state(
-            raw["param_state"], src_positions, tgt_positions, plan=resumed_plan)
+        # 走生产可调用的迁移入口（review 1d：把内联逻辑抽为公开 API）。
+        converted = dstate.migrate_param_state_to_target(
+            raw["param_state"],
+            source_format="expert" if args.source_stock else "entity",
+            model=resumed, target_plan=resumed_plan, ddp_config=ddp_config,
+            data_parallel_world_size=world, expert_data_parallel_world_size=world,
+            source_plan=plan)
         resumed_optimizer.load_state_dict({
             "optimizer": raw["optimizer"],
             "param_state": converted,

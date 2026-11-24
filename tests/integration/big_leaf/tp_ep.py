@@ -189,12 +189,31 @@ def main():
     optimizers = getattr(optimizer, "chained_optimizers", [optimizer])
     compared = 0
     if not combined_parallel:
-        for name, p in model.named_parameters():
+        # 双线实体：DDP/optimizer 的参数实体是内部线（plan.entities()）。不能用
+        # 外部线 weight{i} 查 param_to_bucket_group / model_param_gbuf_map /
+        # main_grad（review 2026-11-23：外部参数查内部映射会 KeyError/不匹配）。
+        param_names = {id(p): name for name, p in model.named_parameters()}
+
+        def expected_grad_of(p):
+            """实体 → 参考梯度（未展平）：非 GL 参数按名取；GL 实体按模块 stack weight{i}。"""
+            if id(p) in param_names:
+                return reference_grads[param_names[id(p)]]
+            for module in plan.modules_to_bind:
+                big, big_b = plan.proxies[id(module)]
+                if p is big or p is big_b:
+                    module_name = next(
+                        n for n, m in model_modules.items() if m is module)
+                    kind = "weight" if p is big else "bias"
+                    return torch.stack([reference_grads[f"{module_name}.{kind}{i}"]
+                                        for i in range(module.num_gemms)])
+            raise KeyError(f"未识别的实体参数: {tuple(p.shape)}")
+
+        for p in plan.entities():
             bucket_group = ddp.param_to_bucket_group[p]
             is_expert = bucket_group in ddp.expert_parallel_bucket_groups
             reduce_group = ddp.intra_expt_dp_group if is_expert else ddp.intra_dp_cp_group
             scaling_factor = bucket_group.buckets[0].gradient_scaling_factor
-            expected_full = reference_grads[name].clone()
+            expected_full = expected_grad_of(p).clone().float()
             expected_full.mul_(scaling_factor)
             if reduce_group.size() > 1:
                 dist.all_reduce(expected_full, group=reduce_group)
@@ -207,7 +226,7 @@ def main():
             actual = p.main_grad.view(-1)[param_range.start:param_range.end]
             expected = expected_full[param_range.start:param_range.end]
             assert torch.equal(actual, expected), (
-                rank, name, param_range, (actual - expected).abs().max())
+                rank, tuple(p.shape), param_range, (actual - expected).abs().max())
             compared += actual.numel()
         assert compared > 0
 

@@ -25,8 +25,8 @@
 | dist-opt OFF（手工优化器，big/lw1_nopin） | **0.995** |
 | 冻结/LoRA 形态（big/lw1_nopin，fwd+bwd） | **1.027**（旧 1.18–1.29，pack-once 回收） |
 
-**验证状态**：单测 171 全过；集成五形态（distopt）+ 四向 checkpoint + TP2×EP2 +
-LoRA + LoRA-distopt 全 PASS；整网五连（run.sh 拉起）全 exit=0，HF 导出无污染。
+**验证状态**：单测 184 全过；集成五形态（distopt）+ 四向 checkpoint + TP/EP 三配置
++ LoRA + LoRA-distopt 全 PASS；整网（run.sh 拉起）全 exit=0，HF 导出无污染。
 
 ---
 
@@ -137,8 +137,8 @@ plain-tensor 的「避开 pin 污染」安全理由依然成立。
 `prepare()` 把整模块冻结的 GroupedLinear 归入 `frozen_modules`，`attach_ddp` 用
 独立 buf（复用 `_repack_one`）绑定，**只拿 forward 收益**（forward 直取 + 免 cat），
 不进 DDP buffer / optimizer（无梯度、无 Adam 状态）。LoRA base 即此形态；LoRA 适配器
-（`lora_A`/`lora_B` 本身也是 GroupedLinear）照常走双线实体路径。`restore` 时冻结
-权重脱离独立 buf 视图（clone 回独立存储，防悬空）。
+（`lora_A`/`lora_B` 本身也是 GroupedLinear）照常走双线实体路径。`restore` 后冻结
+权重保持独立 buf 视图（视图 refcount 保活 storage，不悬空、无需 clone，见 §8.1）。
 
 ### 2.5 optimizer checkpoint：fully-reshardable + 格式闸门 + 旧格式迁移
 
@@ -153,7 +153,10 @@ plain-tensor 的「避开 pin 污染」安全理由依然成立。
 - **旧格式迁移**（`distopt_state.py`）：fully-reshardable `param_state` 是
   `{param_idx: {state_key: tensor}}` 位置字典，两种格式（expert 粒度 per-weight{i}
   ↔ entity 粒度 big）的位置序都可确定性复刻（`stock_positions`/`entity_positions`），
-  `convert_param_state` 做 dim 0 的 **stack/slice** 完成粒度转换，**无需源实例在场**。
+  `convert_param_state` 做 dim 0 的 **stack/slice** 完成粒度转换。读盘用**源格式参考
+  实例**（fresh model+DDP+optimizer，同架构、格式相反）的 mcore 原生
+  `sharded_state_dict`——不需原始训练实例；公开入口 `migrate_param_state_to_target()`
+  封装位置序复刻 + 转换（见 §8.1 的 1d 澄清）。
 
 ---
 
@@ -173,20 +176,20 @@ plain-tensor 的「避开 pin 污染」安全理由依然成立。
 
 ## 4. 代码实现（模块拆解）
 
-生产核心共 6 个文件、1710 行（`ttorch/bridge/big_leaf/`）：
+生产核心共 6 个文件、1856 行（`ttorch/bridge/big_leaf/`）：
 
 | 文件 | 行 | 职责（本轮改动） |
 |---|---:|---|
-| `megatron.py` | 452 | **核心重写**：`BigLeafMegatronPlan` 双线实体——`_build_proxies`（构造内部线实体）、`entities()`（DDP/optimizer 可见实体集）、`entity_swap()`（换装原语）、`compute_full_param_layout`（按实体建 layout）、`attach_ddp`（外部线重绑视图 + 冻结模块绑定）、`restore(detach_storage)` |
-| `optimizer.py` | 141 | **新增**：两个边界补丁——`optimizer_boundary_wrapper`（optimizer 构造换装）、`mcore_sharded_state_dict_wrapper`（序列化换装 + fully-reshardable 闸门 + `_assert_sd_signature` 签名守卫） |
-| `distopt_state.py` | 157 | **新增**：旧↔新格式迁移——`stock_positions`/`entity_positions`（位置序复刻）、`convert_param_state`（expert↔entity 粒度 stack/slice）、`build_param_state_template` |
-| `core.py` | 730 | `_repack_one` 加 hook/main_grad 容忍参数（冻结绑定用）；冻结 + pin 关时大叶子转 `nn.Parameter`（pack-once，回收 item 7） |
+| `megatron.py` | 475 | **核心重写**：`BigLeafMegatronPlan` 双线实体——`_build_proxies`（构造内部线实体 + `_propagate_param_attrs` 属性传播）、`entities()`（DDP/optimizer 可见实体集）、`entity_swap()`（换装原语）、`compute_full_param_layout`（按实体建 layout）、`attach_ddp`（外部线重绑视图 + 冻结模块绑定）、`restore()` |
+| `optimizer.py` | 171 | **新增**：两个边界补丁——`optimizer_boundary_wrapper`（optimizer 构造换装）、`mcore_sharded_state_dict_wrapper`（序列化换装 + fully-reshardable 闸门 + `_assert_sd_signature` 签名守卫 + 多模型/TP/EP 范围闸门） |
+| `distopt_state.py` | 218 | **新增**：旧↔新格式迁移——`stock_positions`/`entity_positions`（位置序复刻）、`convert_param_state`（expert↔entity 粒度 stack/slice）、`migrate_param_state_to_target`（生产可调用迁移入口）、`build_param_state_template`（布局诊断） |
+| `core.py` | 762 | `_repack_one` 加 hook/main_grad 容忍参数（冻结绑定用）；冻结 + pin 关时大叶子转 `nn.Parameter`（pack-once，回收 item 7）；`_check_binding_runtime` 版本契约（检测外部写权重） |
 | `runtime.py` | 68 | `ddp_init_wrapper`：layout 改传 `plan.entities()`，DDP 构造纳入 `entity_swap()` 窗口 |
 | `swift.py` | 162 | 注册两个 optimizer 边界补丁（补丁计数 5→6） |
 
-**改动规模**（git diff，含测试/文档/基准）：14 个已跟踪文件 +606/-244，另新增
-3 个文件（`optimizer.py`、`distopt_state.py`、`test_big_leaf_distopt.py`）与 4 份
-基准证据 JSON。
+**改动规模**（git diff，含测试/文档/基准）：14 个已跟踪文件 +606/-244（首轮双线）
++ 二轮 review 修复，另新增 4 个文件（`optimizer.py`、`distopt_state.py`、
+`test_big_leaf_distopt.py`、`test_big_leaf_review_fixes.py`）与 4 份基准证据 JSON。
 
 ---
 
@@ -238,12 +241,12 @@ param/plain = **0.771**。安全论证：pin 关无导出污染路径，pin 开�
 
 ## 6. 完整 demo 验证
 
-### 6.1 单元测试（`tests/unit`，171 全过）
+### 6.1 单元测试（`tests/unit`，184 全过）
 
 big_leaf 相关 6 个文件；本轮新增 `test_big_leaf_distopt.py`（8 例，CPU-only）：
 param_state 转换形状/字节序等价、`sharded_state_dict` 签名守卫（真实签名锚定 +
 漂移 fail-fast + 工厂安装期校验）、格式闸门 save/load 措辞分流、无 plan 零侵入透传。
-（163 → 171 的构成见设计文档 §13.6。）
+（163 → 171 见 §13.6，171 → 184 见 §13.7 二轮 review。）
 
 ### 6.2 集成测试（`tests/integration/big_leaf`，torchrun 多卡）
 
@@ -277,6 +280,10 @@ param_state 转换形状/字节序等价、`sharded_state_dict` 签名守卫（�
   10.94063663，第三位小数级一致，为 6 步累积序差）。
 - **HF 导出无污染**：runE（LoRA，pin 关生产配置）导出 231 键 **0 非有限值**，
   权重 absmax 0.111——验证了 pack-once 的 pin-gate 不引入 §16.3 污染。
+- **二轮 review 修复后复验**（2026-11-23）：runF（full + dist-opt + save）exit=0、
+  loss 12.16→10.94（与 runA 一致），新增的多模型/TP/EP/版本/格式闸门在生产
+  路径（TP=1、EP=1、单模型）正常放行；runG（LoRA + merge/unmerge）exit=0、
+  `modules=24`，**版本契约守卫零误报**，HF 导出 231 键 0 非有限值。
 
 ---
 
@@ -293,21 +300,48 @@ param_state 转换形状/字节序等价、`sharded_state_dict` 签名守卫（�
 | P2-2 | 格式闸门 load 路径错误信息按 save 侧措辞，误导排障 | 按 `is_loading` 分流 save/load 措辞 |
 | P2-3 | prepare 瞬时 ~3× 显存峰值 | 未改代码，登记为 §13.5-5 待实测项 |
 
+### 8.1 复审修复（2026-11-23 二轮，外部 review 指认 6 项，红绿齐全）
+
+二轮外部 review 指认 6 个问题 + 性能口径提醒，逐项**真实复现确认后修复**（新增
+`test_big_leaf_review_fixes.py` 13 例，红阶段 8 失败确认缺陷存在；全量回归 171→184）：
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1a | `_name_map` 把普通 Linear/LayerNorm 的 weight/bias 当 weight{i}，`int("")` 崩 | 只认数字后缀专家参数，普通直通 |
+| 1b/1c | 转换器忽略目标 shape（专家数不符静默产错形状）；entity→entity 空 stack | 校验声明 shape fail-fast；entity→entity 恒等直通 |
+| 1d | 迁移读盘依赖源实例、生产无可调用 API | 读盘走**源格式参考实例**（mcore 原生）；手搓模板降级为布局诊断；新增公开入口 `migrate_param_state_to_target()` |
+| 2a/2b | 序列化多模型覆盖、TP/EP 元数据未覆盖 | ckpt 边界 fail-fast 多模型/TP>1/EP>1 |
+| 3 | 格式闸门只查 metadata，但 mcore **显式 sharding_type 优先**（可绕过） | 闸门改按 mcore 同一有效值判 |
+| 4 | 实体只复制 `allreduce`，TP/分组属性未传；lr/wd 等价性 | `_propagate_param_attrs` 传安全属性、不照抄 per-expert 分片 spec；docstring 明确 name/shape 级 lr/wd 需重验证 |
+| 5a | 共享 storage ≠ 共享 `_version`，外部写权重 backward 静默用错值 | `_check_binding_runtime` 版本契约检测；sanctioned 路径（merge/load）重记基线 |
+| 5b/5c | 「防悬空」clone 解释过强（.data 别名保活）；restore 语义应分开 | **收敛掉** P1-2 的 `detach_storage`+冻结 clone（错误前提的过度设计），分清存储生命周期 vs 训练有效性 |
+| tp_ep | TP-only/EP-only 用外部参数查内部 DDP 映射 | 改用 `plan.entities()`+实体→参考梯度映射，~1.25M 元素逐位对拍 |
+
+**1d 诚实闭环**：手搓 `build_param_state_template` 的裸 `from_rank_offsets` 缺
+fully-reshardable 真实分片元数据，实测驱动不了 load（`Invalid access pattern`）；
+要修复等于重写 mcore 内部构造（过度设计），故改走参考实例机制。完整记录见设计文档
+§13.7；定位与口径澄清（非框架无关、compile 未验收、性能基准口径）见 §13.8。
+
 ---
 
 ## 9. 已知边界与后续（如实登记）
 
 1. **dp_reshardable 格式 fail-fast**（生产需 `dist_ckpt_optim_fully_reshardable=true`），
    未做兼容——如需支持要单独论证实体 layout 的桶内 pad 对齐。
-2. **TP>1 axis-map / EP>1 optimizer 元数据未验证**：整网 TP=1、EP=1。
-   `_rebuilt_sharded_state_dict` 用 plain-module fallback，TP>1 的 axis-map 形态
-   不在本轮范围；EP>1 的 optimizer state 元数据假设未覆盖。
-3. **`restore` 语义收紧**：摘除后不能继续训练（DDP 梯度实体是内部线）；默认不解除
-   可训 weight{i} 对 param_data 的视图依赖（`detach_storage=True` 可脱离）。
+2. **optimizer ckpt 的多模型/TP>1/EP>1 未验收即 fail-fast**（`_tp_ep_world_sizes`
+   闸门）：`_rebuilt_sharded_state_dict` 用 plain-module fallback（整模型按
+   replicated），只覆盖单模型 chunk + TP=1 + EP=1；扩展时需保留原生 metadata 只转换
+   受影响实体。
+3. **`restore` 语义**：摘除后**不能继续训练**（DDP 梯度实体是内部线，hook 与参数
+   实体不匹配）——这是训练有效性问题；`weight{i}` 保持内部线存储视图，refcount
+   保活 storage、不悬空（存储生命周期与训练有效性是两回事，§13.7-5b/5c）。
 4. **prepare 瞬时 ~3× 显存峰值**（big 中转 + 原 weight{i} + param_data 并存，构造后
    回落 1×）——大 MoE（35B-A3B 量级）峰值待实测登记。
 5. **部分冻结不支持**：只支持整模块可训或整模块冻结，`prepare()` 对部分冻结
    fail-fast。
+6. **lr/wd 自定义分组**：换装窗口内实体名/维数变化，按 `weight{i}` 名字模式或
+   per-expert shape 的分组规则不命中实体，需在实体层重写；按属性的规则有效（属性
+   已传播）。**迁移读盘需构造源格式参考实例**（非全自动内联检测）。
 
 ---
 
@@ -329,14 +363,17 @@ param_state 转换形状/字节序等价、`sharded_state_dict` 签名守卫（�
 `distopt_state.py`（新增）、`core.py`、`runtime.py`、`swift.py`。
 
 **测试**：`tests/unit/test_big_leaf_distopt.py`（新增 8 例）、
+`tests/unit/test_big_leaf_review_fixes.py`（新增 13 例，二轮 review 守卫）、
 `test_big_leaf_swift.py`（补丁计数）、`test_big_leaf_runtime.py`；集成
-`distopt.py`、`distopt_checkpoint.py`、`tp_ep.py`、`lora_distopt.py` 适配双线 API。
+`distopt.py`、`distopt_checkpoint.py`（迁移走公开 API）、`tp_ep.py`（TP-only/EP-only
+映射修复）、`lora_distopt.py` 适配双线 API。
 
 **基准**：`experiments/big_leaf_lw_gap/bench_distopt_gap.py`、`bench_module_gap.py`
 （双线适配）+ 证据 `out/distopt_dp1_dual.json`、`distopt_dp4_dual.json`、
 `module_gap_dual.json`、`module_gap_frozen_dual.json`。
 
-**文档**：`big_leaf_方案设计与实现_20261109.md`（§13 全节）、本 PR 说明、
-`待办总览`（回归口径 171）。
+**文档**：`big_leaf_方案设计与实现_20261109.md`（§13 全节 + §13.7 二轮 review +
+§13.8 定位澄清）、本 PR 说明、`待办总览`（回归口径 184）。
 
-**规模**：14 个已跟踪文件 +606/-244；新增 3 个文件 + 4 份基准 JSON。
+**规模**：首轮双线 14 个已跟踪文件 +606/-244 + 二轮 review 修复（8 文件 +243/-80）；
+新增 4 个文件 + 4 份基准 JSON。

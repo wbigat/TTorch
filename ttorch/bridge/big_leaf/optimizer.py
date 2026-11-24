@@ -82,6 +82,24 @@ def _active_plans(optimizer):
     return plans
 
 
+def _tp_ep_world_sizes():
+    """返回 (TP, EP, ETP) world size。
+
+    明确**未初始化**（非 worker 探针进程）返回 (1,1,1)。**已初始化后，任何查询
+    异常都让它抛出（fail-fast）**——不能把查询失败当作 TP1/EP1 放行（review 三轮
+    P3 fail-open）。ETP（独立专家张量并行）在支持的 mcore 版本里一并返回：
+    TP1/EP1 不等于 ETP1。
+    """
+    from megatron.core import parallel_state as mpu
+    if not mpu.model_parallel_is_initialized():
+        return 1, 1, 1
+    tp = mpu.get_tensor_model_parallel_world_size()
+    ep = mpu.get_expert_model_parallel_world_size()
+    get_etp = getattr(mpu, "get_expert_tensor_parallel_world_size", None)
+    etp = get_etp() if get_etp is not None else 1
+    return tp, ep, etp
+
+
 def optimizer_boundary_wrapper(orig):
     """optimizer 构建窗口内换装，构建后恢复；无 plan 时原样通过。"""
     @functools.wraps(orig)
@@ -117,18 +135,39 @@ def mcore_sharded_state_dict_wrapper(orig):
         if not plans:
             return orig(self, model_sharded_state_dict, is_loading, sharding_type,
                         metadata)
-        sharding = (metadata or {}).get("distrib_optim_sharding_type")
-        if sharding != "fully_reshardable":
-            # 缺失键时 mcore 默认 dp_reshardable，与实体 layout 不兼容——
-            # 必须显式要求 fully-reshardable，不允许落到默认格式静默崩溃。
+        # 范围闸门：重建用 plain-module fallback（整模型按 replicated 处理），只在
+        # 单模型 chunk + TP=1 + EP=1 下经验证。多模型/TP/EP 未验收，fail-fast 而非
+        # 静默写坏 checkpoint（review 2026-11-23 问题 2）。
+        # 按 **model_chunks 总数**判，不是 active plan 数：[有 plan 的模型, 普通模型]
+        # 会让 active plans=1 放行，但重建只含 big_leaf 模型、普通 chunk 的可训参数
+        # 查表缺失（review 三轮 P1）。多 chunk（无论是否全有 plan）一律未验收。
+        n_chunks = len(getattr(self, "model_chunks", None) or [])
+        if n_chunks > 1:
+            raise ValueError(
+                f"big_leaf 双线实体版 optimizer checkpoint 目前只验收单模型 chunk，"
+                f"实际 {n_chunks} 个 model chunk（多模型未验收）")
+        tp_ws, ep_ws, etp_ws = _tp_ep_world_sizes()
+        if tp_ws > 1 or ep_ws > 1 or etp_ws > 1:
+            raise ValueError(
+                f"big_leaf 双线实体版 optimizer checkpoint 暂未验收 TP>1 / EP>1 / ETP>1"
+                f"（当前 TP={tp_ws} EP={ep_ws} ETP={etp_ws}；axis-map/EP/ETP 元数据"
+                "未覆盖，扩展时需保留原生 metadata 只转换受影响实体）")
+        # 格式闸门：mcore 的取值优先级是**显式 sharding_type 非空时优先**（带
+        # deprecation 警告），否则读 metadata['distrib_optim_sharding_type']，
+        # 默认 fully_sharded_model_space。闸门必须按同一有效值判，否则可绕过
+        # （metadata=fully + 显式 dp → 被放行；显式 fully + metadata 空 → 被误拒，
+        # review 问题 3）。
+        effective = sharding_type if sharding_type is not None \
+            else (metadata or {}).get("distrib_optim_sharding_type")
+        if effective != "fully_reshardable":
             if is_loading:
                 raise ValueError(
                     f"big_leaf 双线实体版只能加载 fully-reshardable optimizer "
-                    f"checkpoint，当前 distrib_optim_sharding_type={sharding!r}；"
+                    f"checkpoint，当前有效 sharding_type={effective!r}；"
                     "非 fully-reshardable 的旧 ckpt 需先用 distopt_state 迁移转换器转换")
             raise ValueError(
                 f"big_leaf 双线实体版只支持 fully-reshardable optimizer checkpoint，"
-                f"当前 distrib_optim_sharding_type={sharding!r}；请设置 "
+                f"当前有效 sharding_type={effective!r}；请设置 "
                 "dist_ckpt_optim_fully_reshardable=true")
         with contextlib.ExitStack() as stack:
             for plan in plans:
